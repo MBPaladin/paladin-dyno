@@ -37,9 +37,15 @@ class Window(QWidget):
         with open(f"{dyno_paths.dyno_config_directory}/master_config.yaml", 'r') as f:
             self.master_params = yaml.safe_load(f)
 
-        # calculate decimation for gui buffer, 
+        # calculate decimation for gui buffer,
         self.gui_decimation = int(self.dyno_params['gui_params']['window_length_s']*1e6/self.master_params['cycle_time_us']/self.dyno_params['gui_params']['displayed_samples'])
         buffer_length = int(self.dyno_params['gui_params']['window_length_s'] * 1e6 / self.master_params['cycle_time_us'] / self.gui_decimation)
+
+        # Real time between two decimated buffer samples (seconds). Used to seed the
+        # time axis and to scroll it. NOTE: this is the control period * decimation,
+        # NOT the 30 ms GUI timer period.
+        self.window_length_s = self.dyno_params['gui_params']['window_length_s']
+        self.gui_dt = self.gui_decimation * self.master_params['cycle_time_us'] / 1e6
 
         # add configured sensor keys
         if 'sensors' in self.dyno_params:
@@ -70,7 +76,10 @@ class Window(QWidget):
 
         # make data buffer, one row for each item in the log keys
         self.gui_data = np.zeros((len(self.log_keys), buffer_length))
-        self.gui_data[0,:] = np.arange(-buffer_length, 0)*0.03
+        # Seed the time row as one continuous window ending just before 0, spaced at
+        # the true decimated-sample period. This makes the axis a full, correctly
+        # scaled window at launch instead of ~64 s of mis-spaced fake history.
+        self.gui_data[0,:] = np.arange(-buffer_length, 0)*self.gui_dt
 
         # make a buffer for incoming telementry
         self.telemetry_samples = []
@@ -182,6 +191,10 @@ class Window(QWidget):
             # plot.getViewBox().setYRange(plot_params['range'][0], plot_params['range'][1])
             plot.setLabel('left', plot_params['unit'])
             plot.showGrid(x=True, y=True, alpha=0.5)
+            if i == 0:
+                # We drive the x-range ourselves (rolling window in redraw), so keep
+                # pyqtgraph from auto-ranging x and warping the axis during start-up.
+                plot.getViewBox().enableAutoRange(x=False)
             if i > 0:
                 plot.setXLink(self.plots[0]['plot']) # link x range of all other plots to the first
             legend = pg.LegendItem(offset=(80, 10))
@@ -310,6 +323,14 @@ class Window(QWidget):
 
     def redraw(self):
         draw_start = time.time()
+
+        # Scroll the x-axis as a fixed-width window ending at the latest sample. All
+        # plots are x-linked to plots[0], so setting it here moves every scope. This
+        # replaces auto-ranging, which warped the axis while the seeded start-up
+        # samples flushed out of the buffer.
+        t_latest = self.gui_data[0, -1]
+        self.plots[0]['plot'].setXRange(t_latest - self.window_length_s, t_latest, padding=0)
+
         for plot in self.plots:
             times = []
             for curve, trace_id in zip(plot['curves'], plot['data_keys']):
