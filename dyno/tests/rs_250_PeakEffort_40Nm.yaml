@@ -1,0 +1,9 @@
+behaviors:
+  - id: Peak_Effort
+    type: test_trace
+    settings:
+      input_motor:
+        control_mode: torque
+      output_motor:
+        control_mode: position
+      trace_file: "PeakEffort40NM.csv"

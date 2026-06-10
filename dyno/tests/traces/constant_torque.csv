@@ -1,0 +1,5 @@
+time,output_motor_torque,input_motor_torque
+0,0,0
+2,0,-8
+22,0,-8
+23,0,0

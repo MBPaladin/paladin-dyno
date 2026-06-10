@@ -1,0 +1,6 @@
+working_directory = "/home/paladin/Documents/Github/rocky-dyno"
+dyno_directory = f"{working_directory}/dyno"
+dyno_src_directory = f"{dyno_directory}/src"
+dyno_test_directory = f"{dyno_directory}/tests"
+dyno_config_directory = f"{dyno_directory}/config"
+dyno_logs_directory = f"{dyno_directory}/logs"

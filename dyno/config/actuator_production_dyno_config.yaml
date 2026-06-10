@@ -1,0 +1,197 @@
+# --- 1. SENSOR CONFIGURATION ---
+# All logical sensors go here. Port mapping handles the hardware routing.
+sensors:
+  # --- Configurable (User Accessible) ---
+  sensor_torque_dummy:
+    port: ADC1
+    supply: 24v
+    fs_v: 10
+    fs_pos: 100
+    offset: 0
+
+  # --- Reserved (System Functional) ---
+  load_torque:
+    port: RESERVED_ADC
+    fs_v: 10
+    fs_pos: -500
+    offset: 0
+    supply: NA  # Internal wiring has permanent power
+
+  # --- Reserved (System Functional) ---
+  load_stator_temp:
+    port: RESERVED_RTD
+    sensor_type: PT100
+
+# --- 3. PHYSICAL PANEL WIRING HARNESS ---
+# This maps the physical labels on your dyno's front panel to the internal EtherCAT hardware.
+panel_ports:
+  ADC1:
+    signal_module: adc_1
+    signal_channel: ch2
+    power_12v: { module: 12v_power1, channel: 1 }
+    power_24v: { module: 24v_power1, channel: 1 }
+  ADC2:
+    signal_module: adc_1
+    signal_channel: ch3
+    power_12v: { module: 12v_power1, channel: 2 }
+    power_24v: { module: 24v_power1, channel: 2 }
+  ADC3:
+    signal_module: adc_1
+    signal_channel: ch4
+    power_12v: { module: 12v_power1, channel: 3 }
+    power_24v: { module: 24v_power1, channel: 3 }
+  ADC4:
+    signal_module: adc_2
+    signal_channel: ch1
+    power_12v: { module: 12v_power1, channel: 4 }
+    power_24v: { module: 24v_power1, channel: 4 }
+  ADC5:
+    signal_module: adc_2
+    signal_channel: ch2
+    power_12v: { module: 12v_power2, channel: 1 }
+    power_24v: { module: 24v_power2, channel: 1 }
+  ADC6:
+    signal_module: adc_2
+    signal_channel: ch3
+    power_12v: { module: 12v_power2, channel: 2 }
+    power_24v: { module: 24v_power2, channel: 2 }
+  ADC7:
+    signal_module: adc_2
+    signal_channel: ch4
+    power_12v: { module: 12v_power2, channel: 3 }
+    power_24v: { module: 24v_power2, channel: 3 }
+  ADC8:
+    signal_module: adc_3
+    signal_channel: ch1
+    power_12v: { module: 12v_power2, channel: 4 }
+    power_24v: { module: 24v_power2, channel: 4 }
+  ADC9:
+    signal_module: adc_3
+    signal_channel: ch2
+    power_12v: { module: 12v_power3, channel: 1 }
+    power_24v: { module: 24v_power3, channel: 1 }
+  ADC10:
+    signal_module: adc_3
+    signal_channel: ch3
+    power_12v: { module: 12v_power3, channel: 2 }
+    power_24v: { module: 24v_power3, channel: 2 }
+  ADC11:
+    signal_module: adc_3
+    signal_channel: ch4
+    power_12v: { module: 12v_power3, channel: 3 }
+    power_24v: { module: 24v_power3, channel: 3 }
+  RESERVED_ADC:
+    signal_module: adc_1
+    signal_channel: ch1
+  RTD1:
+    signal_module: rtd_module
+    signal_channel: ch1
+  RTD2:
+    signal_module: rtd_module
+    signal_channel: ch2
+  RTD3:
+    signal_module: rtd_module
+    signal_channel: ch3
+  RTD4:
+    signal_module: rtd_module
+    signal_channel: ch4
+  RESERVED_RTD:
+    signal_module: rtd_module
+    signal_channel: ch8
+
+# --- 2. PHYSICAL HARDWARE BUS ---
+expected_slave_layout:
+  - { model: EK1100, name: coupler }
+  - { model: EL2502, name: pwm }
+  - { model: EL3208, name: rtd_module }
+  - { model: EL5042, name: encoder}
+  - { model: EL2004, name: 24v_power1}
+  - { model: EL2004, name: 24v_power2}
+  - { model: EL2004, name: 24v_power3}
+  - { model: EL2004_12v, name: 12v_power1}
+  - { model: EL2004_12v, name: 12v_power2}
+  - { model: EL2004_12v, name: 12v_power3}
+  - { model: ELM3004, name: adc_1}
+  - { model: ELM3004, name: adc_2}
+  - { model: ELM3004, name: adc_3}
+  - model: AKD
+    name: LOAD
+    params:
+      flip_torque_sign: True
+      gear_ratio: 1 #Output should always be set to 1
+      motor_params:
+        kt: 5.3
+        k_tanh: 0.025
+      motor_limits:
+        torque: 70
+        velocity: 31.5
+      drive_params:
+        i_cont: 8
+  - model: AKD
+    name: DUT
+    params:
+      flip_torque_sign: True
+      gear_ratio: 1 #Output should always be set to 1
+      motor_params:
+        kt: 7.35
+        k_tanh: 0.068
+      motor_limits:
+        torque: 73
+        velocity: 31.5
+        acceleration: 12 #Rad/s^2
+        rotatum: 160 #Nm/s, 4 x peak torque value
+      drive_params:
+        i_cont: 3
+
+
+safeties: # Measured values over these limits will cause the test to stop
+  output_torque: 70 # Nm on the output torque cell. measured abs(torque) over this limit will stop a test
+  input_torque: 15 # Nm on the input torque cell. measured abs(torque) over this limit will stop a test
+  output_velocity: 15 # rad/s on the output. measured abs(velocity) over this limit will stop the test
+  input_velocity: 500 # rad/s
+
+gui_params: # defines length and resolution of the plots
+  window_length_s: 30
+  displayed_samples: 2048
+
+# We want to change log keys between configs without having to change the control loop / adjust its code. In the section below, attributes to be logged / visualized are entered as a list of lists [str(log name readable), str(attribute of self to log)]
+
+# log_keys: # Fixed values that aren't user adjustable
+#   - [time, time]
+#   - [dut_mode, devices.DUT.servo_drive_mode]
+#   - [dut_torque_command, devices.DUT.torque_command]
+#   - [dut_velocity_command, devices.DUT.velocity_command]
+#   - [dut_position_command, devices.DUT.position_command]
+#   - [dut_output_position, devices.DUT.position]
+#   - [dut_projected_input_encoder, devices.DUT.inc_position]
+#   - [dut_motor_position, devices.DUT.motor_position]
+#   - [dut_velocity, devices.DUT.velocity]
+#   - [dut_current, devices.DUT.current]
+#   - [dut_effort, devices.DUT.effort]
+#   - [load_mode, devices.LOAD.servo_drive_mode]
+#   - [load_torque_command, devices.LOAD.torque_command]
+#   - [load_velocity_command, devices.LOAD.velocity_command]
+#   - [load_position_command, devices.LOAD.position_command]
+#   - [load_position, devices.LOAD.position]
+#   - [load_velocity, devices.LOAD.velocity]
+#   - [load_current, devices.LOAD.current]
+#   - [load_position_2, devices.encoder.position]
+
+  #Keys for motor testing
+log_keys: # Fixed values that aren't user adjustable
+  - [time, time]
+  - [dut_mode, devices.DUT.servo_drive_mode]
+  - [dut_torque_command, devices.DUT.torque_command]
+  - [dut_velocity_command, devices.DUT.velocity_command]
+  - [dut_position_command, devices.DUT.position_command]
+  - [dut_output_position, devices.DUT.position]
+  - [dut_velocity, devices.DUT.velocity]
+  - [dut_current, devices.DUT.current]
+  - [load_mode, devices.LOAD.servo_drive_mode]
+  - [load_torque_command, devices.LOAD.torque_command]
+  - [load_velocity_command, devices.LOAD.velocity_command]
+  - [load_position_command, devices.LOAD.position_command]
+  - [load_position, devices.LOAD.position]
+  - [load_velocity, devices.LOAD.velocity]
+  - [load_current, devices.LOAD.current]
+  - [load_position_2, devices.encoder.position]

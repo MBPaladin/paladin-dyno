@@ -1,0 +1,9 @@
+behaviors:
+  - id: CONSTANT_TORQUE
+    type: test_trace
+    settings:
+      input_motor:
+        control_mode: torque
+      output_motor:
+        control_mode: torque
+      trace_file: "constant_torque.csv"

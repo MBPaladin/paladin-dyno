@@ -1,0 +1,10 @@
+pyqtgraph
+PySide6
+PyYAML
+h5py
+pandas
+pysoem
+xmltodict
+numpy
+matplotlib
+scipy

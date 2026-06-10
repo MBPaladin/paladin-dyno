@@ -1,0 +1,11 @@
+behaviors:
+
+  # comment
+  - id: SineWave
+    type: test_trace
+    settings:
+      input_motor:
+        control_mode: position
+      output_motor:
+        control_mode: torque
+      trace_file: "torquePositionSineSmoothed.csv"

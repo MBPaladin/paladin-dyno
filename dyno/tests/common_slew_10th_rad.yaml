@@ -1,0 +1,10 @@
+behaviors:
+  # A backlash measurement test that runs up to 10 Nm
+  - id: SLEW
+    type: test_trace
+    settings:
+      input_motor:
+        control_mode: torque
+      output_motor:
+        control_mode: position
+      trace_file: "10th_rev_slew.csv"

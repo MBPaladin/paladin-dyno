@@ -1,0 +1,57 @@
+############################
+### RS LINE OF ACTUATORS ###
+############################
+
+RS750:
+  names:
+    - RS750_01
+    - RS750_02 #Multiple hardware rev's can the same parameters
+  limits: #cross checked against limits read over SDO
+    torque_nm: 200
+    velocity_radps: 15
+  slew_saturation: 0.05
+  gains:
+    torque: # Leave blank for now, 0's are assigned for kp / kd after loading
+    velocity:
+      kp: 32
+      kd: 8
+    position:
+      kp: 300
+      kd: 35
+RS250:
+  names:
+    - RS250_01
+    - RS250_02 #Multiple hardware rev's can the same parameters
+  limits: #cross checked against limits read over SDO
+    torque_nm: 20
+    velocity_radps: 5
+  slew_saturation: 0.05
+  gains:
+    torque: # Leave blank for now, 0's are assigned for kp / kd after loading
+    velocity:
+      kp: 32
+      kd: 8
+    position:
+      kp: 300
+      kd: 35
+RS320:
+  names:
+    - RS320_01
+    - RS320_02 #Multiple hardware rev's can the same parameters
+  limits: #cross checked against limits read over SDO
+    # TODO: confirm these against datasheet/SDO. Guessed by interpolating
+    # between RS250 (20 Nm, 5 rad/s) and RS750 (200 Nm, 15 rad/s).
+    torque_nm: 60
+    velocity_radps: 8
+  # TODO: tune. slew_saturation * torque_nm should be ~3-5 Nm to clear
+  # static friction without slamming. With torque_nm=60, 0.06 -> 3.6 Nm.
+  slew_saturation: 0.06
+  gains:
+    torque: # Leave blank for now, 0's are assigned for kp / kd after loading
+    # Same gain values as RS250/RS750; verify these are appropriate for RS320.
+    velocity:
+      kp: 32
+      kd: 8
+    position:
+      kp: 300
+      kd: 35

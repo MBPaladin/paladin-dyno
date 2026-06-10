@@ -1,0 +1,11 @@
+behaviors:
+  - id: POSITIONAL_ACCURACY_1DEG
+    name: PositionalAccuracyFine
+    description: Fine positional accuracy — 1-degree increments, single cycle (~12 min)
+    type: test_trace
+    settings:
+      input_motor:
+        control_mode: position
+      output_motor:
+        control_mode: torque
+      trace_file: "step_positional_accuracy_1deg.csv"

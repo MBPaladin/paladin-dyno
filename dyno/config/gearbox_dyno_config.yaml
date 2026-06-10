@@ -1,0 +1,93 @@
+# GEARBOX DYNO CONFIG
+
+# --- 1. SENSOR CONFIGURATION ---
+# All logical sensors go here. Port mapping handles the hardware routing.
+sensors:
+  # --- Reserved (System Functional) ---
+  input_torque:
+    port: RESERVED_ADC_1
+    fs_v: 10
+    fs_pos: -20
+    offset: 0
+    supply: NA  # Internal wiring has permanent power
+
+  output_torque:
+    port: RESERVED_ADC_2
+    fs_v: 5
+    fs_pos: 500
+    offset: 0
+    supply: NA  # Internal wiring has permanent power
+
+# --- 3. PHYSICAL PANEL WIRING HARNESS ---
+# This maps the physical labels on your dyno's front panel to the internal EtherCAT hardware.
+panel_ports:
+  RESERVED_ADC_1:
+    signal_module: ADC
+    signal_channel: ch1
+  RESERVED_ADC_2:
+    signal_module: ADC
+    signal_channel: ch2
+
+# Properties of each device can be accessed via their name in python. i.e. self.devices['input_motor'].torque
+# Names provide a way to identify multiple copies of one device
+expected_slave_layout: # This section captures parameters required to initialize the classes that wrap ethercat modules
+  - { model: EK1100, name: coupler}
+  - { model: EL2002, name: digital_output}
+  - { model: EL1002, name: digital_input}
+  - { model: ELM3002, name: ADC}
+  - model: AKD
+    name: DUT
+    params:
+      gear_ratio: 31 # approximate, used for feed forward torque commands / safeties
+      motor_params: #Peaks refer to motor peak, irregardless of drive limits, All currents are in A_rms
+        kt: 0.733 # measured torque constant
+        k_tanh: 0.022 # defines tanh saturation curve along with kt
+      motor_limits: # commands that exceed this value are clipped as they go out to the motor
+        torque: 10 # Nm, abs(commands) > limit, are clipped
+        velocity: 350 # rad/s, abs(commands) > limit, are clipped
+        acceleration: 400 #Rad/s^2
+        rotatum: 40 #Nm/s, 4 x peak torque value
+      drive_params:
+        i_cont: 5.812 # This value needs to match the servo drive setting. torque ff comands are sent to the drive as current commands in units of i_cont / 1000
+  - model: AKD
+    name: LOAD
+    params:
+      gear_ratio: 1 #Output should always be set to 1
+      motor_params: #Peaks refer to motor peak, irregardless of drive limits, All currents are in A_rms
+        kt: 11.7
+        k_tanh: 0.016
+      motor_limits:
+        torque: 330
+        velocity: 12
+        acceleration: 12 #Rad/s^2
+        rotatum: 1320 #Nm/s, 4 x peak torque value
+      drive_params:
+        i_cont: 12 
+
+
+safeties: # Measured values over these limits will cause the test to stop
+  output_torque: 375 # Nm on the output torque cell. measured abs(torque) over this limit will stop a test
+  input_torque: 15 # Nm on the input torque cell. measured abs(torque) over this limit will stop a test
+  output_velocity: 15 # rad/s on the output. measured abs(velocity) over this limit will stop the test
+  input_velocity: 500 # rad/s
+
+gui_params: # defines length and resolution of the plots
+  window_length_s: 30
+  displayed_samples: 2048
+
+log_keys: #This needs to match with how the ethercat loop and gui are creating datapoints / writing them into the data buffer. When you select the drop down to look at 'input_position' the gui pulls the trace from buffer[3]
+  - [time, time]
+  - [input_mode, devices.DUT.servo_drive_mode]
+  - [input_torque_command, devices.DUT.torque_command]
+  - [input_velocity_command, devices.DUT.velocity_command]
+  - [input_position_command, devices.DUT.position_command]
+  - [input_output_position, devices.DUT.position]
+  - [input_velocity, devices.DUT.velocity]
+  - [input_current, devices.DUT.current]
+  - [output_mode, devices.LOAD.servo_drive_mode]
+  - [output_torque_command, devices.LOAD.torque_command]
+  - [output_velocity_command, devices.LOAD.velocity_command]
+  - [output_position_command, devices.LOAD.position_command]
+  - [output_position, devices.LOAD.position_command]
+  - [output_velocity, devices.LOAD.velocity]
+  - [output_current, devices.LOAD.current]

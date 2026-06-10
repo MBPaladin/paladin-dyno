@@ -1,0 +1,16 @@
+
+behaviors:
+  - id: EFFICIENCY
+    description: james_made_this_beware
+    type: grid_search
+    settings:
+      input_motor:
+        control_mode: velocity
+        command_list: [40,80, 100, 120]
+      output_motor:
+        control_mode: torque
+        command_list: [20, 250, 10, -250, -20, 10]
+      loop_order: [velocity, torque]
+      duration_per_point_s: 2
+      settle_time_s: 0.5
+      transition_rate: 0.5

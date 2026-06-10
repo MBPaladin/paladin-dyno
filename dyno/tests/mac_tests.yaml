@@ -1,0 +1,72 @@
+behaviors:
+#   - id: BACKLASH-HYSTERESIS
+#     type: grid_search
+#     settings:
+#       input_motor:
+#         control_mode: torque
+#         command_list: [10,-10] # units = Rads
+#       output_motor:
+#         control_mode: position
+#         command_list: [0]
+#       loop_order: [torque, position]
+#       duration_per_point_s: 1.5
+#       settle_time_s: 0.25
+#       transition_rate: 0.025 #Fraction of max allowable velocity / torque ramp rate
+  # - id: CSV-BACKLASH-HYSTERESIS
+  #   type: test_trace
+  #   settings:
+  #     input_motor:
+  #       control_mode: torque
+  #     output_motor:
+  #       control_mode: position
+  #     trace_file: "backlash_trace.csv"
+  # - id: ENCODER
+  #   type: grid_search
+  #   settings:
+  #     input_motor:
+  #       control_mode: velocity
+  #       command_list: [4,-4,4,-4] # units = Rad/s
+  #     output_motor:
+  #       control_mode: torque
+  #       command_list: [0]
+  #     loop_order: [velocity, torque]
+  #     duration_per_point_s: 1.5
+  #     settle_time_s: 0.25
+  #     transition_rate: 0.05 #Fraction of max allowable velocity / torque ramp rate
+  # - id: CSV-ENCODER
+  #   type: test_trace
+  #   settings:
+  #     input_motor:
+  #       control_mode: velocity
+  #     output_motor:
+  #       control_mode: torque
+  #     trace_file: "encoder_trace.csv"
+  - id: EFFICIENCY
+    type: grid_search
+    settings:
+      input_motor:
+        control_mode: torque
+        command_list: [0.1,0.25,0.5,1,2,4,8]
+      output_motor:
+        control_mode: velocity
+        command_list: [-10,-7.5,-5.0,-2.5,0,2.5,5,7.5,10] # units = Rad/s
+      loop_order: [velocity, torque]
+      duration_per_point_s: 3
+      settle_time_s: 0.25
+      transition_rate: 0.05 #Fraction of max allowable velocity / torque ramp rate
+  # - id: COGGING
+  #   type: test_trace
+  #   settings:
+  #     input_motor:
+  #       control_mode: torque
+  #     output_motor:
+  #       control_mode: position
+  #     trace_file: "cogging_trace.csv"
+  # - id: COGGING-REVERSE
+  #   type: test_trace
+  #   settings:
+  #     input_motor:
+  #       control_mode: position
+  #     output_motor:
+  #       control_mode: torque
+  #     trace_file: "cogging_trace_backward.csv"

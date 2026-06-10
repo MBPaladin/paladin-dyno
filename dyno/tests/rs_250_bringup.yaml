@@ -1,0 +1,46 @@
+behaviors:
+  # - id: Torque_Accuracy
+  #   type: test_trace
+  #   settings:
+  #     input_motor:
+  #       control_mode: torque
+  #     output_motor:
+  #       control_mode: position
+  #     trace_file: "torque_sweep_20Nm.csv"
+  # - id: BACKLASH
+  #   type: test_trace
+  #   settings:
+  #     input_motor:
+  #       control_mode: torque
+  #     output_motor:
+  #       control_mode: position
+  #     trace_file: "backlash_trace.csv"
+  - id: EFFICIENCY
+    type: grid_search
+    settings:
+      input_motor:
+        control_mode: velocity
+        command_list: [1, 2, 3, 4] # units = Rad/s
+      output_motor:
+        control_mode: torque
+        command_list: [0, 2.5, 5]
+      loop_order: [velocity, torque]
+      duration_per_point_s: 1.5
+      settle_time_s: 0.25
+      transition_rate: 0.05 #Fraction of max allowable velocity / torque ramp rate
+  # - id: 015_sine_cycle_position
+  #   type: test_trace
+  #   settings:
+  #     input_motor:
+  #       control_mode: position
+  #     output_motor:
+  #       control_mode: torque
+  #     trace_file: "0_15_sine_cycle_position.csv"
+  # - id: 015_sine_cycle_torque
+  #   type: test_trace
+  #   settings:
+  #     input_motor:
+  #       control_mode: torque
+  #     output_motor:
+  #       control_mode: position
+  #     trace_file: "0_15_sine_cycle_torque.csv"

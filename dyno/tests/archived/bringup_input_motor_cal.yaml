@@ -1,0 +1,12 @@
+behaviors:
+
+  # A backlash measurement test that runs up to 10 Nm
+  - id: CAL
+    name: Input motor torque calibration test
+    type: test_trace
+    settings:
+      input_motor:
+        control_mode: torque
+      output_motor:
+        control_mode: position
+      trace_file: "input_cal.csv"

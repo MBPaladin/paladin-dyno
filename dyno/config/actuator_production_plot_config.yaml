@@ -1,0 +1,75 @@
+Output Torque:
+  title: Torque
+  unit: Nm
+  range: # defines range of each scope
+    - -100
+    - 100
+  data_keys: # defines which log entries to pull for the scope
+    - dut_effort
+    - load_torque
+    - dut_torque_command
+    - load_torque_command
+  legends: # defines legends for the above keys
+    - DUT Effort
+    - Measured Torque
+    - DUT Torque Command
+    - LOAD Torque Command
+  pens: # sets colors for each trace
+    - r
+    - g
+    - c
+    - c
+Output Velocity:
+  title: Velocity
+  unit: Rad/s
+  range:
+    - -12
+    - 12
+  data_keys:
+    - dut_velocity
+    - load_velocity
+    - dut_velocity_command
+    - load_velocity_command
+  legends:
+    - DUT Velocity
+    - Load Velocity
+    - DUT Velocity Command
+    - LOAD Velocity Command
+  pens:
+    - r
+    - g
+    - c
+    - c
+Output Position:
+  title: Position
+  unit: Rad
+  range:
+    - -0.1
+    - 6.4
+  data_keys:
+    - dut_output_position
+    - load_position
+    - dut_position_command
+    - load_position_command
+  legends:
+    - DUT Position
+    - Load Position
+    - DUT Position Command
+    - LOAD Position Command
+  pens:
+    - r
+    - g
+    - c
+    - c
+Load Temperature:
+  title: Temperature
+  unit: C
+  range: # defines range of each scope
+    - -100
+    - 100
+  data_keys: # defines which log entries to pull for the scope
+    - load_stator_temp
+  legends: # defines legends for the above keys
+    - Load Winding Temp
+  pens: # sets colors for each trace
+    - r

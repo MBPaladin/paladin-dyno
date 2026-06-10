@@ -1,0 +1,19 @@
+behaviors:
+
+  # A grid search actuator efficency test
+  - id: LIMITS
+    type: grid_search
+    settings:
+      input_motor:
+        control_mode: velocity
+        # command_list: [15, 30, 60, 100, 150, 200, 250, 300, 350] # units = Rad/s - up to 12 rads/s output
+        command_list: [240]
+      output_motor:
+        control_mode: torque
+        # command_list: [150,200,250]
+        # command_list: [-5, -10, -20, -40, -60, -80, -100, -120, -140, -160, -180, -200, -220, -240, -260, -280] # Small torque sweeps around zero
+        command_list: [-180, -220, -260, -300] # Small torque sweeps around zero
+      loop_order: [velocity, torque]
+      duration_per_point_s: 0.8
+      settle_time_s: 0.2
+      transition_rate: 0.4 #Fraction of max allowable velocity / torque ramp rate

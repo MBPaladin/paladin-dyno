@@ -1,0 +1,16 @@
+behaviors:
+
+  # A grid search actuator efficency test
+  - id: EFFICIENCY
+    type: grid_search
+    settings:
+      input_motor:
+        control_mode: velocity
+        command_list: [15, 30, 60, 120, 180, 240, 300]
+      output_motor:
+        control_mode: torque
+        command_list: [-5, -240, -10, -200, -20, -160, -40, -120, -60, -80, 5, 240, 10, 200, 20, 160, 40, 120, 60, 80] # interlacing high / low torque events is an added precaution against triggering thermal foldback limits
+      loop_order: [velocity, torque]
+      duration_per_point_s: 2
+      settle_time_s: 0.5
+      transition_rate: 0.25 #Fraction of max allowable velocity / torque ramp rate

@@ -1,0 +1,2 @@
+cycle_time_us: 1000 # overall ethercat cycle time. AKD / ELM have their cycle times hard coded in their setup functions
+interface: enp86s0

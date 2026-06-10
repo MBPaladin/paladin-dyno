@@ -1,0 +1,16 @@
+behaviors:
+
+  # A grid search actuator efficency test
+  - id: EFFICIENCY
+    type: grid_search
+    settings:
+      input_motor:
+        control_mode: velocity
+        command_list: [-20,-50,-100,-200,20,50,100,200] # units = Rad/s
+      output_motor:
+        control_mode: torque
+        command_list: [-5,-10,-20,-30,-40,5,10,20,30,40] # units Nm
+      loop_order: [velocity, torque]
+      duration_per_point_s: 3
+      settle_time_s: 1.0
+      transition_rate: 0.25 #Fraction of max allowable velocity / torque ramp rate

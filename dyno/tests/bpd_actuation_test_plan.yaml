@@ -1,0 +1,45 @@
+behaviors:
+  # - id: POSITIONAL_ACCURACY
+  #   name: PositionalAccuracyCoarse
+  #   description: Coarse positional accuracy — 10-degree increments, single cycle
+  #   type: test_trace
+  #   settings:
+  #     input_motor:
+  #       control_mode: position
+  #     output_motor:
+  #       control_mode: torque
+  #     trace_file: "step_positional_accuracy.csv"
+  - id: BACKLASH
+    type: test_trace
+    settings:
+      use_relative_command: True
+      input_motor:
+        control_mode: torque
+        scale_override: 0.01
+      output_motor:
+        control_mode: position
+      trace_file: "bpd_backlash_trace.csv"
+  # - id: EFFICIENCY
+  #   type: grid_search
+  #   settings:
+  #     use_relative_command: True
+  #     input_motor:
+  #       control_mode: velocity
+  #       command_list: [0.1, 0.2] # units = Rad/s
+  #     output_motor:
+  #       control_mode: torque
+  #       command_list: [-0.05, -0.025, -0.0125, 0.0125, 0.025, 0.05]
+  #     loop_order: [velocity, torque]
+  #     duration_per_point_s: 1.5
+  #     settle_time_s: 0.25
+  #     transition_rate: 0.05 #Fraction of max allowable velocity / torque ramp rate
+  - id: PEAK_EFFORT
+    type: test_trace
+    settings:
+      use_relative_command: True
+      input_motor:
+        control_mode: torque
+        scale_override: 0.01
+      output_motor:
+        control_mode: position
+      trace_file: bpd_peak_effort_trace.csv

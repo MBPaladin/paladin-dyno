@@ -1,0 +1,30 @@
+behaviors:
+  - id: WARMUP
+    type: test_trace
+    settings:
+      input_motor:
+        control_mode: torque
+      output_motor:
+        control_mode: position
+      trace_file: "bringup.csv"
+  # - id: CSV-ENCODER
+  #   type: test_trace
+  #   settings:
+  #     input_motor:
+  #       control_mode: velocity
+  #     output_motor:
+  #       control_mode: torque
+  #     trace_file: "encoder_trace.csv"
+  # - id: EFFICIENCY
+  #   type: grid_search
+  #   settings:
+  #     input_motor:
+  #       control_mode: velocity
+  #       command_list: [-2,-1,-0.5,-0.25,25,0.5,1,2] # units = Rad/s
+  #     output_motor:
+  #       control_mode: torque
+  #       command_list: [-6,-4,-2,-1,-0.5,0.5,1,2,4,6]
+  #     loop_order: [velocity, torque]
+  #     duration_per_point_s: 1.5
+  #     settle_time_s: 0.25
+  #     transition_rate: 0.05 #Fraction of max allowable velocity / torque ramp rate

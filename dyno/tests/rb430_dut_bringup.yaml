@@ -1,0 +1,38 @@
+# References to common test files
+behaviors:
+  - id: LOOP_SEQ_001
+    description: Runs a duty cycle, then a backlash test, repeated multiple times.
+    type: loop
+    settings:
+      loop_count: 10 # The entire sequence (duty cycle + backlash test) repeats 5 times
+    behaviors:
+      - id: LOOP_SEQ_002
+        description: Runs a duty cycle, then a backlash test, repeated multiple times.
+        type: loop
+        settings:
+          loop_count: 10 # The entire sequence (duty cycle + backlash test) repeats 5 times
+        behaviors:
+          - id: DUTYCYCLE
+            type: test_trace
+            settings:
+              input_motor:
+                control_mode: position
+              output_motor:
+                control_mode: torque
+              trace_file: "0_15_sine_cycle.csv"
+      # - id: V_DUTYCYCLE
+      #   type: test_trace
+      #   settings:
+      #     input_motor:
+      #       control_mode: velocity
+      #     output_motor:
+      #       control_mode: torque
+      #     trace_file: "v_duty_cycle.csv"
+      # - id: T_DUTYCYCLE
+      #   type: test_trace
+      #   settings:
+      #     input_motor:
+      #       control_mode: torque
+      #     output_motor:
+      #       control_mode: velocity
+      #     trace_file: "t_duty_cycle.csv"

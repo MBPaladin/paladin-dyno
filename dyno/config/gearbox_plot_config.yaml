@@ -1,0 +1,90 @@
+Input Torque:
+  title: Input Torque
+  unit: Nm
+  range: # defines range of each scope
+    - -12
+    - 12
+  data_keys: # defines which log entries to pull for the scope
+    - input_torque
+    - input_torque_command
+  legends: # defines legends for the above keys
+    - Measured
+    - Commanded
+  pens: # sets colors for each trace
+    - r
+    - c
+Output Torque:
+  title: Output Torque
+  unit: Nm
+  range:
+    - -300
+    - 300
+  data_keys:
+    - output_torque
+    - output_torque_command
+  legends:
+    - Measured
+    - Commanded
+  pens:
+    - r
+    - c
+Input Velocity:
+  title: Input Velocity
+  unit: Rad/s
+  range:
+    - -400
+    - 400
+  data_keys:
+    - input_velocity
+    - input_velocity_command
+  legends:
+    - Measured
+    - Commanded
+  pens:
+    - r
+    - c
+Output Velocity:
+  title: Output Velocity
+  unit: Rad/s
+  range:
+    - -13
+    - 13
+  data_keys:
+    - output_velocity
+    - output_velocity_command
+  legends:
+    - Measured
+    - Commanded
+  pens:
+    - r
+    - c
+Output Position:
+  title: Output Position
+  unit: Rad
+  range:
+    - -0.1
+    - 6.4
+  data_keys:
+    - output_position
+    - output_position_command
+  legends:
+    - Measured
+    - Commanded
+  pens:
+    - r
+    - c
+Input Position:
+  title: Input Position
+  unit: Rad
+  range:
+    - -0.1
+    - 6.4
+  data_keys:
+    - input_position
+    - input_position_command
+  legends:
+    - Measured
+    - Commanded
+  pens:
+    - r
+    - c

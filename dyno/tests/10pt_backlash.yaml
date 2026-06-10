@@ -1,0 +1,17 @@
+# References to common test files
+imports:
+  - common_backlash_test.yaml
+  - common_slew_10th_rad.yaml
+
+behaviors:
+  - id: LOOP
+    description: Runs a duty cycle, then a backlash test, repeated multiple times.
+    type: loop
+    settings:
+      loop_count: 10 # The entire sequence (duty cycle + backlash test) repeats 5 times
+    behaviors:
+    - type: imported_test
+      id: BACKLASH # Reference another reusable test
+    - type: imported_test
+      id: SLEW # Reference another reusable test
+

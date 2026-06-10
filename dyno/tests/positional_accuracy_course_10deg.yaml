@@ -1,0 +1,16 @@
+behaviors:
+  - id: POS_ACC_LOOP
+    name: PositionalAccuracyLoop
+    description: Repeats the positional accuracy step trace for ISO 230-2 style repeatability statistics
+    type: loop
+    settings:
+      loop_count: 1
+    behaviors:
+      - id: POSITIONAL_ACCURACY
+        type: test_trace
+        settings:
+          input_motor:
+            control_mode: position
+          output_motor:
+            control_mode: torque
+          trace_file: "step_positional_accuracy.csv"

@@ -1,0 +1,15 @@
+behaviors:
+  - id: LOOP
+    description: Runs a duty cycle, then a backlash test, repeated multiple times. # descriptions aren't strictly needed, and can be omitted if preferred
+    type: loop
+    settings:
+      loop_count: 20
+    behaviors:
+      - id: DUTYCYCLE
+        type: test_trace
+        settings:
+          input_motor:
+            control_mode: position
+          output_motor:
+            control_mode: torque
+          trace_file: "duty_cycle.csv"

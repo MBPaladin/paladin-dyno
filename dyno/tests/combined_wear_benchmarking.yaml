@@ -1,0 +1,25 @@
+# References to common test files
+imports:
+  - common_duty_cycle.yaml
+  - common_backlash_test.yaml
+  - common_efficiency_test_32pt_40nm.yaml
+
+behaviors:
+  - id: LOOP_SEQ_001
+    description: Runs a duty cycle, then a backlash test, repeated multiple times.
+    type: loop
+    settings:
+      loop_count: 2 # The entire sequence (duty cycle + backlash test) repeats 5 times
+    behaviors:
+      - id: DUTY_CYCLE_LOOP
+        type: loop
+        settings:
+          loop_count: 10
+        behaviors:
+          - name: WearDutyCycle
+            type: imported_test
+            id: DUTYCYCLE
+      - type: imported_test
+        id: BACKLASH         # Reference the test defined in common_reusable_tests.yaml
+      - type: imported_test
+        id: EFFICIENCY # Reference another reusable test

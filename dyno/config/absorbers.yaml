@@ -1,0 +1,89 @@
+RA080-01:
+  type: rotary
+  flip_torque_sign: True
+  gear_ratio: 1 #Output should always be set to 1
+  motor_params:
+    kt: 5.3
+    k_tanh: 0.025
+  motor_limits:
+    torque: 100
+    velocity: 63
+    acceleration: 12 #Rad/s^2
+    rotatum: 320 #Nm/s, 4 x peak torque value
+  drive_params:
+    i_cont: 8
+
+RA080-02:
+  type: rotary
+  flip_torque_sign: True
+  gear_ratio: 1 #Output should always be set to 1
+  motor_params:
+    kt: 5.3
+    k_tanh: 0.025
+  motor_limits:
+    torque: 100
+    velocity: 63
+    acceleration: 12 #Rad/s^2
+    rotatum: 320 #Nm/s, 4 x peak torque value
+  drive_params:
+    i_cont: 8
+
+RA400-01:
+  type: rotary
+  flip_torque_sign: True
+  gear_ratio: 1 #Output should always be set to 1
+  motor_params:
+    kt: 25.5
+    k_tanh: 0.018
+  motor_limits:
+    torque: 450
+    velocity: 13
+    acceleration: 12 #Rad/s^2
+    rotatum: 1800 #Nm/s, 4 x peak torque value
+  drive_params:
+    i_cont: 8
+
+RA400-02:
+  type: rotary
+  flip_torque_sign: True
+  gear_ratio: 1 #Output should always be set to 1
+  motor_params:
+    kt: 25.5
+    k_tanh: 0.018
+  motor_limits:
+    torque: 450
+    velocity: 13
+    acceleration: 12 #Rad/s^2
+    rotatum: 1800 #Nm/s, 4 x peak torque value
+  drive_params:
+    i_cont: 8
+
+RA400-03:
+  type: rotary
+  flip_torque_sign: True
+  gear_ratio: 1 #Output should always be set to 1
+  motor_params:
+    kt: 25.5
+    k_tanh: 0.018
+  motor_limits:
+    torque: 450
+    velocity: 13
+    acceleration: 12 #Rad/s^2
+    rotatum: 1800 #Nm/s, 4 x peak torque value
+  drive_params:
+    i_cont: 8
+
+RA400-04:
+  type: rotary
+  flip_torque_sign: True
+  gear_ratio: 1 #Output should always be set to 1
+  motor_params:
+    kt: 25.5
+    k_tanh: 0.018
+  motor_limits:
+    torque: 450
+    velocity: 13
+    acceleration: 12 #Rad/s^2
+    rotatum: 1800 #Nm/s, 4 x peak torque value
+  drive_params:
+    i_cont: 8

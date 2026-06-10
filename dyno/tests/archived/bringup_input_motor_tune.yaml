@@ -1,0 +1,12 @@
+behaviors:
+
+  # A backlash measurement test that runs up to 10 Nm
+  - id: TUNE
+    name: Input motor position tuning trace
+    type: test_trace
+    settings:
+      input_motor:
+        control_mode: position
+      output_motor:
+        control_mode: torque
+      trace_file: "input_tune.csv"
