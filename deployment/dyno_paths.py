@@ -1,4 +1,4 @@
-working_directory = "/home/paladin/Documents/Github/rocky-dyno"
+working_directory = "/home/paladin/Documents/Github/paladin-dyno"
 dyno_directory = f"{working_directory}/dyno"
 dyno_src_directory = f"{dyno_directory}/src"
 dyno_test_directory = f"{dyno_directory}/tests"
