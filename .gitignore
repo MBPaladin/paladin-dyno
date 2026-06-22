@@ -53,3 +53,6 @@ Thumbs.db
 __pycache__/
 .venv
 *.png
+
+# Results
+brian_tests/
