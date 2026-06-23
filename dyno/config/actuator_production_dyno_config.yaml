@@ -2,7 +2,7 @@
 # All logical sensors go here. Port mapping handles the hardware routing.
 sensors:
   # --- Configurable (User Accessible) ---
-  sensor_torque_dummy:
+  input_torque:
     port: ADC1
     supply: 24v
     fs_v: 10
@@ -13,7 +13,7 @@ sensors:
   load_torque:
     port: RESERVED_ADC
     fs_v: 10
-    fs_pos: -500
+    fs_pos: 500
     offset: 0
     supply: NA  # Internal wiring has permanent power
 
@@ -118,7 +118,7 @@ expected_slave_layout:
     name: LOAD
     params:
       flip_torque_sign: True
-      gear_ratio: 1 #Output should always be set to 1
+      gear_ratio: 1 #Output should always be set to 1S
       motor_params:
         kt: 5.3
         k_tanh: 0.025
@@ -130,11 +130,13 @@ expected_slave_layout:
   - model: AKD
     name: DUT
     params:
-      flip_torque_sign: True
+      flip_torque_sign: False
       gear_ratio: 1 #Output should always be set to 1
       motor_params:
+        #kt: 6
         kt: 7.35
         k_tanh: 0.068
+        #k_tanh: 0.15
       motor_limits:
         torque: 73
         velocity: 31.5
@@ -147,7 +149,7 @@ expected_slave_layout:
 safeties: # Measured values over these limits will cause the test to stop
   output_torque: 70 # Nm on the output torque cell. measured abs(torque) over this limit will stop a test
   input_torque: 15 # Nm on the input torque cell. measured abs(torque) over this limit will stop a test
-  output_velocity: 15 # rad/s on the output. measured abs(velocity) over this limit will stop the test
+  output_velocity: 31.5 # rad/s on the output. measured abs(velocity) over this limit will stop the test
   input_velocity: 500 # rad/s
 
 gui_params: # defines length and resolution of the plots

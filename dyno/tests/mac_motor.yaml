@@ -1,19 +1,19 @@
 behaviors:
-  - id: WARMUP
-    type: test_trace
-    settings:
-      input_motor:
-        control_mode: torque
-      output_motor:
-        control_mode: position
-      trace_file: "bringup.csv"
+  # - id: WARMUP
+  #   type: test_trace
+  #   settings:
+  #     input_motor:
+  #       control_mode: torque
+  #     output_motor:
+  #       control_mode: position
+  #     trace_file: "torque_sawtooth.csv"
   # - id: CSV-ENCODER
   #   type: test_trace
   #   settings:
   #     input_motor:
-  #       control_mode: velocity
-  #     output_motor:
   #       control_mode: torque
+  #     output_motor:
+  #       control_mode: velocity
   #     trace_file: "encoder_trace.csv"
   # - id: EFFICIENCY
   #   type: grid_search
@@ -28,3 +28,19 @@ behaviors:
   #     duration_per_point_s: 1.5
   #     settle_time_s: 0.25
   #     transition_rate: 0.05 #Fraction of max allowable velocity / torque ramp rate
+  # - id: COGGING-TORQUE
+  #   type: test_trace
+  #   settings:
+  #     input_motor:
+  #       control_mode: torque
+  #     output_motor:
+  #       control_mode: position
+  #     trace_file: "cogging_trace_generated.csv"
+  - id: COGGING-TORQUE-VC
+    type: test_trace
+    settings:
+      input_motor:
+        control_mode: torque
+      output_motor:
+        control_mode: velocity
+      trace_file: "cogging_trace_vc.csv"

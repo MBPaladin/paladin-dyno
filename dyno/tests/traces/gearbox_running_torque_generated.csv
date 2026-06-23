@@ -1,0 +1,5 @@
+time,input_motor_velocity,output_motor_position
+0,0,0
+30,300,0
+90,-300,0
+120,0,0
