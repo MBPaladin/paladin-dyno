@@ -1,9 +1,11 @@
-"""Combined post-processing of Brian's dyno test logs.
+"""Combined post-processing of Brian's motor dyno test logs.
 
-Opens each relevant .hdf5 file in dyno/logs/brian_tests/, runs the analysis
-selected by filename, and writes all report materials (figures, CSVs, summary
-text/JSON) into dyno/logs/brian_tests/results/. The results folder is wiped at
-the start of every run so stale outputs never accumulate.
+Opens each relevant .hdf5 file in dyno/logs/brian_tests/motor_tests/, runs the
+analysis selected by filename, and writes all report materials (figures, CSVs,
+summary text/JSON) into dyno/logs/brian_tests/motor_tests/results/. The results
+folder is wiped at the start of every run so stale outputs never accumulate.
+(Gearbox logs live in a sibling dyno/logs/brian_tests/gearbox_tests/ folder and
+are handled by a separate script.)
 
 Run with the anaconda base interpreter:
     "C:/Users/Nathan Justus/anaconda3/python.exe" dyno/src/mac_post_processing.py
@@ -23,8 +25,8 @@ from scipy.signal import find_peaks
 
 # --- Paths ------------------------------------------------------------------
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-BRIAN_TESTS_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, '..', 'logs', 'brian_tests'))
-RESULTS_DIR = os.path.join(BRIAN_TESTS_DIR, 'results')
+MOTOR_TESTS_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, '..', 'logs', 'brian_tests', 'motor_tests'))
+RESULTS_DIR = os.path.join(MOTOR_TESTS_DIR, 'results')
 
 # --- Tunables ---------------------------------------------------------------
 TORQUE_RESPONSE_SAMPLE_STEP_ARMS = 0.25  # density of the fit-derived current/torque CSV
@@ -112,7 +114,7 @@ def tanh_model_offset(current, A, B, C):
 
 def load_spec_sheet():
     """Read motor_current_specs.csv (Phase Current Arms, Torque Nm) if present."""
-    spec_path = os.path.join(BRIAN_TESTS_DIR, 'motor_current_specs.csv')
+    spec_path = os.path.join(MOTOR_TESTS_DIR, 'motor_current_specs.csv')
     if not os.path.isfile(spec_path):
         print(f'  WARNING: spec sheet not found at {spec_path}')
         return None, None
@@ -677,12 +679,12 @@ def _norm(filename):
 
 def find_file(*needles):
     """Return the path of the first .hdf5 whose normalized name contains all needles."""
-    for fn in sorted(os.listdir(BRIAN_TESTS_DIR)):
+    for fn in sorted(os.listdir(MOTOR_TESTS_DIR)):
         if not fn.endswith('.hdf5'):
             continue
         norm = _norm(fn)
         if all(n in norm for n in needles):
-            return os.path.join(BRIAN_TESTS_DIR, fn)
+            return os.path.join(MOTOR_TESTS_DIR, fn)
     return None
 
 
@@ -714,10 +716,10 @@ def main():
 
     # Combined roll-up across all analyses run this pass.
     if combined:
-        with open(os.path.join(RESULTS_DIR, 'brian_tests_report.json'), 'w') as jf:
+        with open(os.path.join(RESULTS_DIR, 'motor_tests_report.json'), 'w') as jf:
             json.dump(combined, jf, indent=2, default=str)
-        with open(os.path.join(RESULTS_DIR, 'brian_tests_report.txt'), 'w') as tf:
-            tf.write('Brian Tests — Combined Report\n')
+        with open(os.path.join(RESULTS_DIR, 'motor_tests_report.txt'), 'w') as tf:
+            tf.write('Motor Tests — Combined Report\n')
             tf.write('=' * 40 + '\n\n')
             for test, summary in combined.items():
                 tf.write(f'[{test}]\n')
@@ -727,7 +729,7 @@ def main():
                     else:
                         tf.write(f'  {k:30s}: {v}\n')
                 tf.write('\n')
-        print('Saved combined report: brian_tests_report.txt / .json')
+        print('Saved combined report: motor_tests_report.txt / .json')
 
     print('Done.')
 
