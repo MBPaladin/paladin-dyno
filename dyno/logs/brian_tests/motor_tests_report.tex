@@ -1,0 +1,177 @@
+\documentclass[11pt]{article}
+\input{_report_preamble}
+
+\title{\textbf{Transverse-Flux Fan Motor: Dynamometer Test Report}}
+\author{Paladin Dynamics --- Agility Dyno}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+% ===========================================================================
+\section{Introduction}
+% ===========================================================================
+This report summarizes blocked-rotor and running dynamometer tests on the
+transverse-current (transverse-flux) fan motor. The device under test (DUT) is a
+high--pole-count machine with \textbf{30 pole pairs}, driven on the Agility dyno
+against a load motor and an in-line torque cell.
+
+The transverse-flux topology decouples the electric and magnetic loading: each
+pole is its own flux path, so the machine packs many poles into a short axial
+length and produces high torque density at low speed. That same architecture
+sets the behavior we look for in the tests below:
+
+\begin{itemize}
+  \item \textbf{Strong cogging.} With 30 pole pairs and a segmented stator, the
+        rotor sees a large number of detent positions per revolution. The
+        reluctance variation as poles pass the stator teeth produces a
+        position-periodic torque ripple even with no current applied
+        (Section~\ref{sec:cogging}).
+  \item \textbf{Mid/high-frequency excitation.} Because cogging repeats once per
+        electrical period, its forcing frequency is $30\times$ the mechanical
+        rotation rate. Even modest shaft speeds push that forcing into the
+        structural bandwidth of the rotor/fixture, so we expect speed-dependent
+        \emph{resonant} amplification of the ripple (Sections~\ref{sec:fft}
+        and~\ref{sec:cogging}).
+  \item \textbf{Magnetic saturation.} High flux density per pole means the
+        torque/current curve bends over well inside the operating envelope; we
+        characterize this with a saturating fit in Section~\ref{sec:torque}.
+\end{itemize}
+
+The tests reported here are: (i) a blocked-rotor torque-vs-current sweep,
+(ii) a no-load running-torque-vs-velocity sweep, and (iii) a velocity-controlled
+cogging characterization across speed and load.
+
+% ===========================================================================
+\section{Torque Response}\label{sec:torque}
+% ===========================================================================
+The rotor was held stationary while the torque command was swept; phase current
+(\si{\ampere_{rms}}) was measured against load-cell torque. The data were fit to a
+saturating model with a zero-current bias term,
+\begin{equation}
+  T(I) = A\,\tanh(B\,I) + C,
+\end{equation}
+where the $\tanh$ captures magnetic saturation and $C$ absorbs the measured
+zero-current torque bias (cell offset, cogging at the parked angle, gravity).
+$C$ is reported as a diagnostic and then subtracted, so the plotted data, fit,
+and datasheet overlay all share an odd, through-origin frame.
+
+\resultfig{motor_tests/results/torque_response/torque_response_torque_vs_current.png}{0.78}
+  {Blocked-rotor torque vs.\ phase current (bias-corrected), with the saturating
+   fit and the manufacturer spec sheet overlaid.}{fig:torque}
+
+\begin{table}[H]
+  \centering
+  \caption{Torque-response fit parameters.}
+  \begin{tabular}{lrl}
+    \toprule
+    Parameter & Value & Notes\\
+    \midrule
+    Small-signal $K_t = AB$ & \num{7.94}\,\si{\newton\meter\per\ampere_{rms}} & slope at $I=0$\\
+    Saturation torque $A$   & \num{78.1}\,\si{\newton\meter} & model asymptote\\
+    Saturation rate $B$     & \num{0.1017}\,\si{\per\ampere_{rms}} & \\
+    Zero-current bias $C$   & \num{0.797}\,\si{\newton\meter} & removed after fit\\
+    $R^2$ / RMSE            & \num{0.9997} / \num{0.71}\,\si{\newton\meter} & over $\pm\,\SI{11.4}{\ampere_{rms}}$\\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\paragraph{Fit vs.\ spec sheet.} The fit is essentially exact ($R^2=0.9997$).
+The measured small-signal torque constant, \SI{7.94}{\newton\meter\per\ampere_{rms}},
+runs slightly \emph{above} the datasheet's near-origin slope ($\approx
+\SI{7}{\newton\meter\per\ampere}$): the real motor makes a touch more torque per
+amp at low current. The trend reverses at the top of the range --- the spec sheet
+climbs past the measured curve beyond $\sim\!\SI{8}{\ampere_{rms}}$, i.e.\ the
+hardware saturates a little harder than the datasheet predicts. Within the tested
+window the motor reaches $\sim\!\SI{64}{\newton\meter}$ at \SI{11.4}{\ampere_{rms}},
+short of the $A=\SI{78}{\newton\meter}$ asymptote.
+
+% ===========================================================================
+\section{Running Torque vs.\ Velocity}\label{sec:running}
+% ===========================================================================
+With the DUT unpowered, the load motor drove it through a triangular velocity
+profile ($0\!\to\!+30\!\to\!0\!\to\!-30\!\to\!0$\,\si{\radian\per\second}) while
+the load cell recorded the torque needed to turn it --- pure parasitic loss. The
+constant-acceleration ramps add an inertia term $J\dot\omega$ that is $+$ on the
+accel pass and $-$ on the decel pass; binning by velocity over the whole run
+averages the two passes and cancels it, leaving the friction-vs-speed curve. Each
+direction was fit to Coulomb~$+$~viscous, $T(\omega)=T_c\,\mathrm{sign}(\omega)+b\,\omega$.
+
+\resultfig{motor_tests/results/running_torque/running_torque_torque_vs_velocity.png}{0.78}
+  {No-load running torque vs.\ driven velocity (offset-corrected). Smoothed mean
+   over \SI{0.5}{\radian\per\second} bins with per-direction Coulomb+viscous fits.}{fig:running}
+
+\begin{table}[H]
+  \centering
+  \caption{No-load drag parameters.}
+  \begin{tabular}{lr}
+    \toprule
+    Parameter & Value\\
+    \midrule
+    Coulomb friction $T_c$        & \num{0.695}\,\si{\newton\meter}\\
+    Viscous (mean) $b$            & \num{0.0216}\,\si{\newton\meter\per(\radian\per\second)}\\
+    Viscous ($+\omega$ / $-\omega$) & \num{0.0161} / \num{0.0271}\,\si{\newton\meter\per(\radian\per\second)}\\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+The drag is dominated by Coulomb friction with a small viscous slope. Note the
+raw cloud (gray) \emph{widens} with $|\omega|$: that spread is the cogging ripple
+discussed next, growing as the cogging forcing frequency rises with speed. The
+modest per-direction $R^2$ reflects how small the mean drag is relative to that
+ripple, not a poor fit of the underlying friction.
+
+% ---------------------------------------------------------------------------
+\subsection{FFT Analysis}\label{sec:fft}
+% ---------------------------------------------------------------------------
+\placeholder{Spectral analysis of the running-torque signal vs.\ speed (order
+tracking of the cogging harmonics and identification of the fixed structural
+resonances near \SI{12}{\hertz} and \SI{24}{\hertz}). This section will provide
+the mechanism that explains the speed-dependent cogging amplification in
+Section~\ref{sec:cogging}. Results not yet generated.}
+
+% ===========================================================================
+\section{Cogging Analysis}\label{sec:cogging}
+% ===========================================================================
+The load motor drove the DUT through a grid of speed plateaus
+($\pm 4\text{--}30$\,\si{\radian\per\second}) and held torque levels
+($0,10,20,25$\,\si{\newton\meter}) while load torque was recorded against motor
+angle. Folding torque over angle reveals the cogging pattern. (Results shown are
+from the \texttt{cogging\_10s} run.)
+
+\paragraph{Global view.} At the slowest speed (\SI{4}{\radian\per\second}), where
+dynamic amplification is minimal, the cogging is a clean periodic ripple riding on
+the commanded torque level across a full mechanical revolution.
+
+\resultfig{motor_tests/results/cogging_10s/cogging_10s_global.png}{0.82}
+  {Output torque vs.\ mechanical angle over one full input rotation at
+   \SI{4}{\radian\per\second}, one trace per torque level (shaded $\pm$ std).}{fig:cog-global}
+
+\paragraph{Per-phase (local) view.} Folding over a single pole-pair period and
+subtracting the mean isolates the repeatable cogging waveform. The peak-to-peak
+ripple is $\approx\SI{1.4}{\newton\meter}$ unloaded, rising to
+$\approx 2.1\text{--}2.3$\,\si{\newton\meter} under load --- load-dependent, as
+expected when stator saturation interacts with the rotor detent pattern.
+
+\resultfig{motor_tests/results/cogging_10s/cogging_10s_local.png}{0.72}
+  {Phase-folded, mean-subtracted cogging over one pole-pair period at
+   \SI{4}{\radian\per\second}, by torque level.}{fig:cog-local}
+
+\paragraph{Speed dependence.} Repeating the per-phase fold at every speed
+exposes a strong dynamic effect: the folded ripple does \emph{not} stay constant.
+Most speeds sit within a $\pm 1\text{--}2$\,\si{\newton\meter} band, but near
+\SI{24}{\radian\per\second} the amplitude balloons several-fold (to
+$\sim\!\pm 7$\,\si{\newton\meter}), with a weaker secondary growth near
+\SI{12}{\radian\per\second}. This is the signature of a \emph{mechanical
+resonance} swept by a cogging order: as speed rises, a cogging harmonic crosses a
+fixed structural mode and the ripple is amplified. These two speeds correspond to
+the resonances near \SI{12}{\hertz} and \SI{24}{\hertz} that the running-torque
+FFT (Section~\ref{sec:fft}, forthcoming) will localize directly --- the spectral
+view tells this story more cleanly than a Campbell diagram, which is why the
+latter is omitted here.
+
+\resultfig{motor_tests/results/cogging_10s/cogging_10s_speed_dep_0Nm.png}{0.82}
+  {Per-phase cogging at \SI{0}{\newton\meter} overlaid across all drive speeds.
+   The \SI{24}{\radian\per\second} trace shows the resonant amplification.}{fig:cog-speed}
+
+\end{document}
