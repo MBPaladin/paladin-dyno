@@ -99,8 +99,8 @@ excluded.
   \end{tabular}
 \end{table}
 
-Efficiency \textbf{rises with output torque} --- from the high 70s/80s\,\% at
-light load up to the low-to-mid 90s\,\% --- because the roughly fixed friction
+Efficiency \textbf{rises with output torque}, from the high 70s/80s\,\% at
+light load up to the low-to-mid 90s\,\%, because the roughly fixed friction
 loss is a shrinking fraction of the transmitted torque. It falls off slightly at
 the highest input speeds. Backdriving sits a few points below forward driving at
 matched operating points, consistent with the overhauling direction paying the
@@ -192,8 +192,10 @@ output-referred back-drive drag.
   \end{tabular}
 \end{table}
 
-Because of motor speed limitations, the output-driven sweep reaches far higher output speed (\SI{10.3}{\radian\per\second}
-vs.\ \SI{2.4}{}) and so exercises the viscous term much more strongly. The two runs
+Driven directly on the output, the motor's speed range maps straight to output
+speed rather than being divided by 26, so this sweep reaches far higher output
+speed (\SI{10.3}{\radian\per\second} vs.\ \SI{2.4}{}) and exercises the viscous
+term much more strongly. The two runs
 are mutually consistent: referring the input-driven Coulomb drag to the output by
 the power-equivalent factor of 26 ($0.040\times26\approx\SI{1.0}{\newton\meter}$)
 lands close to the directly-measured back-drive value of \SI{1.51}{\newton\meter},
@@ -236,8 +238,8 @@ The output torque ripples by \textbf{$\approx\SI{0.9}{\newton\meter}$ RMS}, abou
 gearbox effect: it is nearly the \emph{same} absolute size at 50, 80, and
 \SI{110}{\newton\meter} of load (so it reads as a larger percentage at light load),
 and it drops to a $\approx\SI{0.3}{\newton\meter}$ floor when the shaft is held
-still: it is produced by rotation (the cycloidal lobe-pass hand-off), not
-by measurement noise.
+still, showing it is produced by rotation (the cycloidal lobe-pass hand-off)
+rather than measurement noise.
 
 % ===========================================================================
 \appendix
@@ -251,11 +253,10 @@ input-torque ring-down was FFT'd to find structural natural frequencies.
 
 The dominant mode is at \SI{21.4}{\hertz}, with further peaks at \SI{64}{\hertz}
 and a cluster near \SI{407}{}--\SI{438}{\hertz}. This appendix is included because
-the low frequency \SI{21.4}{\hertz} mode lines up with the running-torque ripple
-resonance ($\approx\SI{21.4}{\hertz}$, Section~\ref{sec:gbrunning}): the ripple
-amplified at high input speed is partly a \emph{structural} resonance of the test
-fixture being driven by the cycloidal lobe-pass forcing, not solely a property of
-the gearbox itself. This should be kept in mind when interpreting the high-speed
-ripple magnitude.
+the \SI{21.4}{\hertz} mode lines up with the broad structural peak in the
+running-torque spectrum (Section~\ref{sec:gbrunning}): that peak is the fixture
+resonating as the cycloidal lobe-pass forcing sweeps through its natural frequency,
+not a property of the gearbox itself. It is worth keeping in mind when interpreting
+the ripple seen in the running-torque sweeps.
 
 \end{document}
