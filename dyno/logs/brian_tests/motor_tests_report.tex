@@ -8,12 +8,15 @@
 \begin{document}
 \maketitle
 
+\resultfig{pics/FanMotor.jpg}{0.25}
+  {The transverse-flux fan attatched to the mounting fixture.}{fig:fan-motor}
+
 % ===========================================================================
 \section{Introduction}
 % ===========================================================================
 This report summarizes blocked-rotor and running dynamometer tests on the
 transverse-current (transverse-flux) fan motor. The device under test (DUT) is a
-high--pole-count machine with \textbf{30 pole pairs}, driven on the Paladin dynamometer
+high-pole-count machine with \textbf{30 pole pairs}, driven on the Paladin dynamometer
 against a load motor and an in-line torque cell.
 
 The transverse-flux topology decouples the electric and magnetic loading: each
@@ -31,8 +34,7 @@ sets the behavior we look for in the tests below:
         electrical period, its forcing frequency is $30\times$ the mechanical
         rotation rate. Even modest shaft speeds push that forcing into the
         structural bandwidth of the rotor/fixture, so we expect speed-dependent
-        \emph{resonant} amplification of the ripple (Sections~\ref{sec:fft}
-        and~\ref{sec:cogging}).
+        \emph{resonant} amplification of the ripple (Section~\ref{sec:cogging}).
   \item \textbf{Magnetic saturation.} High flux density per pole means the
         torque/current curve bends over well inside the operating envelope; we
         characterize this with a saturating fit in Section~\ref{sec:torque}.
@@ -112,19 +114,11 @@ direction was fit to Coulomb~$+$~viscous, $T(\omega)=T_c\,\mathrm{sign}(\omega)+
 \end{table}
 
 The drag is dominated by Coulomb friction with a small viscous slope. Note the
-raw cloud (gray) \emph{widens} with $|\omega|$: that spread is the cogging ripple
-discussed next, growing as the cogging forcing frequency rises with speed. The
+raw cloud (gray) \emph{widens} with $|\omega|$: that spread is the cogging ripple,
+growing as the cogging forcing frequency rises with speed and is amplified by a
+structural resonance (characterized spectrally in Section~\ref{sec:cogging}). The
 modest per-direction $R^2$ reflects how small the mean drag is relative to that
 ripple, not a poor fit of the underlying friction.
-
-% ---------------------------------------------------------------------------
-\subsection{FFT Analysis}\label{sec:fft}
-% ---------------------------------------------------------------------------
-\placeholder{Spectral analysis of the running-torque signal vs.\ speed (order
-tracking of the cogging harmonics and identification of the fixed structural
-resonances near \SI{12}{\hertz} and \SI{24}{\hertz}). This section will provide
-the mechanism that explains the speed-dependent cogging amplification in
-Section~\ref{sec:cogging}. Results not yet generated.}
 
 % ===========================================================================
 \section{Cogging Analysis}\label{sec:cogging}
@@ -132,8 +126,7 @@ Section~\ref{sec:cogging}. Results not yet generated.}
 The load motor drove the DUT through a grid of speed plateaus
 ($\pm 4\text{--}30$\,\si{\radian\per\second}) and held torque levels
 ($0,10,20,25$\,\si{\newton\meter}) while load torque was recorded against motor
-angle. Folding torque over angle reveals the cogging pattern. (Results shown are
-from the \texttt{cogging\_10s} run.)
+angle. Folding torque over angle reveals the cogging pattern.
 
 \paragraph{Global view.} At the slowest speed (\SI{4}{\radian\per\second}), where
 dynamic amplification is minimal, the cogging is a clean periodic ripple riding on
@@ -146,8 +139,8 @@ the commanded torque level across a full mechanical revolution.
 \paragraph{Per-phase (local) view.} Folding over a single pole-pair period and
 subtracting the mean isolates the repeatable cogging waveform. The peak-to-peak
 ripple is $\approx\SI{1.4}{\newton\meter}$ unloaded, rising to
-$\approx 2.1\text{--}2.3$\,\si{\newton\meter} under load --- load-dependent, as
-expected when stator saturation interacts with the rotor detent pattern.
+\mbox{$\approx\SI{2.1}{\newton\meter}\text{--}\SI{2.3}{\newton\meter}$} under load, a
+load dependence expected when stator saturation interacts with the rotor detent pattern.
 
 \resultfig{motor_tests/results/cogging_10s/cogging_10s_local.png}{0.72}
   {Phase-folded, mean-subtracted cogging over one pole-pair period at
@@ -155,19 +148,52 @@ expected when stator saturation interacts with the rotor detent pattern.
 
 \paragraph{Speed dependence.} Repeating the per-phase fold at every speed
 exposes a strong dynamic effect: the folded ripple does \emph{not} stay constant.
-Most speeds sit within a $\pm 1\text{--}2$\,\si{\newton\meter} band, but near
-\SI{24}{\radian\per\second} the amplitude balloons several-fold (to
+Most speeds sit within a $\pm 1\text{--}2$\,\si{\newton\meter} band, but at a drive
+speed near \SI{24}{\radian\per\second} the amplitude balloons several-fold (to
 $\sim\!\pm 7$\,\si{\newton\meter}), with a weaker secondary growth near
-\SI{12}{\radian\per\second}. This is the signature of a \emph{mechanical
-resonance} swept by a cogging order: as speed rises, a cogging harmonic crosses a
-fixed structural mode and the ripple is amplified. These two speeds correspond to
-the resonances near \SI{12}{\hertz} and \SI{24}{\hertz} that the running-torque
-FFT (Section~\ref{sec:fft}, forthcoming) will localize directly --- the spectral
-view tells this story more cleanly than a Campbell diagram, which is why the
-latter is omitted here.
+\SI{12}{\radian\per\second}. The ballooned trace also carries two humps per
+pole-pair period (a second-harmonic shape), a hint that a specific cogging order,
+not the fundamental, is being amplified. This is the signature of a \emph{mechanical
+resonance} swept by a cogging order: each harmonic climbs in frequency with speed,
+and where one crosses a fixed structural mode the ripple is amplified. By itself
+the speed plot shows \emph{that} something resonates but not \emph{what}; the
+spectral view localizes it.
 
 \resultfig{motor_tests/results/cogging_10s/cogging_10s_speed_dep_0Nm.png}{0.82}
   {Per-phase cogging at \SI{0}{\newton\meter} overlaid across all drive speeds.
    The \SI{24}{\radian\per\second} trace shows the resonant amplification.}{fig:cog-speed}
+
+\subsection{Spectral mechanism}\label{sec:fft}
+The cogging forcing frequency scales with speed (order $n$ sits at
+$n\,p\,\omega/2\pi$ for $p=30$ pole pairs), whereas a structural resonance stays at
+a fixed frequency. Overlaying the cogging spectra taken at each drive speed
+therefore separates the two: the orders march outward with speed while the
+resonances stay put.
+
+\resultfig{motor_tests/results/cogging_10s/cogging_10s_fft.png}{0.97}
+  {Left: cogging-torque spectra at each drive speed (\SI{0}{\newton\meter}); the
+   structural resonances (red) sit at fixed frequencies. Right: amplitude at the
+   dominant \SI{228}{\hertz} resonance vs.\ drive speed, peaking where a low cogging
+   order ($n$) crosses the mode.}{fig:cog-fft}
+
+The spectra show a dominant fixed resonance at \textbf{$\approx\SI{228}{\hertz}$}
+(with a second near \SI{472}{\hertz}) that does not move with speed. That resolves
+the time-domain puzzle: at \SI{24}{\radian\per\second} the \emph{second} cogging
+order ($2p\,\omega/2\pi \approx \SI{229}{\hertz}$) lands on the \SI{228}{\hertz}
+mode and drives the large ripple, while the weaker bump near
+\SI{12}{\radian\per\second} is the fourth order crossing the same mode. Note that
+\SI{24}{\radian\per\second} is a drive \emph{speed}, not the resonance frequency;
+the two are easy to conflate from the speed plot alone. This setup had no tap test
+of its own, but tap tests on related dynamometer fixtures have shown structural
+modes spanning the low tens up to several hundred hertz, consistent with a fixture
+resonance in this range.
+
+\paragraph{Conclusion.} The motor's intrinsic cogging is small and well-behaved:
+$\approx\SI{1.4}{\newton\meter}$ peak-to-peak unloaded, growing modestly under
+load. The dramatic ripple at certain speeds is not a magnetic property but a
+\emph{test-rig} effect, a $\approx\SI{228}{\hertz}$ structural resonance that a low
+cogging order excites near \SI{24}{\radian\per\second}. On a different mechanical
+mounting that amplification would shift or vanish, so the slow-speed
+(\SI{4}{\radian\per\second}) measurement is the one that reflects the motor itself.
 
 \end{document}

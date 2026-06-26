@@ -48,6 +48,13 @@ COGGING_SPECTRUM_NBINS = 480          # frequency-grid bins (~1 Hz); max-pooled 
 COGGING_SPECTRUM_ORDERS = 6           # number of pole-pass harmonic order lines to overlay
 COGGING_SPECTRUM_N_RESONANCES = 3     # number of fixed-resonance lines to detect and mark
 
+COGGING_FFT_FMAX_HZ = 500             # max frequency for the spectral (FFT) view
+COGGING_FFT_NBINS = 500               # frequency-grid bins for max-pooling (~1 Hz)
+COGGING_FFT_MIN_RES_HZ = 50           # ignore peaks below this when locating structural resonances
+COGGING_FFT_N_RES = 2                 # number of structural resonances to mark
+COGGING_FFT_RES_BAND_HZ = 8.0         # half-width of the band used for resonance-amplitude-vs-speed
+COGGING_FFT_ORDER_MARKS = (2, 3, 4, 5)  # cogging orders whose resonance-crossing speeds are annotated
+
 
 def reset_results_dir():
     """Delete and recreate the results folder so each run starts clean."""
@@ -536,6 +543,108 @@ def cogging_harmonics(name, stem, out_dir, segs, pos, vel, tq, speeds, sign, pp,
     return dominant
 
 
+def cogging_fft(name, stem, out_dir, segs, pos, vel, tq, speeds, sign, pp, fs, torque):
+    """Spectral view of the cogging torque that explains the speed-dependent
+    amplification without a tap test.
+
+    A structural resonance is a FIXED frequency: it does not move with shaft speed,
+    whereas the cogging orders do (order n sits at n*pp*w/2pi). Overlaying the
+    per-speed amplitude spectra exposes the fixed resonance peaks directly, and the
+    ripple balloons at whatever drive speed places a strong (low) cogging order on
+    one of them. Returns the dominant resonance frequency (Hz)."""
+    fmax = min(COGGING_FFT_FMAX_HZ, 0.97 * fs / 2)
+    grid = np.linspace(0.0, fmax, COGGING_FFT_NBINS + 1)
+    gc = 0.5 * (grid[:-1] + grid[1:])
+
+    raw_spectra = []   # (speed, fr, amp) at native resolution, for the overlay
+    binned = []        # max-pooled onto the common grid, for the envelope/band
+    for spd in speeds:
+        _, q = _cogging_trace(pos, vel, tq, segs, sign * spd, torque)
+        if q is None or q.size < 256:
+            raw_spectra.append((spd, None, None))
+            binned.append(np.full(len(gc), np.nan))
+            continue
+        qd = q - np.mean(q)
+        w = np.hanning(qd.size)
+        amp = np.abs(np.fft.rfft(qd * w)) * 2.0 / np.sum(w)
+        fr = np.fft.rfftfreq(qd.size, 1.0 / fs)
+        raw_spectra.append((spd, fr, amp))
+        idx = np.clip(np.digitize(fr, grid) - 1, 0, len(gc) - 1)
+        b = np.full(len(gc), np.nan)
+        for k in range(len(gc)):
+            sel = amp[idx == k]
+            if sel.size:
+                b[k] = sel.max()
+        binned.append(b)
+    binned = np.array(binned)  # [n_speed, n_grid]
+
+    # Fixed resonances = peaks of the cross-speed envelope (energy piles up wherever
+    # any order crosses a mode), above a low-frequency cutoff.
+    env = np.nanmax(binned, axis=0)
+    valid = gc >= COGGING_FFT_MIN_RES_HZ
+    pk, props = find_peaks(np.where(valid, np.nan_to_num(env), 0.0),
+                           height=np.nanmax(env) * 0.25, distance=15)
+    order = np.argsort(props['peak_heights'])[::-1][:COGGING_FFT_N_RES]
+    res = sorted(float(gc[pk[o]]) for o in order)
+    dominant = float(gc[pk[order[0]]]) if len(order) else float('nan')
+
+    # Resonance-band amplitude vs drive speed (drives the right-hand panel).
+    band_amp = []
+    for j, spd in enumerate(speeds):
+        if dominant == dominant:
+            m = (gc >= dominant - COGGING_FFT_RES_BAND_HZ) & (gc <= dominant + COGGING_FFT_RES_BAND_HZ)
+            band_amp.append(float(np.nanmax(binned[j][m])) if np.any(~np.isnan(binned[j][m])) else np.nan)
+        else:
+            band_amp.append(np.nan)
+    band_amp = np.array(band_amp)
+
+    cmap = plt.cm.viridis
+    fig, (axL, axR) = plt.subplots(1, 2, figsize=(16, 6.5))
+
+    # Left: overlaid per-speed spectra; resonances are the peaks that stay put.
+    for i, (spd, fr, amp) in enumerate(raw_spectra):
+        if fr is None:
+            continue
+        keep = fr <= fmax
+        axL.plot(fr[keep], amp[keep], color=cmap(i / max(len(speeds) - 1, 1)),
+                 linewidth=1.0, alpha=0.85, label=f'{spd:g} rad/s')
+    for rf in res:
+        axL.axvline(rf, color='red', linestyle=':', linewidth=1.3, alpha=0.8)
+        axL.annotate(f'{rf:.0f} Hz', (rf, axL.get_ylim()[1]), color='red', fontsize=9,
+                     ha='center', va='top')
+    axL.set_xlim(0, fmax)
+    axL.set_xlabel('Frequency (Hz)')
+    axL.set_ylabel('Cogging torque amplitude (Nm)')
+    axL.set_title(f'{stem}: cogging spectra by drive speed @ {torque:g} Nm\n'
+                  '(structural resonances are fixed in frequency)')
+    axL.legend(title='Drive speed', fontsize=8, ncol=2)
+    axL.grid(True, alpha=0.3)
+
+    # Right: amplitude at the dominant resonance vs speed, with the drive speeds at
+    # which each cogging order crosses it marked.
+    axR.plot(speeds, band_amp, 'o-', color='tab:blue', linewidth=1.6, markersize=7)
+    if dominant == dominant:
+        for n in COGGING_FFT_ORDER_MARKS:
+            w_cross = dominant * 2.0 * np.pi / (pp * n)  # speed where order n hits the mode
+            if speeds[0] <= w_cross <= speeds[-1]:
+                axR.axvline(w_cross, color='0.5', linestyle='--', linewidth=1.0)
+                axR.annotate(f'{n}x', (w_cross, axR.get_ylim()[1]), color='0.35',
+                             fontsize=9, ha='center', va='top')
+    axR.set_xlabel('Drive speed (rad/s)')
+    axR.set_ylabel(f'Amplitude at {dominant:.0f} Hz resonance (Nm)')
+    axR.set_title('Resonance amplitude vs speed\n(cogging order n crosses the mode at the marked speeds)')
+    axR.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, f'{name}_fft.png'), dpi=200)
+    plt.close(fig)
+
+    _write_wide_csv(os.path.join(out_dir, f'{name}_fft_spectra.csv'),
+                    'frequency_hz', gc, [(f'{spd:g}rad_s', binned[i]) for i, spd in enumerate(speeds)])
+    print(f'  Saved: {name}_fft.png / _fft_spectra.csv  (resonances: {[round(r) for r in res]} Hz)')
+    return dominant, res
+
+
 def analyze_cogging(filepath):
     stem = os.path.splitext(os.path.basename(filepath))[0]
     name = stem  # output prefix, e.g. 'cogging_5s'
@@ -664,6 +773,12 @@ def analyze_cogging(filepath):
         if torque == torque_levels[0]:
             res_hz = rh
     summary['resonance_hz'] = res_hz
+
+    # ---- 5) FFT SPECTRAL VIEW: fixed resonances + order crossings (0 Nm) -----
+    fft_dom, fft_res = cogging_fft(name, stem, out_dir, segs, pos, vel, tq,
+                                   speeds, sign, pp, fs, torque_levels[0])
+    summary['fft_dominant_resonance_hz'] = fft_dom
+    summary['fft_resonances_hz'] = fft_res
 
     return write_summary(name, summary, out_dir)
 
