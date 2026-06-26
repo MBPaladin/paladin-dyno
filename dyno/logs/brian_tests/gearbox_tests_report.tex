@@ -162,11 +162,12 @@ flipped) already measures the output shaft directly and is \emph{not} rescaled.
 
 Input-referred drag is very low and
 grows only weakly with speed, again indicating predominantly rolling contact. A
-torque ripple is present on top of this baseline (RMS
-$\approx\SI{1.75}{\newton\meter}$ at top speed, input-referred), at the cycloidal
-lobe-pass frequency; it is the dominant high-speed feature, and its spectral
-make-up is examined in the frequency-content analysis below
-(Figure~\ref{fig:gbrun-fft}).
+torque ripple rides on top of this baseline at the cycloidal lobe-pass frequency
+and grows large at the highest input speeds, but that growth is mostly the test
+fixture's structural resonance being excited rather than the gearbox itself (see
+Figure~\ref{fig:gbrun-fft}), so its raw amplitude here is not a reliable ripple
+figure. The ripple magnitude is instead quantified under load below
+(Figure~\ref{fig:ripple}).
 
 \subsection{Output-driven}
 With the gearbox flipped in place, the test motor drove the output shaft directly,
@@ -221,11 +222,28 @@ coincides with the \SI{21.4}{\hertz} fundamental from the tap test
 (Appendix~\ref{sec:tap}), with the lobe-pass forcing ringing the fixture as it
 sweeps through.
 
+A clean ripple \emph{magnitude} is best taken not from these no-load sweeps but
+from the loaded, constant-speed efficiency dwells (Section~\ref{sec:eff}): with the
+output torque held at a fixed setpoint, whatever fluctuation remains on it is the
+transmission ripple, measured at a real load and below the fixture resonance.
+
+\resultfig{gearbox_tests/results/torque_ripple/torque_ripple.png}{0.72}
+  {Per-dwell output torque ripple (RMS) vs.\ transmitted torque. Rotating dwells
+   (blue) sit well above the no-rotation static-hold floor (grey).}{fig:ripple}
+
+The output torque ripples by \textbf{$\approx\SI{0.9}{\newton\meter}$ RMS}, about
+\SI{1.3}{\percent} of the transmitted torque. Two features mark it as a genuine
+gearbox effect: it is nearly the \emph{same} absolute size at 50, 80, and
+\SI{110}{\newton\meter} of load (so it reads as a larger percentage at light load),
+and it drops to a $\approx\SI{0.3}{\newton\meter}$ floor when the shaft is held
+still: it is produced by rotation (the cycloidal lobe-pass hand-off), not
+by measurement noise.
+
 % ===========================================================================
 \appendix
 \section{Structural Tap Test}\label{sec:tap}
 % ===========================================================================
-The stationary, unpowered dynamometer was struck with a rubber mallet and the
+The stationary, powered dynamometer was struck with a rubber mallet and the
 input-torque ring-down was FFT'd to find structural natural frequencies.
 
 \resultfig{gearbox_tests/results/tap_test/tap_test_fft.png}{0.78}

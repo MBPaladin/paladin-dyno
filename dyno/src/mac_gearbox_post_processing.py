@@ -49,6 +49,14 @@ EFFICIENCY_MIN_DWELL = 200       # min samples for a setpoint to count
 EFFICIENCY_LIGHT_LOAD_NM = 10.0  # 'loaded' map drops torque columns with |setpoint| below this
 EFFICIENCY_MIN_OUTPUT_TORQUE_NM = 5.0  # forward/backdrive maps: drop dwells with |measured output torque| below this (low-torque efficiency is noise)
 
+# --- Loaded torque ripple (reuses the efficiency dwells) --------------------
+# Each efficiency dwell holds a constant input speed and output torque for ~1 s.
+# The AC RMS of the (linearly-detrended) output torque over a dwell is the torque
+# ripple at that operating point. Standstill dwells (zero input speed -> no
+# rotation) give the load-side noise floor; rotating dwells add the gearbox's
+# transmission ripple on top. Quantified only on dwells transmitting a real load.
+RIPPLE_MIN_OUTPUT_TORQUE_NM = 40.0  # only quantify ripple on dwells above this transmitted torque
+
 RUNNING_FILE_STEM = 'running_input'   # no-load input running-torque file
 RUNNING_VEL_BIN_RAD_S = 1.0      # velocity bin width for the drag/ripple curves
 RUNNING_FIT_MIN_VEL = 5.0        # ignore |v| below this for the Coulomb+viscous fit
@@ -1416,6 +1424,106 @@ def analyze_output_running_torque(filepath):
     }, out_dir)
 
 
+# ---------------------------------------------------------------------------
+# LOADED TORQUE RIPPLE  (efficiency*.hdf5 dwells -> torque_ripple)
+# ---------------------------------------------------------------------------
+# The cleanest ripple magnitude comes from the loaded, constant-speed efficiency
+# dwells (not the no-load running-torque sweeps, whose high-speed ripple is
+# dominated by a structural fixture resonance and whose input-side torques sit
+# near the cell noise floor). Per loaded dwell we detrend the output torque and
+# take its AC RMS. Standstill dwells (no rotation) isolate the load-side noise
+# floor; rotating dwells reveal the gearbox transmission ripple above it.
+# ---------------------------------------------------------------------------
+
+def _ac_rms(x):
+    """RMS of x after removing a linear trend (DC + slow settling drift)."""
+    n = len(x)
+    tt = np.arange(n)
+    c = np.polyfit(tt, x, 1)
+    r = x - (c[0] * tt + c[1])
+    return float(np.sqrt(np.mean(r ** 2)))
+
+
+def analyze_loaded_ripple(filepaths):
+    name = 'torque_ripple'
+    out_dir = test_dir(name)
+    print(f'Processing GEARBOX LOADED TORQUE RIPPLE: {len(filepaths)} efficiency files')
+
+    moving, still = [], []  # each row: (|mean output torque| Nm, ripple RMS Nm, ripple %)
+    for fp in filepaths:
+        with h5py.File(fp, 'r') as f:
+            bidx = f['behavior_indices'][:]
+            for i in range(len(bidx)):
+                a, b = int(bidx[i, 0]), int(bidx[i, 1])
+                if b - a < EFFICIENCY_MIN_DWELL:
+                    continue
+                sl = slice(a + int((b - a) * EFFICIENCY_SETTLE_FRAC), b)
+                vcmd = round(float(np.nanmean(f['dut_velocity_command'][sl])))
+                lt = np.asarray(f['load_torque'][sl], dtype=float)  # output torque (Nm)
+                m = float(np.mean(lt))
+                if abs(m) < RIPPLE_MIN_OUTPUT_TORQUE_NM:
+                    continue
+                rms = _ac_rms(lt)
+                (still if vcmd == 0 else moving).append((abs(m), rms, 100.0 * rms / abs(m)))
+    moving = np.array(moving) if moving else np.empty((0, 3))
+    still = np.array(still) if still else np.empty((0, 3))
+
+    floor_Nm = float(np.mean(still[:, 1])) if len(still) else float('nan')
+    ripple_Nm = float(np.mean(moving[:, 1])) if len(moving) else float('nan')
+    ripple_pct = float(np.mean(moving[:, 2])) if len(moving) else float('nan')
+    # Remove the static load-side floor (in quadrature) to isolate the gearbox.
+    gearbox_Nm = float(np.sqrt(max(ripple_Nm ** 2 - floor_Nm ** 2, 0.0))) \
+        if ripple_Nm == ripple_Nm and floor_Nm == floor_Nm else ripple_Nm
+    print(f'  loaded ripple: rotating {ripple_Nm:.3f} Nm RMS ({ripple_pct:.2f}% of load), '
+          f'static floor {floor_Nm:.3f} Nm -> gearbox {gearbox_Nm:.3f} Nm')
+
+    # --- Figure: ripple RMS vs transmitted torque (rotating vs standstill) ---
+    fig, ax = plt.subplots(figsize=(10, 6.5))
+    if len(still):
+        ax.scatter(still[:, 0], still[:, 1], s=30, color='0.55', alpha=0.8,
+                   label='static hold (no rotation) — load-side noise floor')
+        ax.axhline(floor_Nm, color='0.55', linestyle='--', linewidth=1.2)
+    if len(moving):
+        ax.scatter(moving[:, 0], moving[:, 1], s=30, color='tab:blue', alpha=0.8,
+                   label='rotating (loaded dwells)')
+        ax.axhline(ripple_Nm, color='tab:blue', linestyle='--', linewidth=1.4,
+                   label=f'rotating mean {ripple_Nm:.2f} Nm RMS')
+    ax.set_xlabel('Transmitted output torque (Nm)')
+    ax.set_ylabel('Output torque ripple, RMS (Nm)')
+    ax.set_title('Output torque ripple from loaded constant-speed dwells')
+    ax.set_ylim(bottom=0)
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, f'{name}.png'), dpi=200)
+    plt.close(fig)
+    print(f'  Saved: {name}.png')
+
+    # --- CSV: per-dwell ripple ----------------------------------------------
+    with open(os.path.join(out_dir, f'{name}.csv'), 'w') as cf:
+        cf.write('state,transmitted_torque_Nm,ripple_rms_Nm,ripple_pct\n')
+        for state, arr in (('static', still), ('rotating', moving)):
+            for t_nm, rms, pct in arr:
+                cf.write(f'{state},{t_nm:.3f},{rms:.5f},{pct:.4f}\n')
+    print(f'  Saved: {name}.csv')
+
+    return write_summary(name, {
+        'analysis': 'Output torque ripple from loaded constant-speed efficiency dwells; AC RMS of '
+                    'detrended output torque, rotating vs standstill',
+        'source': 'efficiency dwells',
+        'min_transmitted_torque_Nm': RIPPLE_MIN_OUTPUT_TORQUE_NM,
+        'n_rotating_dwells': int(len(moving)),
+        'n_standstill_dwells': int(len(still)),
+        'ripple_rms_rotating_Nm': ripple_Nm,
+        'ripple_rms_rotating_pct_of_load': ripple_pct,
+        'noise_floor_static_Nm': floor_Nm,
+        'gearbox_ripple_floor_removed_Nm': gearbox_Nm,
+        'note': 'Rotating ripple is ~load-independent in absolute terms, so the percentage falls as '
+                'load rises. The static-hold dwells (no rotation) set the load-side noise floor; the '
+                'gearbox figure removes it in quadrature.',
+    }, out_dir)
+
+
 def find_file(*needles):
     """Return the path of the first .hdf5 whose lowercased name contains all needles."""
     for fn in sorted(os.listdir(GEARBOX_TESTS_DIR)):
@@ -1442,6 +1550,7 @@ def main():
         # efficiency data's own CW/CCW symmetry (the backlash2 zero drifted and
         # over-corrected; this self-derived value matches backlash1's -0.010 Nm).
         combined['efficiency'] = analyze_efficiency(eff_paths, auto_zero=True)
+        combined['torque_ripple'] = analyze_loaded_ripple(eff_paths)
     else:
         print('No gearbox efficiency files found.')
 

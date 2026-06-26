@@ -159,7 +159,7 @@ def analyze_torque_response(filepath):
     # through-origin frame of the de-biased fit and the datasheet.
     fig, ax = plt.subplots(figsize=(12, 8))
     ax.scatter(current, torque - C, s=4, alpha=0.25, color='steelblue',
-               label=f'Measured, bias-corrected (−C = {-C:+.3f} Nm)')
+               label='Measured')
 
     cur_min, cur_max = float(np.min(current)), float(np.max(current))
     fit_x = np.linspace(cur_min, cur_max, 500)

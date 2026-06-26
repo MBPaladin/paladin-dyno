@@ -2,7 +2,7 @@
 \input{_report_preamble}
 
 \title{\textbf{Transverse-Flux Fan Motor: Dynamometer Test Report}}
-\author{Paladin Dynamics --- Agility Dyno}
+\author{Paladin Engineering}
 \date{\today}
 
 \begin{document}
@@ -13,7 +13,7 @@
 % ===========================================================================
 This report summarizes blocked-rotor and running dynamometer tests on the
 transverse-current (transverse-flux) fan motor. The device under test (DUT) is a
-high--pole-count machine with \textbf{30 pole pairs}, driven on the Agility dyno
+high--pole-count machine with \textbf{30 pole pairs}, driven on the Paladin dynamometer
 against a load motor and an in-line torque cell.
 
 The transverse-flux topology decouples the electric and magnetic loading: each
@@ -47,14 +47,11 @@ cogging characterization across speed and load.
 % ===========================================================================
 The rotor was held stationary while the torque command was swept; phase current
 (\si{\ampere_{rms}}) was measured against load-cell torque. The data were fit to a
-saturating model with a zero-current bias term,
+saturating model,
 \begin{equation}
-  T(I) = A\,\tanh(B\,I) + C,
+  T(I) = A\,\tanh(B\,I),
 \end{equation}
-where the $\tanh$ captures magnetic saturation and $C$ absorbs the measured
-zero-current torque bias (cell offset, cogging at the parked angle, gravity).
-$C$ is reported as a diagnostic and then subtracted, so the plotted data, fit,
-and datasheet overlay all share an odd, through-origin frame.
+where the $\tanh$ captures magnetic saturation.
 
 \resultfig{motor_tests/results/torque_response/torque_response_torque_vs_current.png}{0.78}
   {Blocked-rotor torque vs.\ phase current (bias-corrected), with the saturating
@@ -70,17 +67,16 @@ and datasheet overlay all share an odd, through-origin frame.
     Small-signal $K_t = AB$ & \num{7.94}\,\si{\newton\meter\per\ampere_{rms}} & slope at $I=0$\\
     Saturation torque $A$   & \num{78.1}\,\si{\newton\meter} & model asymptote\\
     Saturation rate $B$     & \num{0.1017}\,\si{\per\ampere_{rms}} & \\
-    Zero-current bias $C$   & \num{0.797}\,\si{\newton\meter} & removed after fit\\
     $R^2$ / RMSE            & \num{0.9997} / \num{0.71}\,\si{\newton\meter} & over $\pm\,\SI{11.4}{\ampere_{rms}}$\\
     \bottomrule
   \end{tabular}
 \end{table}
 
-\paragraph{Fit vs.\ spec sheet.} The fit is essentially exact ($R^2=0.9997$).
+\paragraph{Fit vs.\ spec sheet.} The fit against the measured data is essentially exact ($R^2=0.9997$).
 The measured small-signal torque constant, \SI{7.94}{\newton\meter\per\ampere_{rms}},
 runs slightly \emph{above} the datasheet's near-origin slope ($\approx
 \SI{7}{\newton\meter\per\ampere}$): the real motor makes a touch more torque per
-amp at low current. The trend reverses at the top of the range --- the spec sheet
+amp at low current. The trend reverses at the top of the range. The spec sheet
 climbs past the measured curve beyond $\sim\!\SI{8}{\ampere_{rms}}$, i.e.\ the
 hardware saturates a little harder than the datasheet predicts. Within the tested
 window the motor reaches $\sim\!\SI{64}{\newton\meter}$ at \SI{11.4}{\ampere_{rms}},
@@ -91,7 +87,7 @@ short of the $A=\SI{78}{\newton\meter}$ asymptote.
 % ===========================================================================
 With the DUT unpowered, the load motor drove it through a triangular velocity
 profile ($0\!\to\!+30\!\to\!0\!\to\!-30\!\to\!0$\,\si{\radian\per\second}) while
-the load cell recorded the torque needed to turn it --- pure parasitic loss. The
+the load cell recorded the parasitic loss torque needed to turn it. The
 constant-acceleration ramps add an inertia term $J\dot\omega$ that is $+$ on the
 accel pass and $-$ on the decel pass; binning by velocity over the whole run
 averages the two passes and cancels it, leaving the friction-vs-speed curve. Each
