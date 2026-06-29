@@ -6,16 +6,19 @@ Output Torque:
     - 100
   data_keys: # defines which log entries to pull for the scope
     - dut_effort
+    - input_torque
     - load_torque
     - dut_torque_command
     - load_torque_command
   legends: # defines legends for the above keys
     - DUT Effort
-    - Measured Torque
+    - Measured Input Torque
+    - Measured Output Torque
     - DUT Torque Command
     - LOAD Torque Command
   pens: # sets colors for each trace
     - r
+    - y
     - g
     - c
     - c

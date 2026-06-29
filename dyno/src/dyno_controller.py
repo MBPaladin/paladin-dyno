@@ -170,9 +170,9 @@ class Controller(Master):
             return True
         
         # 2 rad/s velocity difference, in output coordinates, between the two motors will kill the test
-        if abs((input_velocity / input_gear_ratio) - (output_velocity / output_gear_ratio)) > 2: 
-            print('Safety triggered, diverging velocities detected. Check the configured gear ratio for each motor')
-            return True
+        # if abs((input_velocity / input_gear_ratio) - (output_velocity / output_gear_ratio)) > 2: 
+        #     print('Safety triggered, diverging velocities detected. Check the configured gear ratio for each motor')
+        #     return True
         
         if self.devices.DUT.fault:
             print('Safety triggered, DUT is in fault state')

@@ -3,11 +3,11 @@ import os
 import math
 
 # --- Tunables --------------------------------------------------------------
-ACCEL = 1                       # [rad/s^2] Rate of velocity increase of the OUTPUT
-PEAK_VELOCITY = 30              # [rad/s] Peak Velocity of the OUTPUT. 
+ACCEL = 0.5                      # [rad/s^2] Rate of velocity increase of the OUTPUT
+PEAK_VELOCITY = 50             # [rad/s] Peak Velocity of the OUTPUT. 
 REST_DURATION = 3               # [s] Duration of rest before reverse test   
 MOTOR_CHOICE = "input"          # "input" or "output". Test controls single motor only
-GEAR_RATIO = 10                  # gear_ratio : 1  | output torque : input torque
+GEAR_RATIO = 1                 # gear_ratio : 1  | output torque : input torque
 
 OUTPUT_NAME = "gearbox_running_torque_generated.csv"
 # ---------------------------------------------------------------------------
@@ -45,9 +45,9 @@ def main():
     with open(out_path, "w", newline="") as f:
         writer = csv.writer(f)
         if MOTOR_CHOICE == "input":
-            writer.writerow(["time", "input_motor_velocity", "output_motor_position"])
+            writer.writerow(["time", "input_motor_velocity", "output_motor_torque"])
         else:
-            writer.writerow(["time", "output_motor_velocity", "input_motor_position"])
+            writer.writerow(["time", "output_motor_velocity", "input_motor_torque"])
 
         
         # Note: Corrected the variable names here to match the data mapping

@@ -16,9 +16,9 @@ RA080-01:
 RA080-02:
   type: rotary
   flip_torque_sign: True
-  gear_ratio: 1 #Output should always be set to 1
+  gear_ratio: 26 #Output should always be set to 1
   motor_params:
-    kt: 5.3
+    kt: 3.03
     k_tanh: 0.025
   motor_limits:
     torque: 100

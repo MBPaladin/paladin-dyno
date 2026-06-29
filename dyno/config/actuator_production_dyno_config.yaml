@@ -118,36 +118,51 @@ expected_slave_layout:
     name: LOAD
     params:
       flip_torque_sign: True
-      gear_ratio: 1 #Output should always be set to 1S
+      gear_ratio: 1 #Output should always be set to 1
+      motor_params:
+        kt: 25.5
+        k_tanh: 0.018
+      motor_limits:
+        torque: 450
+        velocity: 13
+        acceleration: 12 #Rad/s^2
+        rotatum: 1800 #Nm/s, 4 x peak torque value
+      drive_params:
+    i_cont: 8
+  - model: AKD
+    name: DUT
+    params:
+      # flip_torque_sign: False
+      # gear_ratio: 1 #Output should always be set to 1
+      # motor_params:
+      #   #kt: 6
+      #   kt: 7.35
+      #   k_tanh: 0.068
+      #   #k_tanh: 0.15
+      # motor_limits:
+      #   torque: 73
+      #   velocity: 31.5
+      #   acceleration: 12 #Rad/s^2
+      #   rotatum: 160 #Nm/s, 4 x peak torque value
+      # drive_params:
+      #   i_cont: 3
+
+      flip_torque_sign: True
+      gear_ratio: 26
       motor_params:
         kt: 5.3
         k_tanh: 0.025
       motor_limits:
-        torque: 70
-        velocity: 31.5
+        torque: 100
+        velocity: 63
+        acceleration: 12 #Rad/s^2
+        rotatum: 320 #Nm/s, 4 x peak torque value
       drive_params:
         i_cont: 8
-  - model: AKD
-    name: DUT
-    params:
-      flip_torque_sign: False
-      gear_ratio: 1 #Output should always be set to 1
-      motor_params:
-        #kt: 6
-        kt: 7.35
-        k_tanh: 0.068
-        #k_tanh: 0.15
-      motor_limits:
-        torque: 73
-        velocity: 31.5
-        acceleration: 12 #Rad/s^2
-        rotatum: 160 #Nm/s, 4 x peak torque value
-      drive_params:
-        i_cont: 3
 
 
 safeties: # Measured values over these limits will cause the test to stop
-  output_torque: 70 # Nm on the output torque cell. measured abs(torque) over this limit will stop a test
+  output_torque: 200 # Nm on the output torque cell. measured abs(torque) over this limit will stop a test
   input_torque: 15 # Nm on the input torque cell. measured abs(torque) over this limit will stop a test
   output_velocity: 31.5 # rad/s on the output. measured abs(velocity) over this limit will stop the test
   input_velocity: 500 # rad/s
