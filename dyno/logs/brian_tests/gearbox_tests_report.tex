@@ -1,0 +1,263 @@
+\documentclass[11pt]{article}
+\input{_report_preamble}
+
+\title{\textbf{Cycloidal Gearbox: Dynamometer Test Report}}
+\author{Paladin Engineering\hspace{0.6em}%
+  \raisebox{-0.4\height}{\includegraphics[height=2.2em]{pics/paladinLogo.png}}}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\resultfig{pics/gearboxCropped.png}{0.4}{Cycloidal-drive gearbox design that was tested (Note: Two units were supplied for testing. This report outlines the results for Gearbox 1, while the image depicts Gearbox 2.)}{fig:gearbox}
+
+% ===========================================================================
+\section{Introduction}
+% ===========================================================================
+This report summarizes dynamometer characterization of the cycloidal reduction
+gearbox driven by a test motor. The unit is a \textbf{26:1}
+cycloidal drive, tested input-driven and (where noted) output-driven on the
+Paladin dynamometer with in-line torque cells on both the input and output shafts.
+
+A cycloidal drive transmits torque through a lobed cycloidal disc rolling inside
+a ring of pins, with multiple lobes engaged at once. That architecture drives the
+properties we measure:
+
+\begin{itemize}
+  \item \textbf{Low backlash, high stiffness.} Many simultaneous, preloaded
+        rolling contacts mean very little lost motion and a stiff torsional path
+        (Section~\ref{sec:backlash}).
+  \item \textbf{High, load-dependent efficiency.} Rolling (rather than sliding)
+        contact gives good efficiency that improves with load as fixed losses
+        become a smaller fraction of throughput (Section~\ref{sec:eff}).
+  \item \textbf{Low no-load drag with lobe-frequency ripple.} The disc's orbiting
+        motion produces a small torque ripple at the lobe-pass frequency as rolling contacts hand off, riding
+        on top of a low baseline drag (Section~\ref{sec:gbrunning}).
+  \item \textbf{Good backdrivability.} The same low friction makes the unit
+        readily back-driven, at a modest efficiency penalty vs.\ forward driving
+        (Section~\ref{sec:eff}).
+\end{itemize}
+
+Tests reported: backlash/torsional analysis, an efficiency map (forward and
+backdrive), no-load running torque, and stiction. A structural tap test is
+included as an appendix where it bears on the dynamic results.
+
+% ===========================================================================
+\section{Backlash}\label{sec:backlash}
+% ===========================================================================
+The output side of the shaft was held at a fixed position while a torque sawtooth was applied at the
+input; the output was then shifted and the sweep repeated, sampling backlash at
+19 mesh positions. Referring the input angle to the output side
+($\theta_\text{out}-\theta_\text{in}/26$) and plotting deflection vs.\ tared input
+torque yields a hysteresis loop per position. Very little apparent backlash is present,
+with results looking more similar to a stiff torsional spring with ripple effects than a traditional dead-band.
+It is likely that this mechanism is preloaded, rendering a traditional flank-based backlash measurement less meaningful.
+
+\resultfig{gearbox_tests/results/backlash/backlash_deflection_vs_torque.png}{0.78}
+  {Output-referred deflection vs.\ tared input torque across 19 mesh positions
+   (color = output hold position).}{fig:backlash}
+
+The loop is narrow and the loaded flanks are nearly straight and almost
+collinear, which is the clean signature of a \textbf{preloaded drive with minimal
+backlash}: the few arc-minutes of gap are small and consistent around the output
+rotation, and the high flank slope confirms a stiff torsional path. The
+position-to-position scatter (color bands) reflects mesh-phase variation rather
+than any single large dead-band.
+
+Torsional stiffness is high, with a mean of \SI{10580}{\newton\meter\per\radian} and
+  a standard deviation of \SI{540}{\newton\meter\per\radian} across the 19 mesh positions. The stiffness is not constant, but varies with mesh position and torque, as expected for a cycloidal drive with multiple rolling contacts.
+
+% ===========================================================================
+\section{Efficiency}\label{sec:eff}
+% ===========================================================================
+The input was velocity-controlled while the load applied an output torque
+setpoint; both shaft torques were measured at each $\sim\!\SI{1}{\second}$ dwell.
+Because the 26:1 ratio is kinematically fixed (no slip), power efficiency equals
+torque efficiency: $\eta = \min(26|T_\text{in}|,|T_\text{out}|)/\max(26|T_\text{in}|,|T_\text{out}|)$.
+The sign of $\omega_\text{in}\!\cdot\!T_\text{out}$ splits the data into forward
+driving and backdriving maps; low-torque dwells (where $\eta$ is noise) are
+excluded.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.49\linewidth]{gearbox_tests/results/efficiency/efficiency_map_forward.png}
+  \includegraphics[width=0.49\linewidth]{gearbox_tests/results/efficiency/efficiency_map_backdrive.png}
+  \caption{Efficiency maps vs.\ output speed and output torque: forward driving
+  (left) and backdriving (right), CW/CCW averaged.}
+  \label{fig:eff}
+\end{figure}
+
+\begin{table}[H]
+  \centering
+  \caption{Efficiency summary (loaded operating points).}
+  \begin{tabular}{lrr}
+    \toprule
+    & Forward & Backdrive\\
+    \midrule
+    Peak efficiency  & \SI{95.4}{\percent} & \SI{93.4}{\percent}\\
+    Mean (loaded)    & \SI{93.1}{\percent} & \SI{90.1}{\percent}\\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+Efficiency \textbf{rises with output torque}, from the high 70s/80s\,\% at
+light load up to the low-to-mid 90s\,\%, because the roughly fixed friction
+loss is a shrinking fraction of the transmitted torque. It falls off slightly at
+the highest input speeds. Backdriving sits a few points below forward driving at
+matched operating points, consistent with the overhauling direction paying the
+same friction loss against a smaller delivered torque. These current plots are fairly speed-limited, and a future test campaign will explore the full speed range of the gearbox.
+
+% ===========================================================================
+\section{Stiction}\label{sec:stiction}
+% ===========================================================================
+Static-friction (breakaway) torque was measured with a slow torque-ramp
+protocol: the test motor was commanded a gentle triangular torque sweep
+($\sim\!\SI{0.2}{\newton\meter\per\second}$) that rises until the shaft breaks
+free and slips, then reverses; the torque held just before first motion is the
+breakaway torque. Two configurations were run: the
+gearbox driven from its \textbf{input} shaft, and (with the gearbox flipped in
+place) driven from its \textbf{output} shaft.
+
+The reported gearbox stiction is read from the in-line torque cell.
+Because the cell sits at the gearbox shaft, it measures the torque actually
+delivered into the gearbox at breakaway. This is the gearbox's own static friction,
+already free of the motor's internal friction, with no subtraction required to account for drive motor friction.
+
+\resultfig{gearbox_tests/results/stiction/stiction_comparison.png}{0.7}
+  {Breakaway (static-friction) torque measured by the in-line torque cell at the
+   gearbox shaft: input-driven (at the input shaft) vs.\ output-driven (at the
+   output shaft).}{fig:stiction}
+
+Input-shaft stiction is very small ($\approx\SI{0.04}{\newton\meter}$ at the
+input), consistent with the lightly-loaded, predominantly-rolling high-speed input
+stage. The output-driven breakaway is far larger and much noisier; its large
+spread likely reflects cycloidal lobe-pass ripple rather than poor repeatability.
+
+% ===========================================================================
+\section{Running Torque}\label{sec:gbrunning}
+% ===========================================================================
+With the opposite shaft free, the driven shaft was swept through a $\pm$velocity
+triangle and the no-load drag (Coulomb~$+$~viscous) extracted by velocity-binning
+to cancel inertia. Both data sets are plotted against \emph{output} speed: the
+input-driven sweep is referred to the output through the fixed 26:1 ratio
+($\omega_\text{out}=\omega_\text{in}/26$), whereas the output-driven sweep (gearbox
+flipped) already measures the output shaft directly and is \emph{not} rescaled.
+
+\subsection{Input-driven}
+\resultfig{gearbox_tests/results/running_torque/running_torque_drag_vs_velocity.png}{0.78}
+  {No-load input running torque vs.\ output speed, with the Coulomb+viscous fit.}{fig:gbrun-in}
+
+\begin{table}[H]
+  \centering
+  \caption{Input-driven no-load drag.}
+  \begin{tabular}{lr}
+    \toprule
+    Quantity & Value\\
+    \midrule
+    Coulomb drag         & \SI{0.040}{\newton\meter}\\
+    Viscous drag         & \SI{0.0328}{\newton\meter\per(\radian\per\second)}\\
+    Drag at max speed (\SI{2.4}{\radian\per\second}) & \SI{0.120}{\newton\meter}\\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+Input-referred drag is very low and
+grows only weakly with speed, again indicating predominantly rolling contact. A
+torque ripple rides on top of this baseline at the cycloidal lobe-pass frequency
+and grows large at the highest input speeds, but that growth is mostly the test
+fixture's structural resonance being excited rather than the gearbox itself (see
+Figure~\ref{fig:gbrun-fft}), so its raw amplitude here is not a reliable ripple
+figure. The ripple magnitude is instead quantified under load below
+(Figure~\ref{fig:ripple}).
+
+\subsection{Output-driven}
+With the gearbox flipped in place, the test motor drove the output shaft directly,
+so the measured speed is already output speed and the in-line torque is the
+output-referred back-drive drag.
+
+\resultfig{gearbox_tests/results/output_running_torque/output_running_torque_drag_vs_velocity.png}{0.78}
+  {No-load output-driven (back-drive) running torque vs.\ output speed, with the
+   Coulomb+viscous fit.}{fig:gbrun-out}
+
+\begin{table}[H]
+  \centering
+  \caption{Output-driven (back-drive) no-load drag, output-referred.}
+  \begin{tabular}{lr}
+    \toprule
+    Quantity & Value\\
+    \midrule
+    Coulomb drag         & \SI{1.51}{\newton\meter}\\
+    Viscous drag         & \SI{0.191}{\newton\meter\per(\radian\per\second)}\\
+    Drag at max speed (\SI{10.3}{\radian\per\second}) & \SI{3.48}{\newton\meter}\\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+Driven directly on the output, the motor's speed range maps straight to output
+speed rather than being divided by 26, so this sweep reaches far higher output
+speed (\SI{10.3}{\radian\per\second} vs.\ \SI{2.4}{}) and exercises the viscous
+term much more strongly. The two runs
+are mutually consistent: referring the input-driven Coulomb drag to the output by
+the power-equivalent factor of 26 ($0.040\times26\approx\SI{1.0}{\newton\meter}$)
+lands close to the directly-measured back-drive value of \SI{1.51}{\newton\meter},
+the modest excess being the expected back-driving friction penalty.
+
+\subsection{Frequency content and torque ripple}
+\resultfig{gearbox_tests/results/output_running_torque/output_running_torque_fft.png}{0.85}
+  {Output-driven running-torque spectrum (top, segment-averaged) and spectrogram
+   (bottom). The input-driven content is similar and is not shown separately.}{fig:gbrun-fft}
+
+This section is the frequency-domain view of the \textbf{torque ripple}. The drag
+curves above describe only the mean (baseline) torque; subtracting that baseline
+leaves the small periodic fluctuation that rides on top of it, and the spectrum and
+spectrogram below sort that fluctuation by frequency to show where the ripple
+energy actually sits. The ripple grows with speed because the same per-revolution
+disturbance is swept to higher frequency (and amplified near resonances) as the
+shaft turns faster.
+
+The spectrogram resolves the ripple into speed-proportional \emph{orders}, the
+diagonal ridges that sweep up in frequency as the shaft accelerates, which are
+the cycloidal lobe-pass forcing and its harmonics. Riding on top of these is a
+broad, \emph{speed-independent} peak near \SIrange{18}{24}{\hertz} in the averaged
+spectrum. Because it stays at a fixed frequency while the speed ramps, it is a
+\textbf{structural resonance} of the test fixture, not a gearbox order: it
+coincides with the \SI{21.4}{\hertz} fundamental from the tap test
+(Appendix~\ref{sec:tap}), with the lobe-pass forcing ringing the fixture as it
+sweeps through.
+
+A clean ripple \emph{magnitude} is best taken not from these no-load sweeps but
+from the loaded, constant-speed efficiency dwells (Section~\ref{sec:eff}): with the
+output torque held at a fixed setpoint, whatever fluctuation remains on it is the
+transmission ripple, measured at a real load and below the fixture resonance.
+
+\resultfig{gearbox_tests/results/torque_ripple/torque_ripple.png}{0.72}
+  {Per-dwell output torque ripple (RMS) vs.\ transmitted torque. Rotating dwells
+   (blue) sit well above the no-rotation static-hold floor (grey).}{fig:ripple}
+
+The output torque ripples by \textbf{$\approx\SI{0.9}{\newton\meter}$ RMS}, about
+\SI{1.3}{\percent} of the transmitted torque. Two features mark it as a genuine
+gearbox effect: it is nearly the \emph{same} absolute size at 50, 80, and
+\SI{110}{\newton\meter} of load (so it reads as a larger percentage at light load),
+and it drops to a $\approx\SI{0.3}{\newton\meter}$ floor when the shaft is held
+still, showing it is produced by rotation (the cycloidal lobe-pass hand-off)
+rather than measurement noise.
+
+% ===========================================================================
+\appendix
+\section{Structural Tap Test}\label{sec:tap}
+% ===========================================================================
+The stationary, powered dynamometer was struck with a rubber mallet and the
+input-torque ring-down was FFT'd to find structural natural frequencies.
+
+\resultfig{gearbox_tests/results/tap_test/tap_test_fft.png}{0.78}
+  {Impulse ring-down spectrum of the input-torque signal.}{fig:tap}
+
+The dominant mode is at \SI{21.4}{\hertz}, with further peaks at \SI{64}{\hertz}
+and a cluster near \SI{407}{}--\SI{438}{\hertz}. This appendix is included because
+the \SI{21.4}{\hertz} mode lines up with the broad structural peak in the
+running-torque spectrum (Section~\ref{sec:gbrunning}): that peak is the fixture
+resonating as the cycloidal lobe-pass forcing sweeps through its natural frequency,
+not a property of the gearbox itself. It is worth keeping in mind when interpreting
+the ripple seen in the running-torque sweeps.
+
+\end{document}
