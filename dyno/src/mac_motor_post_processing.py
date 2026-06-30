@@ -711,25 +711,44 @@ def analyze_cogging(filepath):
     print(f'  Saved: {name}_global.png / .csv')
 
     # ---- 2) LOCAL: phase-folded, mean-subtracted cogging @ slowest speed ----
-    fig, ax = plt.subplots(figsize=(12, 8))
+    # Top (2/3): mean-subtracted cogging ripple per torque level, overlaid.
+    # Bottom (1/3): each ripple minus the 0 Nm (no-load) ripple, isolating how the
+    # ripple shape shifts as load/force is added.
+    fig, (axTop, axBot) = plt.subplots(2, 1, figsize=(12, 11), sharex=True,
+                                       gridspec_kw={'height_ratios': [2, 1]})
     cols = []
     pkpk = {}
+    m_by_torque = []
     for ti, torque in enumerate(torque_levels):
         p, q = _cogging_trace(pos, vel, tq, segs, sign * slowest, torque)
         phase = ((p / (2 * np.pi / pp)) - offset_frac) % 1.0
         c, m, sd, _ = _fold(phase, q, COGGING_LOCAL_BINS)
         m = m - np.nanmean(m)  # isolate cogging ripple
+        m_by_torque.append(m)
         color = cmap(ti / max(len(torque_levels) - 1, 1))
-        ax.plot(c * 100, m, color=color, linewidth=1.6, label=f'{torque:g} Nm')
-        ax.fill_between(c * 100, m - sd, m + sd, color=color, alpha=0.15)
+        axTop.plot(c * 100, m, color=color, linewidth=1.6, label=f'{torque:g} Nm')
+        axTop.fill_between(c * 100, m - sd, m + sd, color=color, alpha=0.15)
         cols += [(f'{torque:g}Nm_mean', m), (f'{torque:g}Nm_std', sd)]
         pkpk[f'cogging_pkpk_{torque:g}Nm'] = float(np.nanmax(m) - np.nanmin(m))
-    ax.set_xlabel('Phase Angle (%, one pole period)')
-    ax.set_ylabel('Cogging Torque (Nm, mean-subtracted)')
-    ax.set_title(f'Averaged Cogging vs Phase @ {slowest:g} rad/s')
-    ax.axhline(0, color='k', linewidth=0.5)
-    ax.grid(True, alpha=0.4)
-    ax.legend(title='Torque level')
+    axTop.set_ylabel('Cogging Torque (Nm, mean-subtracted)')
+    axTop.set_title(f'Averaged Cogging vs Phase @ {slowest:g} rad/s')
+    axTop.axhline(0, color='k', linewidth=0.5)
+    axTop.grid(True, alpha=0.4)
+    axTop.legend(title='Torque level')
+
+    # Bottom: each ripple relative to the 0 Nm baseline (first torque level).
+    base = torque_levels[0]
+    m0 = m_by_torque[0]
+    for ti, torque in enumerate(torque_levels):
+        color = cmap(ti / max(len(torque_levels) - 1, 1))
+        dm = m_by_torque[ti] - m0
+        axBot.plot(c * 100, dm, color=color, linewidth=1.4, label=f'{torque:g} Nm')
+        cols += [(f'{torque:g}Nm_minus_{base:g}Nm', dm)]
+    axBot.set_xlabel('Phase Angle (%, one pole period)')
+    axBot.set_ylabel(f'Ripple - {base:g} Nm line (Nm)')
+    axBot.set_title(f'Ripple change relative to the {base:g} Nm (no-load) cogging')
+    axBot.axhline(0, color='k', linewidth=0.5)
+    axBot.grid(True, alpha=0.4)
     fig.tight_layout()
     fig.savefig(os.path.join(out_dir, f'{name}_local.png'), dpi=200)
     plt.close(fig)
