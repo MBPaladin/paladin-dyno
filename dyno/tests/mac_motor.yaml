@@ -20,10 +20,10 @@ behaviors:
   #   settings:
   #     input_motor:
   #       control_mode: velocity
-  #       command_list: [-2,-1,-0.5,-0.25,25,0.5,1,2] # units = Rad/s
+  #       command_list: [-10,-7, -4, -2,-1,-0.5,0,0.5,1,2,4,7,10] # units = Rad/s in input coordinate 
   #     output_motor:
   #       control_mode: torque
-  #       command_list: [-6,-4,-2,-1,-0.5,0.5,1,2,4,6]
+  #       command_list: [-110,-80,-50,50,80,110] # Nm Output coordinate -30,-10,-5,-2,-1,-0.5,0.5,1,2,5,10,30
   #     loop_order: [velocity, torque]
   #     duration_per_point_s: 1.5
   #     settle_time_s: 0.25
@@ -36,11 +36,33 @@ behaviors:
   #     output_motor:
   #       control_mode: position
   #     trace_file: "cogging_trace_generated.csv"
-  - id: COGGING-TORQUE-VC
-    type: test_trace
-    settings:
-      input_motor:
-        control_mode: torque
-      output_motor:
-        control_mode: velocity
-      trace_file: "cogging_trace_vc.csv"
+
+  # - id: COGGING-TORQUE-VC
+  #   type: test_trace
+  #   settings:
+  #     input_motor:
+  #       control_mode: torque
+  #     output_motor:
+  #       control_mode: velocity
+  #     trace_file: "cogging_trace_vc.csv"
+
+  # - id: BACKLASH
+  #   type: test_trace
+  #   settings:
+  #     input_motor:
+  #       control_mode: torque
+  #     output_motor:
+  #       control_mode: position
+  #     trace_file: "backlash_generated.csv"
+    - id: BACKLASH
+      type: test_trace
+      settings:
+        input_motor:
+          control_mode: torque
+        output_motor:
+          control_mode: torque
+        trace_file: "stiction_generated.csv"
+
+
+
+  

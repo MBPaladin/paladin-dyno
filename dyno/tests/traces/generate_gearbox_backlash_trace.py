@@ -4,10 +4,10 @@ import math
 
 # --- Tunables --------------------------------------------------------------
 NUM_LOC = 20                            # Number of locations to test backlash 
-PEAK_OUTPUT_TORQUE = 0.25 * 73          # [Nm] Peak torque on OUTPUT side
+PEAK_OUTPUT_TORQUE = 0.25 * 110          # [Nm] Peak torque on OUTPUT side
 CYCLE_TIME = 10                         # [s] Time per cycle
 MAX_ROTATUM  = 160                      # [Nm/s] Maximum Torque increase per second on OUTPUT side
-GEAR_RATIO = 10                         # gear_ratio : 1  | output torque: input torque 
+GEAR_RATIO = 26                         # gear_ratio : 1  | output torque: input torque 
 ZERO_DWELL_TIME = 1                     # [s] Rest time between each cycle. Uses time to move to next location
 
 OUTPUT_NAME = "backlash_generated.csv"
@@ -22,6 +22,7 @@ def build_rows(num_loc, output_trq, t_cycle, max_rotatum, gear_ratio, zero_dwell
     
     # Locations in radians to test backlash from 0 - 360 degrees of the input side
     locs = [2*math.pi / num_loc * i for i in range(0,num_loc)]
+    locs.insert(1, 2*math.pi/num_loc) # repeat first test to remove any initial condition dependancy
     
     t_step = t_cycle/4
     assert output_trq/t_step < max_rotatum, "Rotatum exceeds maximum. Slow down cycle time or lower torque."
@@ -34,8 +35,12 @@ def build_rows(num_loc, output_trq, t_cycle, max_rotatum, gear_ratio, zero_dwell
         prev_t += zero_dwell_time
         rows.append([prev_t, 0, l])
         
+        # Add a delay before torque ramp to read 0 velocity, 0 torque, tare value
+        prev_t += zero_dwell_time
+        rows.append([prev_t,0,l])
+        
         # Ramp up Torque
-        prev_t += t_step
+        prev_t += t_step    
         rows.append([prev_t, input_trq, l])
         
         # Reverse Torque
