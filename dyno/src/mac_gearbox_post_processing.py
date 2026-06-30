@@ -58,12 +58,14 @@ EFFICIENCY_MIN_OUTPUT_TORQUE_NM = 5.0  # forward/backdrive maps: drop dwells wit
 RIPPLE_MIN_OUTPUT_TORQUE_NM = 40.0  # only quantify ripple on dwells above this transmitted torque
 
 RUNNING_FILE_STEM = 'running_input'   # no-load input running-torque file
-RUNNING_VEL_BIN_RAD_S = 1.0      # velocity bin width for the drag/ripple curves
-RUNNING_FIT_MIN_VEL = 5.0        # ignore |v| below this for the Coulomb+viscous fit
+RUNNING_VEL_BIN_RAD_S_INPUT = 10.0      # velocity bin width for the drag/ripple curves
+RUNNING_VEL_BIN_RAD_S_OUTPUT = 1.0
+RUNNING_FIT_MIN_VEL = 10.0        # ignore |v| below this for the Coulomb+viscous fit
 RUNNING_DETREND_WIN = 101        # moving-average window (samples) to detrend torque -> ripple
 RUNNING_STFT_WIN = 512           # STFT window (samples) for the Campbell spectrogram
 RUNNING_SPEED_BIN_RAD_S = 4.0    # |speed| bin width for the Campbell spectrogram
-RUNNING_FFT_MAX_HZ = 200.0       # max frequency shown on the running-torque FFT spectrum & spectrogram (tunable)
+RUNNING_VCMD_BIN_RAD_S = 0.025     # commanded-velocity bin width for the vs-command spectrogram
+RUNNING_FFT_MAX_HZ = 250.0       # max frequency shown on the running-torque FFT spectrum & spectrogram (tunable)
 
 TAP_FILE_STEM = 'taptest'        # impulse (rubber-mallet) ring-down test
 TAP_SIGNAL = 'input_torque'      # signal to FFT; torque rings much cleaner than velocity here
@@ -462,7 +464,7 @@ def _plot_eff_map(out_dir, suffix, vels, tqs, grid, title,
         for it in range(len(tqs)):
             if not np.isnan(grid[iv, it]):
                 ax.text(it, iv, f'{grid[iv, it]*100:.0f}', ha='center', va='center',
-                        fontsize=6, color='white')
+                        fontsize=12, color='white')
     fig.colorbar(im, ax=ax, label='Efficiency (%)')
     fig.tight_layout()
     fig.savefig(os.path.join(out_dir, f'efficiency_map_{suffix}.png'), dpi=200)
@@ -657,7 +659,7 @@ def analyze_running_torque(filepath):
     fs = 1.0 / np.median(np.diff(t))
 
     # --- Drag curve: mean torque per velocity bin (ripple + inertia averaged) ---
-    bw = RUNNING_VEL_BIN_RAD_S
+    bw = RUNNING_VEL_BIN_RAD_S_INPUT
     edges = np.arange(np.floor(v.min() / bw) * bw, np.ceil(v.max() / bw) * bw + bw, bw)
     centers = 0.5 * (edges[:-1] + edges[1:])
     idx = np.clip(np.digitize(v, edges) - 1, 0, len(centers) - 1)
@@ -665,6 +667,8 @@ def analyze_running_torque(filepath):
     trend = np.convolve(tq, np.ones(RUNNING_DETREND_WIN) / RUNNING_DETREND_WIN, mode='same')
     ripple = tq - trend
     centers/= GEAR_RATIO  # convert to output velocity (rad/s)
+
+    raw_v = v / GEAR_RATIO
     
     bmean = np.full(len(centers), np.nan)
     bripple = np.full(len(centers), np.nan)
@@ -677,10 +681,10 @@ def analyze_running_torque(filepath):
     #Drop first and last bins (too few samples, too much ripple)
     bmean[0] = np.nan
     bmean[-1] = np.nan
-    bmean[-2] = np.nan
+    # bmean[-2] = np.nan
     centers[0] = np.nan
     centers[-1] = np.nan
-    centers[-2] = np.nan
+    # centers[-2] = np.nan
 
     # Coulomb + viscous fit on the drag curve (per side, above the stiction floor)
     # centers is now output-referenced (see above), so the input-referenced
@@ -707,6 +711,7 @@ def analyze_running_torque(filepath):
 
     fig, ax = plt.subplots(figsize=(12, 7))
     ax.plot(centers, bmean, 'b.-', markersize=5, label='Mean drag torque (bin)')
+    #ax.plot(raw_v, tq, 'k.', markersize=1, alpha=0.2, label='Raw torque samples')
     for tag, c in (('pos', 'red'), ('neg', 'green')):
         if tag in fit:
             xs = np.linspace(0, np.nanmax(centers) if tag == 'pos' else np.nanmin(centers), 50)
@@ -978,6 +983,87 @@ def _fft_spectrogram(out_dir, name, t, sig, fs, fmax, win_n, title, ylabel='Torq
             cf.write(f'{fq:.4f},{a:.8f}\n')
     print(f'  Saved: {name}_spectrum.csv')
     return dom
+
+
+def _fft_spectrogram_vs_command(out_dir, name, t, sig, vcmd, fs, fmax, win_n, bin_w, title,
+                                xlabel='|Commanded Output Velocity| (rad/s)'):
+    """Torque spectrogram with the x-axis mapped to |COMMANDED velocity| instead of time.
+
+    Identical per-segment STFT to `_fft_spectrogram`, but each segment is placed at
+    the |commanded velocity| at its center time (looked up from `vcmd`) and the
+    segments are binned by |commanded velocity| and averaged. Binning is what makes
+    this well-defined: the command is a triangular sweep, so any given speed is
+    visited several times (up/down, both signs) -- a literal time->velocity remap
+    would be non-monotonic and un-plottable, so we fold the sign and collapse it onto
+    one freq-vs-speed map. Saves `{name}_fft_vs_command.png` and
+    `{name}_spectrum_vs_command.csv`. Returns the resonance frequency (Hz)."""
+    w = min(win_n, len(sig))
+    hop = w // 2
+    win = np.hanning(w)
+    fr = np.fft.rfftfreq(w, 1.0 / fs)
+    sigd = sig - np.mean(sig)
+
+    # |commanded velocity| bins spanning the swept speed range (0 -> max).
+    vfin = np.abs(vcmd[np.isfinite(vcmd)])
+    vmax = float(np.max(vfin))
+    edges = np.arange(0.0, np.ceil(vmax / bin_w) * bin_w + bin_w, bin_w)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    accum = np.zeros((len(centers), len(fr)))
+    count = np.zeros(len(centers), dtype=int)
+    for i0 in range(0, len(sigd) - w, hop):
+        vc = np.nanmean(np.abs(vcmd[i0:i0 + w]))   # |commanded velocity| at this segment's center
+        if not np.isfinite(vc):
+            continue
+        seg = sigd[i0:i0 + w]
+        amp = np.abs(np.fft.rfft((seg - seg.mean()) * win)) * 2 / np.sum(win)
+        b = int(np.clip(np.digitize(vc, edges) - 1, 0, len(centers) - 1))
+        accum[b] += amp
+        count[b] += 1
+    spec = np.array([accum[k] / count[k] if count[k] else np.full(len(fr), np.nan)
+                     for k in range(len(centers))])  # (n_vbins, n_freq)
+
+    fmax = min(fmax, fr.max())
+    fk = fr <= fmax
+    specf = spec[:, fk]
+    colsum = np.nansum(specf, axis=0)
+    lo = np.searchsorted(fr[fk], 1.0)               # ignore DC / ramp skirt
+    res_hz = float(fr[fk][lo:][np.argmax(colsum[lo:])]) if np.count_nonzero(fk) > lo else float('nan')
+
+    # Segment-averaged spectrum (over every segment, identical to `_fft_spectrogram`'s
+    # top panel): total amplitude summed over all bins / total segment count.
+    mean_spectrum = accum.sum(axis=0) / max(int(count.sum()), 1)
+
+    fig, (axT, axB) = plt.subplots(2, 1, figsize=(12, 10))
+    axT.semilogy(fr[fk], mean_spectrum[fk] + 1e-12, color='tab:blue', linewidth=1.0)
+    axT.set_xlim(0, fmax)
+    axT.set_xlabel('Frequency (Hz)')
+    axT.set_ylabel('Torque Amplitude (Nm)')
+    axT.set_title(f'{title} — segment-averaged spectrum (0-{fmax:g} Hz)')
+    axT.grid(True, which='both', alpha=0.4)
+
+    sm = np.ma.masked_invalid(specf)
+    spec_db = 20 * np.log10(sm / np.nanmax(sm) + 1e-9)
+    f_edges = np.append(fr[fk], fr[fk][-1] + (fr[1] - fr[0]))
+    pcm = axB.pcolormesh(edges, f_edges, spec_db.T, cmap='magma', vmin=-40, vmax=0)
+    #axB.axhline(res_hz, color='cyan', linestyle=':', linewidth=1.3, label=f'resonance ~{res_hz:.0f} Hz')
+    axB.set_xlabel(xlabel)
+    axB.set_ylabel('Frequency (Hz)')
+    axB.set_xlim(edges[0], edges[-1])
+    axB.set_ylim(0, fmax)
+    axB.set_title(f'{title} — spectrogram vs commanded velocity')
+    #axB.legend(loc='upper right', facecolor='gray')
+    fig.colorbar(pcm, ax=axB, label='Amplitude (dB re max)')
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, f'{name}_fft_vs_command.png'), dpi=200)
+    plt.close(fig)
+    print(f'  Saved: {name}_fft_vs_command.png  (resonance ~{res_hz:.0f} Hz)')
+
+    with open(os.path.join(out_dir, f'{name}_spectrum_vs_command.csv'), 'w') as cf:
+        cf.write('command_velocity_rad_s,' + ','.join(f'{fq:.2f}Hz' for fq in fr[fk]) + '\n')
+        for c, row in zip(centers, specf):
+            cf.write(f'{c:.3f},' + ','.join('' if np.isnan(a) else f'{a:.8f}' for a in row) + '\n')
+    print(f'  Saved: {name}_spectrum_vs_command.csv')
+    return res_hz
 
 
 # ---------------------------------------------------------------------------
@@ -1307,11 +1393,12 @@ def analyze_output_running_torque(filepath):
         start, end = behavior_span(f)
         t = np.asarray(f['time'][start:end], dtype=float)
         v = np.asarray(f['dut_velocity'][start:end], dtype=float)     # output velocity (rad/s)
+        vcmd = np.asarray(f['dut_velocity_command'][start:end], dtype=float)  # commanded velocity (rad/s)
         tq = np.asarray(f['input_torque'][start:end], dtype=float)    # output-referred drag (Nm)
     fs = 1.0 / np.median(np.diff(t))
 
     # --- Drag curve: mean torque per velocity bin (ripple + inertia averaged) ---
-    bw = RUNNING_VEL_BIN_RAD_S
+    bw = RUNNING_VEL_BIN_RAD_S_OUTPUT
     edges = np.arange(np.floor(v.min() / bw) * bw, np.ceil(v.max() / bw) * bw + bw, bw)
     centers = 0.5 * (edges[:-1] + edges[1:])
     idx = np.clip(np.digitize(v, edges) - 1, 0, len(centers) - 1)
@@ -1403,6 +1490,11 @@ def analyze_output_running_torque(filepath):
     # --- FFT spectrum + time spectrogram of the output drag torque ----------
     fft_max_hz = _fft_spectrogram(out_dir, name, t, tq, fs, RUNNING_FFT_MAX_HZ, RUNNING_STFT_WIN,
                                   'Output-driven Running Torque')
+
+    # --- Same spectrogram, x-axis remapped to commanded velocity ------------
+    _fft_spectrogram_vs_command(out_dir, name, t, tq, vcmd, fs, RUNNING_FFT_MAX_HZ,
+                                RUNNING_STFT_WIN, RUNNING_VCMD_BIN_RAD_S,
+                                'Output-driven Running Torque')
 
     # --- CSV: drag + ripple vs velocity -------------------------------------
     with open(os.path.join(out_dir, f'{name}_curve.csv'), 'w') as cf:

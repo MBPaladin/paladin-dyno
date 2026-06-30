@@ -37,9 +37,9 @@ RUNNING_TORQUE_FIT_MIN_ABS_VEL = 2.0   # ignore |w| below this for the Coulomb+v
                                        # (excludes the stiction / zero-crossing nonlinearity)
 
 COGGING_FILES = ('cogging_5s', 'cogging_10s')  # filename stems to analyze
-COGGING_POLE_PAIRS = 30                # electrical periods per mechanical revolution
+COGGING_POLE_PAIRS = 60                # electrical periods per mechanical revolution
 COGGING_GLOBAL_BINS = 360             # angle bins over one full mechanical revolution
-COGGING_LOCAL_BINS = 100              # angle bins over one pole-pair (phase) period
+COGGING_LOCAL_BINS = 16              # angle bins over one pole-pair (phase) period
 COGGING_VEL_TOL_FRAC = 0.10           # steady-state filter: |v - target| < frac*|target|
 COGGING_MIN_DWELL_S = 1.0             # min segment duration to count as a setpoint dwell
 COGGING_DIRECTION = 1                 # use +velocity (1) or -velocity (-1) segments
@@ -724,9 +724,9 @@ def analyze_cogging(filepath):
         ax.fill_between(c * 100, m - sd, m + sd, color=color, alpha=0.15)
         cols += [(f'{torque:g}Nm_mean', m), (f'{torque:g}Nm_std', sd)]
         pkpk[f'cogging_pkpk_{torque:g}Nm'] = float(np.nanmax(m) - np.nanmin(m))
-    ax.set_xlabel('Phase Angle (%, one pole-pair period, peak @ 0/100%)')
+    ax.set_xlabel('Phase Angle (%, one pole period)')
     ax.set_ylabel('Cogging Torque (Nm, mean-subtracted)')
-    ax.set_title(f'{stem}: Averaged Cogging vs Phase @ {slowest:g} rad/s')
+    ax.set_title(f'Averaged Cogging vs Phase @ {slowest:g} rad/s')
     ax.axhline(0, color='k', linewidth=0.5)
     ax.grid(True, alpha=0.4)
     ax.legend(title='Torque level')
@@ -752,7 +752,7 @@ def analyze_cogging(filepath):
             color = cmap(si / max(len(speeds) - 1, 1))
             ax.plot(c * 100, m, color=color, linewidth=1.4, label=f'{spd:g} rad/s')
             cols += [(f'{spd:g}rad_s_mean', m)]
-        ax.set_xlabel('Phase Angle (%, one pole-pair period, peak @ 0/100%)')
+        ax.set_xlabel('Phase Angle (%, one pole period)')
         ax.set_ylabel('Cogging Torque (Nm, mean-subtracted)')
         ax.set_title(f'{stem}: Cogging vs Speed @ {torque:g} Nm')
         ax.axhline(0, color='k', linewidth=0.5)

@@ -154,9 +154,9 @@ flipped) already measures the output shaft directly and is \emph{not} rescaled.
     \toprule
     Quantity & Value\\
     \midrule
-    Coulomb drag         & \SI{0.040}{\newton\meter}\\
-    Viscous drag         & \SI{0.0328}{\newton\meter\per(\radian\per\second)}\\
-    Drag at max speed (\SI{2.4}{\radian\per\second}) & \SI{0.120}{\newton\meter}\\
+    Coulomb drag         & \SI{0.044}{\newton\meter}\\
+    Viscous drag         & \SI{0.0289}{\newton\meter\per(\radian\per\second)}\\
+    Drag at max speed (\SI{2.4}{\radian\per\second}) & \SI{0.11}{\newton\meter}\\
     \bottomrule
   \end{tabular}
 \end{table}
@@ -164,10 +164,9 @@ flipped) already measures the output shaft directly and is \emph{not} rescaled.
 Input-referred drag is very low and
 grows only weakly with speed, again indicating predominantly rolling contact. A
 torque ripple rides on top of this baseline at the cycloidal lobe-pass frequency
-and grows large at the highest input speeds, but that growth is mostly the test
+and adds noise in the \SIrange{1}{2}{\radian\per\second} regime, but that growth is mostly the test
 fixture's structural resonance being excited rather than the gearbox itself (see
-Figure~\ref{fig:gbrun-fft}), so its raw amplitude here is not a reliable ripple
-figure. The ripple magnitude is instead quantified under load below
+Figure~\ref{fig:gbrun-fft}). The ripple magnitude is quantified under load below
 (Figure~\ref{fig:ripple}).
 
 \subsection{Output-driven}
@@ -198,14 +197,14 @@ speed rather than being divided by 26, so this sweep reaches far higher output
 speed (\SI{10.3}{\radian\per\second} vs.\ \SI{2.4}{}) and exercises the viscous
 term much more strongly. The two runs
 are mutually consistent: referring the input-driven Coulomb drag to the output by
-the power-equivalent factor of 26 ($0.040\times26\approx\SI{1.0}{\newton\meter}$)
+the power-equivalent factor of 26 ($0.044\times26\approx\SI{1.2}{\newton\meter}$)
 lands close to the directly-measured back-drive value of \SI{1.51}{\newton\meter},
 the modest excess being the expected back-driving friction penalty.
 
 \subsection{Frequency content and torque ripple}
-\resultfig{gearbox_tests/results/output_running_torque/output_running_torque_fft.png}{0.85}
-  {Output-driven running-torque spectrum (top, segment-averaged) and spectrogram
-   (bottom). The input-driven content is similar and is not shown separately.}{fig:gbrun-fft}
+\resultfig{gearbox_tests/results/output_running_torque/output_running_torque_fft_vs_command.png}{0.85}
+  {Output-driven running-torque spectrum (top, segment-averaged) and spectrogram with respect to commanded input velocity magnitude
+   (bottom).}{fig:gbrun-fft}
 
 This section is the frequency-domain view of the \textbf{torque ripple}. The drag
 curves above describe only the mean (baseline) torque; subtracting that baseline
@@ -217,13 +216,15 @@ shaft turns faster.
 
 The spectrogram resolves the ripple into speed-proportional \emph{orders}, the
 diagonal ridges that sweep up in frequency as the shaft accelerates, which are
-the cycloidal lobe-pass forcing and its harmonics. Riding on top of these is a
-broad, \emph{speed-independent} peak near \SIrange{18}{24}{\hertz} in the averaged
+the cycloidal lobe-pass forcing and other periodic mechanical effects. Riding on top of these is a
+broad, \emph{speed-independent} peak near \SI{17}{\hertz} in the averaged
 spectrum. Because it stays at a fixed frequency while the speed ramps, it is a
 \textbf{structural resonance} of the test fixture, not a gearbox order: it
-coincides with the \SI{21.4}{\hertz} fundamental from the tap test
+coincides with the ($17\times26\approx\SI{440}{\Hz}$) fundamental from the tap test
 (Appendix~\ref{sec:tap}), with the lobe-pass forcing ringing the fixture as it
 sweeps through.
+
+Using spectrograms in this way, we can test preloads, look at balances and tolerances, and identify where in the cycloid mechanical imperfections arise.
 
 A clean ripple \emph{magnitude} is best taken not from these no-load sweeps but
 from the loaded, constant-speed efficiency dwells (Section~\ref{sec:eff}): with the
