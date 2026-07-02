@@ -22,6 +22,7 @@ matplotlib.use('Agg')  # headless: save figures, never block on display
 import matplotlib.pyplot as plt
 from scipy.optimize import curve_fit
 from scipy.signal import find_peaks
+from scipy.interpolate import CubicSpline
 
 # --- Paths ------------------------------------------------------------------
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -53,7 +54,7 @@ COGGING_FFT_NBINS = 500               # frequency-grid bins for max-pooling (~1 
 COGGING_FFT_MIN_RES_HZ = 50           # ignore peaks below this when locating structural resonances
 COGGING_FFT_N_RES = 2                 # number of structural resonances to mark
 COGGING_FFT_RES_BAND_HZ = 8.0         # half-width of the band used for resonance-amplitude-vs-speed
-COGGING_FFT_ORDER_MARKS = (2, 3, 4, 5)  # cogging orders whose resonance-crossing speeds are annotated
+COGGING_FFT_ORDER_MARKS = (1, 2, 3, 4, 5)  # cogging orders whose resonance-crossing speeds are annotated
 
 
 def reset_results_dir():
@@ -357,6 +358,7 @@ def analyze_running_torque(filepath):
     ax.set_title('Running Torque vs Driven Velocity (no-load drag)')
     ax.axhline(0, color='k', linewidth=0.5)
     ax.axvline(0, color='k', linewidth=0.5)
+    ax.set_ylim(bottom=-20, top=20)
     ax.grid(True, alpha=0.4)
     ax.legend()
     fig.tight_layout()
@@ -615,8 +617,7 @@ def cogging_fft(name, stem, out_dir, segs, pos, vel, tq, speeds, sign, pp, fs, t
     axL.set_xlim(0, fmax)
     axL.set_xlabel('Frequency (Hz)')
     axL.set_ylabel('Cogging torque amplitude (Nm)')
-    axL.set_title(f'{stem}: cogging spectra by drive speed @ {torque:g} Nm\n'
-                  '(structural resonances are fixed in frequency)')
+    axL.set_title(f'Cogging spectra by drive speed @ {torque:g} Nm\n')
     axL.legend(title='Drive speed', fontsize=8, ncol=2)
     axL.grid(True, alpha=0.3)
 
@@ -739,16 +740,42 @@ def analyze_cogging(filepath):
     # Bottom: each ripple relative to the 0 Nm baseline (first torque level).
     base = torque_levels[0]
     m0 = m_by_torque[0]
+    per_nm = []  # ripple-change per unit load, one row per loaded level
     for ti, torque in enumerate(torque_levels):
         color = cmap(ti / max(len(torque_levels) - 1, 1))
         dm = m_by_torque[ti] - m0
-        axBot.plot(c * 100, dm, color=color, linewidth=1.4, label=f'{torque:g} Nm')
+        axBot.plot(c * 100, dm, color=color, linewidth=1.4)
         cols += [(f'{torque:g}Nm_minus_{base:g}Nm', dm)]
+        if torque != base:                       # skip the flat 0-load line
+            per_nm.append(dm / (torque - base))  # normalize to a 1 Nm load
+
+    # Average the per-Nm ripple-change shape, fit a phase-periodic (wraps 0<->100%)
+    # cubic spline, and scale it back to the heaviest load as a grey dotted prediction.
+    if per_nm:
+        target = torque_levels[-1]
+        mean_per_nm = np.nanmean(np.vstack(per_nm), axis=0)
+        good = np.isfinite(mean_per_nm)
+        if good.sum() >= 4:
+            y = mean_per_nm
+            if not good.all():                   # periodic linear fill of empty bins
+                xp = np.concatenate([c[good] - 1.0, c[good], c[good] + 1.0])
+                yp = np.tile(mean_per_nm[good], 3)
+                y = np.interp(c, xp, yp)
+            xe = np.concatenate([c, [c[0] + 1.0]])       # close the period
+            ye = np.concatenate([y, [y[0]]])
+            spline = CubicSpline(xe, ye, bc_type='periodic')
+            xs = np.linspace(0.0, 1.0, 400)
+            # axBot.plot(xs * 100, spline(xs) * (target - base), color='grey',
+            #            linestyle=':', linewidth=2.2,
+            #            label=f'spline fit → {target:g} Nm')
+            cols += [(f'spline_fit_{target:g}Nm', spline(c) * (target - base))]
     axBot.set_xlabel('Phase Angle (%, one pole period)')
     axBot.set_ylabel(f'Ripple - {base:g} Nm line (Nm)')
     axBot.set_title(f'Ripple change relative to the {base:g} Nm (no-load) cogging')
     axBot.axhline(0, color='k', linewidth=0.5)
     axBot.grid(True, alpha=0.4)
+    if per_nm:
+        axBot.legend(loc='upper right', fontsize=9)
     fig.tight_layout()
     fig.savefig(os.path.join(out_dir, f'{name}_local.png'), dpi=200)
     plt.close(fig)
@@ -773,7 +800,7 @@ def analyze_cogging(filepath):
             cols += [(f'{spd:g}rad_s_mean', m)]
         ax.set_xlabel('Phase Angle (%, one pole period)')
         ax.set_ylabel('Cogging Torque (Nm, mean-subtracted)')
-        ax.set_title(f'{stem}: Cogging vs Speed @ {torque:g} Nm')
+        ax.set_title(f'Cogging vs Speed @ {torque:g} Nm')
         ax.axhline(0, color='k', linewidth=0.5)
         ax.grid(True, alpha=0.4)
         ax.legend(title='Speed', ncol=2)

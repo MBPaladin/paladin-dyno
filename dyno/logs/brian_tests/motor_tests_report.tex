@@ -32,10 +32,10 @@ sets the behavior we look for in the tests below:
         position-periodic torque ripple even with no current applied
         (Section~\ref{sec:cogging}).
   \item \textbf{Mid/high-frequency excitation.} Because cogging repeats once per
-        electrical period, its forcing frequency is $30\times$ the mechanical
+        magnetic period (i.e. once per pole), its forcing frequency is $60\times$ the mechanical
         rotation rate. Even modest shaft speeds push that forcing into the
         structural bandwidth of the rotor/fixture, so we expect speed-dependent
-        \emph{resonant} amplification of the ripple (Section~\ref{sec:cogging}).
+        resonant amplification of the ripple (Section~\ref{sec:cogging}).
   \item \textbf{Magnetic saturation.} High flux density per pole means the
         torque/current curve bends over well inside the operating envelope; we
         characterize this with a saturating fit in Section~\ref{sec:torque}.
@@ -137,14 +137,16 @@ the commanded torque level across a full mechanical revolution.
   {Output torque vs.\ mechanical angle over one full input rotation at
    \SI{4}{\radian\per\second}, one trace per torque level (shaded $\pm$ std).}{fig:cog-global}
 
-\paragraph{Per-phase (local) view.} Folding over a single pole-pair period and
+\paragraph{Per-phase (local) view.} The ripple across the mechanical angle is periodic at \SI{60} oscillations per mechanical revolution, representing the pole count.
+Folding over the single-pole period and
 subtracting the mean isolates the repeatable cogging waveform. The peak-to-peak
-ripple is $\approx\SI{1.4}{\newton\meter}$ unloaded, rising to
-\mbox{$\approx\SI{2.1}{\newton\meter}\text{--}\SI{2.3}{\newton\meter}$} under load, a
+ripple is $\approx\SI{1.1}{\newton\meter}$ unloaded, rising to
+$\approx\SI{1.6}{\newton\meter}$ under load, a
 load dependence expected when stator saturation interacts with the rotor detent pattern.
+Turning this motor into a perfect torque source would involve two feedforward compensations: (i) a static, per-pole-period cogging map and (ii) a torque-dependent gain to counteract the load-induced growth.
 
 \resultfig{motor_tests/results/cogging_10s/cogging_10s_local.png}{0.72}
-  {Phase-folded, mean-subtracted cogging over one pole-pair period at
+  {Phase-folded, mean-subtracted cogging over one pole period at
    \SI{4}{\radian\per\second}, by torque level.}{fig:cog-local}
 
 \paragraph{Speed dependence.} Repeating the per-phase fold at every speed
@@ -152,9 +154,7 @@ exposes a strong dynamic effect: the folded ripple does \emph{not} stay constant
 Most speeds sit within a $\pm 1\text{--}2$\,\si{\newton\meter} band, but at a drive
 speed near \SI{24}{\radian\per\second} the amplitude balloons several-fold (to
 $\sim\!\pm 7$\,\si{\newton\meter}), with a weaker secondary growth near
-\SI{12}{\radian\per\second}. The ballooned trace also carries two humps per
-pole-pair period (a second-harmonic shape), a hint that a specific cogging order,
-not the fundamental, is being amplified. This is the signature of a \emph{mechanical
+\SI{12}{\radian\per\second}. This is the signature of a \emph{mechanical
 resonance} swept by a cogging order: each harmonic climbs in frequency with speed,
 and where one crosses a fixed structural mode the ripple is amplified. By itself
 the speed plot shows \emph{that} something resonates but not \emph{what}; the
@@ -166,7 +166,7 @@ spectral view localizes it.
 
 \subsection{Spectral mechanism}\label{sec:fft}
 The cogging forcing frequency scales with speed (order $n$ sits at
-$n\,p\,\omega/2\pi$ for $p=30$ pole pairs), whereas a structural resonance stays at
+$n\,p\,\omega/\pi$ for $p=30$ pole pairs), whereas a structural resonance stays at
 a fixed frequency. Overlaying the cogging spectra taken at each drive speed
 therefore separates the two: the orders march outward with speed while the
 resonances stay put.
@@ -179,21 +179,22 @@ resonances stay put.
 
 The spectra show a dominant fixed resonance at \textbf{$\approx\SI{228}{\hertz}$}
 (with a second near \SI{472}{\hertz}) that does not move with speed. That resolves
-the time-domain puzzle: at \SI{24}{\radian\per\second} the \emph{second} cogging
-order ($2p\,\omega/2\pi \approx \SI{229}{\hertz}$) lands on the \SI{228}{\hertz}
+the time-domain puzzle: at \SI{24}{\radian\per\second} the first cogging
+order ($p\,\omega/\pi \approx \SI{229}{\hertz}$) lands on the \SI{228}{\hertz}
 mode and drives the large ripple, while the weaker bump near
-\SI{12}{\radian\per\second} is the fourth order crossing the same mode. Note that
+\SI{12}{\radian\per\second} is the second order crossing the same mode. Note that
 \SI{24}{\radian\per\second} is a drive \emph{speed}, not the resonance frequency;
 the two are easy to conflate from the speed plot alone. This setup had no tap test
 of its own, but tap tests on related dynamometer fixtures have shown structural
 modes spanning the low tens up to several hundred hertz, consistent with a fixture
 resonance in this range.
 
-\paragraph{Conclusion.} The motor's intrinsic cogging is relatively well-behaved:
-$\approx\SI{1.4}{\newton\meter}$ peak-to-peak unloaded, growing modestly under
-load. The dramatic ripple at certain speeds is not a magnetic property but a
-\emph{test-rig} effect, a $\approx\SI{228}{\hertz}$ structural resonance that a low
-cogging order excites near \SI{24}{\radian\per\second}. On a different mechanical
+\section{Conclusion} The motor's intrinsic cogging is relatively well-behaved:
+$\approx\SI{1.1}{\newton\meter}$ peak-to-peak unloaded, growing modestly under
+load. Ideal cogging compensation would be a feedforward function that accounts for both the static per-pole-period cogging map and a torque-dependent compensator that adjusts for higher-load effects.
+
+The dramatic ripple at certain speeds is not a magnetic property but a
+\emph{test-rig} effect, a $\approx\SI{228}{\hertz}$ structural resonance that the pole-pass harmonic excites near \SI{24}{\radian\per\second}. On a different mechanical
 mounting that amplification would shift or vanish, so the slow-speed
 (\SI{4}{\radian\per\second}) measurement is the one that reflects the motor itself.
 
