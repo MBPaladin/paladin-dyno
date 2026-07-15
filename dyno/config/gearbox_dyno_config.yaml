@@ -38,6 +38,7 @@ expected_slave_layout: # This section captures parameters required to initialize
   - model: AKD
     name: DUT
     params:
+      flip_torque_sign: False
       gear_ratio: 31 # approximate, used for feed forward torque commands / safeties
       motor_params: #Peaks refer to motor peak, irregardless of drive limits, All currents are in A_rms
         kt: 0.733 # measured torque constant
@@ -52,6 +53,7 @@ expected_slave_layout: # This section captures parameters required to initialize
   - model: AKD
     name: LOAD
     params:
+      flip_torque_sign: True
       gear_ratio: 1 #Output should always be set to 1
       motor_params: #Peaks refer to motor peak, irregardless of drive limits, All currents are in A_rms
         kt: 11.7

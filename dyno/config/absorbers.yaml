@@ -87,3 +87,35 @@ RA400-04:
     rotatum: 1800 #Nm/s, 4 x peak torque value
   drive_params:
     i_cont: 8
+
+# --- Simulation sandbox drives (gui.py --sim). The fake AKD slaves report
+# --- these names over SDO 0x2031; params mirror the gearbox dyno config.
+SIM-DUT:
+  type: rotary
+  flip_torque_sign: False
+  gear_ratio: 31
+  motor_params:
+    kt: 0.733
+    k_tanh: 0.022
+  motor_limits:
+    torque: 10
+    velocity: 350
+    acceleration: 400
+    rotatum: 40
+  drive_params:
+    i_cont: 5.812
+
+SIM-LOAD:
+  type: rotary
+  flip_torque_sign: True
+  gear_ratio: 1
+  motor_params:
+    kt: 11.7
+    k_tanh: 0.016
+  motor_limits:
+    torque: 330
+    velocity: 12
+    acceleration: 12
+    rotatum: 1320
+  drive_params:
+    i_cont: 12

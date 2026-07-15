@@ -9,6 +9,16 @@ import os
 import multiprocessing
 import yaml
 
+# Simulation sandbox: DYNO_SIM must be in the environment BEFORE the dyno
+# imports below, because master.py chooses real-vs-fake pysoem at import time
+# (and the forked Controller child inherits the parent's imported modules).
+if '--sim' in sys.argv:
+    for _m in ('--gearbox', '--actuator', '--actuator_production'):
+        if _m in sys.argv:
+            os.environ['DYNO_SIM'] = _m.lstrip('-')
+            break
+    print('#### SIMULATION MODE ####')
+
 from dyno.src.logger import Logger
 from dyno.src.dyno_controller import Controller
 

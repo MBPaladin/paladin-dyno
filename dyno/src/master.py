@@ -1,10 +1,15 @@
-import pysoem
+import os
+
+if os.environ.get('DYNO_SIM'):
+    from dyno.sim import fake_pysoem as pysoem
+    print('#### SIMULATION MODE: fake EtherCAT bus, no hardware ####')
+else:
+    import pysoem
 import time
 import threading
 import yaml
 import gc
 from dyno.src.timing import hybrid_sleep_until, set_cyclic_thread_priority
-import os
 from dyno.src.devices import DEVICE_CLASSES, EL2004
 import types
 from operator import attrgetter
