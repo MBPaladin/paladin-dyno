@@ -9,18 +9,29 @@ import os
 import multiprocessing
 import yaml
 
+def resolve_mode(argv):
+    """Rig config selection: --config <name> (matching <name>_dyno_config.yaml),
+    with the legacy flags (--gearbox etc.) kept as aliases."""
+    mode = next((a.lstrip('-') for a in argv
+                 if a in ('--gearbox', '--actuator', '--actuator_production')), None)
+    if '--config' in argv:
+        idx = argv.index('--config')
+        mode = argv[idx + 1] if idx + 1 < len(argv) else None
+    return mode
+
+
 # Simulation sandbox: DYNO_SIM must be in the environment BEFORE the dyno
 # imports below, because master.py chooses real-vs-fake pysoem at import time
 # (and the forked Controller child inherits the parent's imported modules).
 if '--sim' in sys.argv:
-    for _m in ('--gearbox', '--actuator', '--actuator_production'):
-        if _m in sys.argv:
-            os.environ['DYNO_SIM'] = _m.lstrip('-')
-            break
+    _m = resolve_mode(sys.argv)
+    if _m:
+        os.environ['DYNO_SIM'] = _m
     print('#### SIMULATION MODE ####')
 
 from dyno.src.logger import Logger
 from dyno.src.dyno_controller import Controller
+from dyno.src.config_utils import augment_log_keys
 
 from deployment import dyno_paths
 
@@ -57,29 +68,8 @@ class Window(QWidget):
         self.window_length_s = self.dyno_params['gui_params']['window_length_s']
         self.gui_dt = self.gui_decimation * self.master_params['cycle_time_us'] / 1e6
 
-        # add configured sensor keys
-        if 'sensors' in self.dyno_params:
-            for sensor_name, config in self.dyno_params['sensors'].items():
-                
-                # Determine the module name (either from port or direct signal_module)
-                if 'port' in config:
-                    port_map = self.dyno_params.get('panel_ports', {}).get(config['port'])
-                    module_name = port_map['signal_module']
-                else:
-                    module_name = config.get('signal_module')
-
-                # Construct the dot-notation path for attrgetter
-                # Format: devices.<module_name>.<sensor_name>
-                log_path = f"devices.{module_name}.{sensor_name}"
-                
-                # Check if this sensor is already in log_keys to avoid duplicates
-                existing_keys = [k[0] for k in self.dyno_params.get('log_keys', [])]
-                
-                if sensor_name not in existing_keys:
-                    self.dyno_params['log_keys'].append([sensor_name, log_path])
-                    print(f"\tAuto-logged sensor: {sensor_name} -> {log_path}")
-
-        self.log_keys = [entry[0] for entry in self.dyno_params['log_keys']]
+        # add configured sensor keys (shared builder — must match Controller/Logger)
+        self.log_keys = augment_log_keys(self.dyno_params, verbose=True)
         print("LOG_KEYS: item count = ", len(self.log_keys))
         for key in self.log_keys:
             print('\t',key)
@@ -360,14 +350,15 @@ class Window(QWidget):
 if __name__=='__main__':
     automated = False
 
-    if '--gearbox' in sys.argv:
-        mode = 'gearbox'
-    elif '--actuator' in sys.argv:
-        mode = 'actuator'
-    elif '--actuator_production' in sys.argv:
-        mode = 'actuator_production'
-    else:
-        print('Launch Aborted, Errant mode key supplied')
+    mode = resolve_mode(sys.argv)
+    if mode is None or not os.path.exists(
+            f"{dyno_paths.dyno_config_directory}/{mode}_dyno_config.yaml"):
+        available = sorted(f[:-len('_dyno_config.yaml')]
+                           for f in os.listdir(dyno_paths.dyno_config_directory)
+                           if f.endswith('_dyno_config.yaml'))
+        print(f'Launch Aborted: no rig config selected (got {mode!r}).')
+        print(f'Use --config <name> (or legacy flag). Available: {available}')
+        sys.exit(1)
 
     if '--automated' in sys.argv:
         automated = True

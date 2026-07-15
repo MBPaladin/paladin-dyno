@@ -8,6 +8,7 @@ import numpy as np
 import time
 import yaml
 from deployment import dyno_paths
+from dyno.src.config_utils import augment_log_keys
 
 class Logger:
     def __init__(self, telemetry_queue, mode):
@@ -17,28 +18,8 @@ class Logger:
         with open(f"{dyno_paths.dyno_config_directory}/{mode}_dyno_config.yaml", 'r') as f:
             self.dyno_params = yaml.safe_load(f)
 
-        if 'sensors' in self.dyno_params:
-            for sensor_name, config in self.dyno_params['sensors'].items():
-                
-                # Determine the module name (either from port or direct signal_module)
-                if 'port' in config:
-                    port_map = self.dyno_params.get('panel_ports', {}).get(config['port'])
-                    module_name = port_map['signal_module']
-                else:
-                    module_name = config.get('signal_module')
-
-                # Construct the dot-notation path for attrgetter
-                # Format: devices.<module_name>.<sensor_name>
-                log_path = f"devices.{module_name}.{sensor_name}"
-                
-                # Check if this sensor is already in log_keys to avoid duplicates
-                existing_keys = [k[0] for k in self.dyno_params.get('log_keys', [])]
-                
-                if sensor_name not in existing_keys:
-                    self.dyno_params['log_keys'].append([sensor_name, log_path])
-                    print(f"\tAuto-logged sensor: {sensor_name} -> {log_path}")
-
-        self.log_keys = [entry[0] for entry in self.dyno_params['log_keys']]
+        # shared builder — must produce the same ordering as GUI/Controller
+        self.log_keys = augment_log_keys(self.dyno_params)
 
         self.telemetry_samples = []
 

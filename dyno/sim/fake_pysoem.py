@@ -202,11 +202,32 @@ class AKDBehavior(Behavior):
 
 
 class RTDBehavior(Behavior):
-    """EL3208: constant plausible temperatures (only used by production cfg)."""
+    """EL3208: 8 channels of plausible ambient temperature (0.1 C/count)."""
+    AMBIENT_C = 25.0
+
     def __init__(self, layout_entry):
         super().__init__(layout_entry)
         from dyno.src.devices import EL3208
         self.input_size = ctypes.sizeof(EL3208.TxPDO)
+
+    def step(self, dt_s, output_buf):
+        buf = bytearray(self.input_size)
+        for ch in range(8):
+            counts = int((self.AMBIENT_C + random.gauss(0, 0.05)) * 10)
+            buf[ch * 4 + 2:ch * 4 + 4] = counts.to_bytes(2, 'little', signed=True)
+        return bytes(buf)
+
+
+class PWMOutBehavior(Behavior):  # EL2502
+    output_size = 4  # 2 x u16 PWM
+
+
+class EnDatEncoderBehavior(Behavior):
+    """EL5042: 2-channel absolute encoder, static zero position for now."""
+    def __init__(self, layout_entry):
+        super().__init__(layout_entry)
+        from dyno.src.devices import EL5042
+        self.input_size = ctypes.sizeof(EL5042.TxPDO)
 
 
 BEHAVIOR_FOR_MODEL = {
@@ -218,6 +239,8 @@ BEHAVIOR_FOR_MODEL = {
     'ELM3002': lambda e: ELM300xBehavior(e, channels=2),
     'ELM3004': lambda e: ELM300xBehavior(e, channels=4),
     'EL3208': lambda e: RTDBehavior(e),
+    'EL2502': lambda e: PWMOutBehavior(e),
+    'EL5042': lambda e: EnDatEncoderBehavior(e),
     'AKD': lambda e: AKDBehavior(e),
 }
 
