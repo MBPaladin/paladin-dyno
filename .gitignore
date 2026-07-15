@@ -56,3 +56,5 @@ __pycache__/
 
 # Results
 brian_tests/
+dyno/jitter_bench/*.npz
+dyno/jitter_bench/*.png

@@ -2,7 +2,8 @@ import pysoem
 import time
 import threading
 import yaml
-from dyno.src.timing import nano_sleep
+import gc
+from dyno.src.timing import hybrid_sleep_until, set_cyclic_thread_priority
 import os
 from dyno.src.devices import DEVICE_CLASSES, EL2004
 import types
@@ -49,59 +50,74 @@ class Master:
         cycle_time_sec = self.process_data_cycle_time_us / 1_000_000.0
         print(f'Process data thread cycle time: {cycle_time_sec*1000:.2f} ms')
 
+        # Kernel wake-up slop and preemption of this thread are the dominant
+        # sources of cycle jitter, ahead of anything on the EtherCAT bus itself.
+        if set_cyclic_thread_priority():
+            print('Process data thread running with SCHED_FIFO priority')
+        else:
+            print('WARNING: could not set SCHED_FIFO (need root or CAP_SYS_NICE), '
+                  'cycle jitter will be worse under load')
+        gc_was_enabled = gc.isenabled()
+        gc.disable() # GC pauses land directly in the cycle-time tail
+
         wkc_error_count = 0
         max_wkc_errors_before_warning = 10 # Only print warning after 10 consecutive errors
 
         target_dc_modulo = 500000
         master_time_offset = None
         jitter_arr = np.zeros(1000)
-        cycle_start_time = time.perf_counter_ns()
-        while not self._pd_thread_stop_event.is_set():
+        monotonic_ns = time.clock_gettime_ns # same clock as hybrid_sleep_until
+        cycle_start_time = monotonic_ns(time.CLOCK_MONOTONIC)
+        try:
+            while not self._pd_thread_stop_event.is_set():
 
-            pdo_send_time = time.perf_counter_ns()
-            self._master.send_processdata()
-            self._actual_wkc = self._master.receive_processdata(timeout=int(cycle_time_sec * 1_000_000 * 0.9)) # Timeout in microseconds, 90% of cycle
+                pdo_send_time = monotonic_ns(time.CLOCK_MONOTONIC)
+                self._master.send_processdata()
+                self._actual_wkc = self._master.receive_processdata(timeout=int(cycle_time_sec * 1_000_000 * 0.9)) # Timeout in microseconds, 90% of cycle
 
-            dc_modulo = self._master.dc_time % 1000000 # determine where in the ethercat cycle we've sent data
-            if master_time_offset == None:
-                master_time_offset = self._master.dc_time - pdo_send_time
+                dc_modulo = self._master.dc_time % 1000000 # determine where in the ethercat cycle we've sent data
+                if master_time_offset == None:
+                    master_time_offset = self._master.dc_time - pdo_send_time
 
-            if self.data_counter > 500:
-                jitter_arr[self.data_counter % 1000] = pdo_send_time - last_dc_time
+                if self.data_counter > 500:
+                    jitter_arr[self.data_counter % 1000] = pdo_send_time - last_dc_time
 
-            last_dc_time = pdo_send_time
+                last_dc_time = pdo_send_time
 
-            start_time_shift = int( ((self._master.dc_time - pdo_send_time) - master_time_offset)/30) + int((dc_modulo - target_dc_modulo)/30)
-            master_time_offset += start_time_shift
+                start_time_shift = int( ((self._master.dc_time - pdo_send_time) - master_time_offset)/30) + int((dc_modulo - target_dc_modulo)/30)
+                master_time_offset += start_time_shift
 
-            if self.in_op:
-                # Process inbound PDO data
-                for device_name in vars(self.devices).keys():
-                    device_instance = getattr(self.devices, device_name)
-                    if hasattr(device_instance, 'process_txpdo'):
-                        device_instance.process_txpdo()
+                if self.in_op:
+                    # Process inbound PDO data
+                    for device_name in vars(self.devices).keys():
+                        device_instance = getattr(self.devices, device_name)
+                        if hasattr(device_instance, 'process_txpdo'):
+                            device_instance.process_txpdo()
 
-                self.step()
+                    self.step()
 
-                # Process outbound PDO data
-                for device_name in vars(self.devices).keys():
-                    device_instance = getattr(self.devices, device_name)
-                    if hasattr(device_instance, 'write_rxpdo'):
-                        device_instance.write_rxpdo()
+                    # Process outbound PDO data
+                    for device_name in vars(self.devices).keys():
+                        device_instance = getattr(self.devices, device_name)
+                        if hasattr(device_instance, 'write_rxpdo'):
+                            device_instance.write_rxpdo()
 
-            if self._actual_wkc < self._master.expected_wkc:
-                wkc_error_count += 1
-                if wkc_error_count >= max_wkc_errors_before_warning and not self.shutdown:
-                    print(f'WARNING: Incorrect WKC. Expected: {self._master.expected_wkc}, Actual: {self._actual_wkc}')
-                    wkc_error_count = 0 # Reset counter after printing warning
-            else:
-                wkc_error_count = 0 # Reset if WKC is correct
+                if self._actual_wkc < self._master.expected_wkc:
+                    wkc_error_count += 1
+                    if wkc_error_count >= max_wkc_errors_before_warning and not self.shutdown:
+                        print(f'WARNING: Incorrect WKC. Expected: {self._master.expected_wkc}, Actual: {self._actual_wkc}')
+                        wkc_error_count = 0 # Reset counter after printing warning
+                else:
+                    wkc_error_count = 0 # Reset if WKC is correct
 
-            cycle_start_time += self.process_data_cycle_time_us * 1000 - start_time_shift
+                cycle_start_time += self.process_data_cycle_time_us * 1000 - start_time_shift
 
-            sleep_duration = cycle_start_time - time.perf_counter_ns()
-            if sleep_duration > 0:
-                nano_sleep(int(sleep_duration))
+                # Absolute deadline: a late cycle doesn't shift the schedule,
+                # and the final ~150us is spun away to absorb wake-up slop.
+                hybrid_sleep_until(cycle_start_time)
+        finally:
+            if gc_was_enabled:
+                gc.enable()
 
     # PDO update loop, taken from basic example. For each ethercat device, if the wrapping class has an 'update' method, that update method is run
     def run(self):
