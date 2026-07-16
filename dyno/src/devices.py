@@ -7,6 +7,7 @@ import yaml
 import queue
 import threading
 from deployment import dyno_paths
+from dyno.src.config_utils import deep_merge, validate_required_params, print_params_provenance
 
 # Hard coded device ID's to double check during bringup
 BECKHOFF_VENDOR_ID = 2
@@ -591,11 +592,31 @@ class AKD:
         drive_name = self._slave.sdo_read(0x2031, 0).decode('utf-8')
         drive_name = drive_name.strip(drive_name[-1])
 
-        if drive_name in [k for k in absorber_params.keys()]:
-            self.params = absorber_params[drive_name]
-            print('Loading Params for: ',drive_name)
+        # Merge absorber entry ONTO the dyno-config layout params: the absorber
+        # overrides only the keys it defines (was: wholesale dict replacement,
+        # which silently discarded every layout value and split flip_torque_sign
+        # off to a different source than everything else).
+        layout_params = params if params is not None else {}
+        if drive_name in absorber_params:
+            print('Loading absorber params for: ', drive_name)
+            self.params, self.params_provenance = deep_merge(
+                layout_params, absorber_params[drive_name],
+                base_src='dyno config', override_src=f'absorbers.yaml:{drive_name}')
         else:
-            print(self.name,' drive params not found in absorber config. Reverting to dyno config params')
+            print(self.name, ' drive params not found in absorber config. Using dyno config params')
+            self.params, self.params_provenance = deep_merge(
+                layout_params, {}, base_src='dyno config')
+
+        validate_required_params(
+            self.params,
+            ['flip_torque_sign', 'gear_ratio',
+             'motor_params.kt', 'motor_params.k_tanh',
+             'motor_limits.torque', 'motor_limits.velocity',
+             'motor_limits.acceleration', 'motor_limits.rotatum',
+             'drive_params.i_cont'],
+            context=f'AKD {self.name} (drive {drive_name!r})')
+        print_params_provenance(f'{self.name} ({drive_name})',
+                                self.params, self.params_provenance)
 
         self._rx_pdo = self.RxPDO()  # Master -> Slave (Output to drive)
         self._tx_pdo = self.TxPDO()  # Slave -> Master (Input from drive)
@@ -622,8 +643,10 @@ class AKD:
         self.switching_modes = False
 
         self.position_offset = 0
-        self.flip_torque_sign = params['flip_torque_sign']
-        self.flip_direction_sign = params.get('flip_direction_sign', False)
+        # from the MERGED params like everything else (was: read from the raw
+        # dyno-config argument even when an absorber entry overrode the rest)
+        self.flip_torque_sign = self.params['flip_torque_sign']
+        self.flip_direction_sign = self.params.get('flip_direction_sign', False)
 
         self.torque_limit = self.params['motor_limits']['torque']
         self.velocity_limit = self.params['motor_limits']['velocity']

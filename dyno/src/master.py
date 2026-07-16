@@ -9,6 +9,7 @@ import time
 import threading
 import yaml
 import gc
+import json
 from dyno.src.timing import hybrid_sleep_until, set_cyclic_thread_priority
 from dyno.src.config_utils import augment_log_keys
 from dyno.src.devices import DEVICE_CLASSES, EL2004
@@ -202,6 +203,24 @@ class Master:
         print('\nCompiled telemetry check: item count = ',len(self._telemetry_compiled))
         for item in self._telemetry_compiled:
             print('\t',item)
+
+        # --- 3.6 Persist resolved device parameters ---
+        # Written every bring-up; the Logger attaches this file to each test's
+        # HDF5 log so post-processing can reconstruct the exact configuration
+        # (post absorber-merge, including provenance of every value).
+        resolved = {'mode': getattr(self, 'mode', None),
+                    'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+                    'devices': {}}
+        for device_name, device in vars(self.devices).items():
+            entry = {'class': type(device).__name__}
+            if isinstance(getattr(device, 'params', None), dict):
+                entry['params'] = device.params
+            if hasattr(device, 'params_provenance'):
+                entry['provenance'] = device.params_provenance
+            resolved['devices'][device_name] = entry
+        os.makedirs(dyno_paths.dyno_logs_directory, exist_ok=True)
+        with open(f'{dyno_paths.dyno_logs_directory}/resolved_config.json', 'w') as f:
+            json.dump(resolved, f, indent=2, default=str)
 
         # --- 4. Transition to OP ---
         self._master.config_map()

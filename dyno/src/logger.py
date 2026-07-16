@@ -104,6 +104,13 @@ class Logger:
         os.mkdir(folder_dir)
         f_name = folder_dir+'/log.hdf5'
         self.file = h5py.File(f_name,'w')
+
+        # Attach the resolved device configuration (written by the master at
+        # bring-up) so every log records exactly what parameters ran.
+        resolved_path = f"{dyno_paths.dyno_logs_directory}/resolved_config.json"
+        if os.path.exists(resolved_path):
+            with open(resolved_path, 'r') as f:
+                self.file.attrs['resolved_config'] = f.read()
         
         # makes the HDF5 file and the datasets within it that are needed
         self.dsets = {}
