@@ -2,7 +2,8 @@
 against the fake EtherCAT bus (no GUI, no hardware) and checks that telemetry
 flows and the drives complete their DS402 enable handshake.
 
-Run from repo root:  PYTHONPATH=. .venv/bin/python dyno/sim/smoke_test.py
+Run from repo root:  PYTHONPATH=. .venv/bin/python dyno/sim/smoke_test.py [mode]
+(mode defaults to gearbox; e.g. actuator_production)
 """
 import math
 import multiprocessing
@@ -10,16 +11,18 @@ import os
 import sys
 import time
 
-os.environ['DYNO_SIM'] = 'gearbox'
+MODE = sys.argv[1] if len(sys.argv) > 1 else 'gearbox'
+os.environ['DYNO_SIM'] = MODE
 
 from dyno.src.dyno_controller import Controller  # noqa: E402
 
 
 def main():
+    print(f'--- sim smoke test, mode={MODE} ---')
     telemetry_q = multiprocessing.Queue()
     command_q = multiprocessing.Queue()
     p = multiprocessing.Process(target=Controller,
-                                args=[telemetry_q, command_q, 'gearbox'])
+                                args=[telemetry_q, command_q, MODE])
     p.start()
 
     samples = []

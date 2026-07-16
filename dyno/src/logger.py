@@ -8,6 +8,7 @@ import numpy as np
 import time
 import yaml
 from deployment import dyno_paths
+from dyno.src.config_utils import augment_log_keys
 
 class Logger:
     def __init__(self, telemetry_queue, mode):
@@ -17,28 +18,8 @@ class Logger:
         with open(f"{dyno_paths.dyno_config_directory}/{mode}_dyno_config.yaml", 'r') as f:
             self.dyno_params = yaml.safe_load(f)
 
-        if 'sensors' in self.dyno_params:
-            for sensor_name, config in self.dyno_params['sensors'].items():
-                
-                # Determine the module name (either from port or direct signal_module)
-                if 'port' in config:
-                    port_map = self.dyno_params.get('panel_ports', {}).get(config['port'])
-                    module_name = port_map['signal_module']
-                else:
-                    module_name = config.get('signal_module')
-
-                # Construct the dot-notation path for attrgetter
-                # Format: devices.<module_name>.<sensor_name>
-                log_path = f"devices.{module_name}.{sensor_name}"
-                
-                # Check if this sensor is already in log_keys to avoid duplicates
-                existing_keys = [k[0] for k in self.dyno_params.get('log_keys', [])]
-                
-                if sensor_name not in existing_keys:
-                    self.dyno_params['log_keys'].append([sensor_name, log_path])
-                    print(f"\tAuto-logged sensor: {sensor_name} -> {log_path}")
-
-        self.log_keys = [entry[0] for entry in self.dyno_params['log_keys']]
+        # shared builder — must produce the same ordering as GUI/Controller
+        self.log_keys = augment_log_keys(self.dyno_params)
 
         self.telemetry_samples = []
 
@@ -123,6 +104,13 @@ class Logger:
         os.mkdir(folder_dir)
         f_name = folder_dir+'/log.hdf5'
         self.file = h5py.File(f_name,'w')
+
+        # Attach the resolved device configuration (written by the master at
+        # bring-up) so every log records exactly what parameters ran.
+        resolved_path = f"{dyno_paths.dyno_logs_directory}/resolved_config.json"
+        if os.path.exists(resolved_path):
+            with open(resolved_path, 'r') as f:
+                self.file.attrs['resolved_config'] = f.read()
         
         # makes the HDF5 file and the datasets within it that are needed
         self.dsets = {}

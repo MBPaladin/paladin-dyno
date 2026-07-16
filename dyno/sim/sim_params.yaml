@@ -1,0 +1,10 @@
+# Optional tuning for the simulation sandbox plant (dyno/sim/plant.py).
+# Delete a key (or this file) to fall back to code defaults.
+
+inertia_kgm2: 25.0     # reflected inertia at the output shaft
+viscous_nms: 0.3       # viscous friction, Nm per rad/s
+coulomb_nm: 0.3        # coulomb friction magnitude, Nm
+ambient_c: 25.0
+thermal_tau_s: 120.0   # stator temperature first-order time constant, s
+heat_c_per_nm: 0.15    # steady-state stator rise per Nm of load torque
+adc_noise_counts: 4000 # gaussian noise on ADC channels (raw counts)

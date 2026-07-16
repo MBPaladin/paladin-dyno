@@ -4,6 +4,7 @@ import time
 import math
 import os
 import threading
+from operator import attrgetter
 from deployment import dyno_paths
 from dyno.src.test_manager import TestManager
 
@@ -37,9 +38,20 @@ class Controller(Master):
         self._test_init_thread = None
 
         self._aux_funcs = []
-        assert self.mode in ['gearbox', 'actuator', 'actuator_production']
         if self.mode == 'actuator_production':
             self._aux_funcs.append(self._aux_func_A3_Dyno)
+
+        # Compile safety checks from config: each entry names a telemetry
+        # source (attrgetter path, same idiom as log_keys) and a limit.
+        # safeties: { output_torque: { source: devices.ADC.output_torque, limit: 375 } }
+        self._safety_checks = []
+        for check_name, spec in self.dyno_params.get('safeties', {}).items():
+            if not isinstance(spec, dict) or 'source' not in spec or 'limit' not in spec:
+                raise ValueError(
+                    f"safeties entry '{check_name}' in {self.mode}_dyno_config.yaml "
+                    f"must be a dict with 'source' and 'limit' keys, got: {spec!r}")
+            self._safety_checks.append(
+                (check_name, attrgetter(spec['source']), abs(spec['limit'])))
 
         try:
             os.sched_setscheduler(0, SCHED_POLICY, os.sched_param(SCHED_PRIO))
@@ -140,44 +152,20 @@ class Controller(Master):
                 read_queue = False
                 pass
 
-    # stops the test if measured values are outside of an acceptable range. more entries can be added as desired
+    # stops the test if measured values are outside of an acceptable range.
+    # Checks are declared in the config's `safeties:` section (source + limit);
+    # add entries there rather than here.
     def _safety_trigger(self):
-        if self.mode == 'actuator_production':
-            output_torque = abs(self.devices.adc_1.load_torque)
-        else:
-            output_torque = abs(self.devices.ADC.output_torque)
-            input_torque = abs(self.devices.ADC.input_torque)
-
-            if input_torque > self.dyno_params['safeties']['input_torque']:
-                print('Safety triggered, input torque of ',input_torque, ' exceeds limit')
+        for check_name, getter, limit in self._safety_checks:
+            value = abs(getter(self))
+            if value > limit:
+                print(f'Safety triggered, {check_name} of {value} exceeds limit of {limit}')
                 return True
 
-        output_velocity = abs(self.devices.LOAD.velocity)
-        output_gear_ratio = self.devices.LOAD.params['gear_ratio']
-        input_velocity = abs(self.devices.DUT.velocity)
-        input_gear_ratio = self.devices.DUT.params['gear_ratio']
-
-        if output_torque > self.dyno_params['safeties']['output_torque']:
-            print('Safety triggered, output torque of ',output_torque, ' exceeds limit')
-            return True
-        
-        if input_velocity > self.dyno_params['safeties']['input_velocity']:
-            print('Safety triggered, input velocity of ',input_velocity, ' exceeds limit')
-            return True
-
-        if output_velocity > self.dyno_params['safeties']['output_velocity']:
-            print('Safety triggered, output velocity of ',output_velocity, ' exceeds limit')
-            return True
-        
-        # 2 rad/s velocity difference, in output coordinates, between the two motors will kill the test
-        # if abs((input_velocity / input_gear_ratio) - (output_velocity / output_gear_ratio)) > 2: 
-        #     print('Safety triggered, diverging velocities detected. Check the configured gear ratio for each motor')
-        #     return True
-        
         if self.devices.DUT.fault:
             print('Safety triggered, DUT is in fault state')
             return True
-        
+
         if self.devices.LOAD.fault:
             print('Safety triggered, LOAD is in fault state')
             return True

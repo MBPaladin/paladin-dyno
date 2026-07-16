@@ -67,11 +67,12 @@ expected_slave_layout: # This section captures parameters required to initialize
         i_cont: 12 
 
 
-safeties: # Measured values over these limits will cause the test to stop
-  output_torque: 375 # Nm on the output torque cell. measured abs(torque) over this limit will stop a test
-  input_torque: 15 # Nm on the input torque cell. measured abs(torque) over this limit will stop a test
-  output_velocity: 15 # rad/s on the output. measured abs(velocity) over this limit will stop the test
-  input_velocity: 500 # rad/s
+safeties: # Measured values over these limits will cause the test to stop.
+  # `source` is an attribute path on the controller (same idiom as log_keys).
+  output_torque: { source: devices.ADC.output_torque, limit: 375 } # Nm on the output torque cell
+  input_torque: { source: devices.ADC.input_torque, limit: 15 } # Nm on the input torque cell
+  output_velocity: { source: devices.LOAD.velocity, limit: 15 } # rad/s on the output
+  input_velocity: { source: devices.DUT.velocity, limit: 500 } # rad/s
 
 gui_params: # defines length and resolution of the plots
   window_length_s: 30
