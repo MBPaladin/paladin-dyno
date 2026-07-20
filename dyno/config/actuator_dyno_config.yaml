@@ -103,3 +103,5 @@ log_keys:
   - [load_position, devices.LOAD.position]
   - [load_velocity, devices.LOAD.velocity]
   - [load_current, devices.LOAD.current]
+  - [cycle_time_us, cycle_dt_us] # measured PDO loop interval
+  - [wkc_error, wkc_error] # expected - actual working counter; 0 = healthy, >0 = dropped/late frame

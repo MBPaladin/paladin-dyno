@@ -29,6 +29,8 @@ class Master:
         self._pd_thread_stop_event = threading.Event()
         self._ch_thread_stop_event = threading.Event()
         self._actual_wkc = 0
+        self.wkc_error = 0 # per-cycle missing working counter (expected - actual); 0 when healthy
+        self.cycle_dt_us = 0.0 # measured interval between PDO sends, logged per-sample
         self._master = pysoem.Master()
         self._master.in_op = False
         self._master.do_check_state = False
@@ -75,16 +77,23 @@ class Master:
         jitter_arr = np.zeros(1000)
         monotonic_ns = time.clock_gettime_ns # same clock as hybrid_sleep_until
         cycle_start_time = monotonic_ns(time.CLOCK_MONOTONIC)
+        last_dc_time = cycle_start_time
         try:
             while not self._pd_thread_stop_event.is_set():
 
                 pdo_send_time = monotonic_ns(time.CLOCK_MONOTONIC)
                 self._master.send_processdata()
                 self._actual_wkc = self._master.receive_processdata(timeout=int(cycle_time_sec * 1_000_000 * 0.9)) # Timeout in microseconds, 90% of cycle
+                # Deficit form so the log reads 0 when healthy and rises on dropped/late frames.
+                self.wkc_error = self._master.expected_wkc - self._actual_wkc
 
                 dc_modulo = self._master.dc_time % 1000000 # determine where in the ethercat cycle we've sent data
                 if master_time_offset == None:
                     master_time_offset = self._master.dc_time - pdo_send_time
+
+                # Measured cycle interval; exposed for per-sample telemetry and
+                # set before self.step() so the logged value matches this cycle.
+                self.cycle_dt_us = (pdo_send_time - last_dc_time) / 1000.0
 
                 if self.data_counter > 500:
                     jitter_arr[self.data_counter % 1000] = pdo_send_time - last_dc_time

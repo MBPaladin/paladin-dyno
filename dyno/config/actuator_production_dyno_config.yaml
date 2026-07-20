@@ -215,3 +215,5 @@ log_keys: # Fixed values that aren't user adjustable
   - [load_velocity, devices.LOAD.velocity]
   - [load_current, devices.LOAD.current]
   - [load_position_2, devices.encoder.position]
+  - [cycle_time_us, cycle_dt_us] # measured PDO loop interval
+  - [wkc_error, wkc_error] # expected - actual working counter; 0 = healthy, >0 = dropped/late frame

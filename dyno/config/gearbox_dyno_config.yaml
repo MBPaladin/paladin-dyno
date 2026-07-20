@@ -94,3 +94,5 @@ log_keys: #This needs to match with how the ethercat loop and gui are creating d
   - [output_position, devices.LOAD.position_command]
   - [output_velocity, devices.LOAD.velocity]
   - [output_current, devices.LOAD.current]
+  - [cycle_time_us, cycle_dt_us] # measured PDO loop interval
+  - [wkc_error, wkc_error] # expected - actual working counter; 0 = healthy, >0 = dropped/late frame
