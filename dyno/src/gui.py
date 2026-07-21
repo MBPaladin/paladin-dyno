@@ -5,7 +5,8 @@ from PySide6.QtWidgets import QApplication
 from PySide6.QtCore import *
 from PySide6.QtWidgets import *
 import sys
-import os   
+import os
+import signal
 import multiprocessing
 import yaml
 
@@ -155,13 +156,20 @@ class Window(QWidget):
             self.logging_process.join()
             print('Logging process terminated')
 
-        # wait for control thread shutdown to occur
-        time.sleep(2)
+        # Wait for the control loop to act on the shutdown command (disable the
+        # drives, bring EtherCAT to INIT, exit its run loop) and exit on its own.
+        # Only force-kill if it overruns, so a clean teardown is never cut short
+        # mid-sequence.
+        shutdown_timeout_s = 5
+        self.control_process.join(timeout=shutdown_timeout_s)
 
         if self.control_process.is_alive():
+            print(f'Control process did not exit within {shutdown_timeout_s}s, terminating')
             self.control_process.terminate()
             self.control_process.join()
             print('Control process terminated')
+        else:
+            print('Control process shut down cleanly')
 
     def __build_ui(self):
         self.main_layout = QHBoxLayout(self)
@@ -219,18 +227,15 @@ class Window(QWidget):
             self.plots.append(plot)
             self.controls_layout.addWidget(selection_box)
 
-        # --- Test Selection section: title on the left, launcher button on the
-        # right (same row), with the Quick Select dropdown beneath. ---
-        test_select_header = QHBoxLayout()
-        test_select_title = QLabel('Test Selection')
+        # --- Test Selection section: centered header, launcher button beneath
+        # (same size as Start/Stop), then the Quick Select dropdown. ---
+        test_select_title = QLabel('Test Selection', alignment=Qt.AlignmentFlag.AlignCenter)
         test_select_title.setStyleSheet('font-size: 16px;')
-        test_select_header.addWidget(test_select_title, stretch=1)
+        self.controls_layout.addWidget(test_select_title)
 
         self.open_test_def_button = QPushButton('Open Test Definition UI')
-        self.open_test_def_button.setStyleSheet('font-size: 14px; padding: 8px;')
         self.open_test_def_button.clicked.connect(self.__open_test_definition)
-        test_select_header.addWidget(self.open_test_def_button, stretch=1)
-        self.controls_layout.addLayout(test_select_header)
+        self.controls_layout.addWidget(self.open_test_def_button)
 
         self.test_select = QComboBox()
         self.test_select.addItems([f for f in os.listdir(dyno_paths.dyno_test_directory) if f[-4:] == 'yaml'])
@@ -397,4 +402,15 @@ if __name__=='__main__':
         g.showFullScreen()
     else:
         g.show()
+
+    # Route a terminal Ctrl-C through Qt's clean shutdown (aboutToQuit ->
+    # close_processes), so the control child is told to safely disable the drives
+    # instead of being orphaned. Qt's C++ event loop doesn't service Python
+    # signals on its own, so a periodic no-op timer wakes the interpreter often
+    # enough to deliver the pending SIGINT.
+    signal.signal(signal.SIGINT, lambda *_: a.quit())
+    sigint_timer = QTimer()
+    sigint_timer.timeout.connect(lambda: None)
+    sigint_timer.start(200)
+
     sys.exit(a.exec())
