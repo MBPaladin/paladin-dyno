@@ -53,6 +53,7 @@ Thumbs.db
 __pycache__/
 .venv
 *.png
+dyno/logs/resolved_config.json
 
 # Results
 brian_tests/
