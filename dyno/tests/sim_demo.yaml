@@ -6,7 +6,7 @@ behaviors:
     settings:
       input_motor:
         control_mode: velocity
-        command_list: [2, 5]
+        command_list: [-5,-2,2, 5]
       output_motor:
         control_mode: torque
         command_list: [5, -5]
