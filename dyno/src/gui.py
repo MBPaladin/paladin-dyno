@@ -220,9 +220,13 @@ class Window(QWidget):
             self.controls_layout.addWidget(selection_box)
 
         # Add fixed buttons to the control layout
-        title_label = QLabel('Test Selection', alignment=Qt.AlignmentFlag.AlignCenter)
-        title_label.setStyleSheet('font-size: 16px;')
-        self.controls_layout.addWidget(title_label)
+        self.open_test_def_button = QPushButton('Open Test Definition UI')
+        self.open_test_def_button.clicked.connect(self.__open_test_definition)
+        self.controls_layout.addWidget(self.open_test_def_button)
+
+        quick_select_label = QLabel('Quick Select:', alignment=Qt.AlignmentFlag.AlignCenter)
+        quick_select_label.setStyleSheet('font-size: 14px;')
+        self.controls_layout.addWidget(quick_select_label)
 
         self.test_select = QComboBox()
         self.test_select.addItem("")
@@ -258,6 +262,16 @@ class Window(QWidget):
 
     def __load_test(self):
         self.control_command_queue.put_nowait(['test_def', (self.test_select.currentText(), self.mode)])
+
+    def __open_test_definition(self):
+        # Lazy import: keeps GUI start-up light and avoids a hard dependency
+        # when running headless. Keep a reference so the window isn't GC'd.
+        from dyno.src.test_definition_window import TestDefinitionWindow
+        if getattr(self, '_test_def_window', None) is None:
+            self._test_def_window = TestDefinitionWindow(self.mode)
+        self._test_def_window.show()
+        self._test_def_window.raise_()
+        self._test_def_window.activateWindow()
 
     # called if you change which scope is selected in the dropdown
     def __change_scopes(self):
