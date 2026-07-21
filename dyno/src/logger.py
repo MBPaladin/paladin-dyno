@@ -1,5 +1,6 @@
 import h5py
 import os
+import signal
 import time
 from PySide6.QtCore import QObject
 from PySide6.QtCore import *
@@ -12,6 +13,10 @@ from dyno.src.config_utils import augment_log_keys
 
 class Logger:
     def __init__(self, telemetry_queue, mode):
+        # Child process: ignore SIGINT and let the parent GUI shut us down
+        # cleanly (via terminate() in close_processes), so a Ctrl-C doesn't kill
+        # us mid-write and truncate the log file.
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
 
         self.telemetry_queue = telemetry_queue
 

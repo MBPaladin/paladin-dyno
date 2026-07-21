@@ -3,6 +3,7 @@ import yaml
 import time
 import math
 import os
+import signal
 import threading
 from operator import attrgetter
 from deployment import dyno_paths
@@ -13,6 +14,12 @@ SCHED_PRIO = 50
 
 class Controller(Master):
     def __init__(self, telemetry_queue=None, command_queue=None,mode=None):
+        # Runs in a child process: ignore SIGINT so a terminal Ctrl-C can't kill
+        # the real-time control loop mid-cycle (which would orphan it with the
+        # drives still enabled). The parent GUI orchestrates an orderly shutdown
+        # via the command queue instead.
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+
         self.mode = mode
 
         with open(f"{dyno_paths.dyno_config_directory}/{mode}_dyno_config.yaml", 'r') as f:
