@@ -219,20 +219,23 @@ class Window(QWidget):
             self.plots.append(plot)
             self.controls_layout.addWidget(selection_box)
 
-        # Add fixed buttons to the control layout
-        self.open_test_def_button = QPushButton('Open Test Definition UI')
-        self.open_test_def_button.clicked.connect(self.__open_test_definition)
-        self.controls_layout.addWidget(self.open_test_def_button)
+        # --- Test Selection section: title on the left, launcher button on the
+        # right (same row), with the Quick Select dropdown beneath. ---
+        test_select_header = QHBoxLayout()
+        test_select_title = QLabel('Test Selection')
+        test_select_title.setStyleSheet('font-size: 16px;')
+        test_select_header.addWidget(test_select_title, stretch=1)
 
-        quick_select_label = QLabel('Quick Select:', alignment=Qt.AlignmentFlag.AlignCenter)
-        quick_select_label.setStyleSheet('font-size: 14px;')
-        self.controls_layout.addWidget(quick_select_label)
+        self.open_test_def_button = QPushButton('Open Test Definition UI')
+        self.open_test_def_button.setStyleSheet('font-size: 14px; padding: 8px;')
+        self.open_test_def_button.clicked.connect(self.__open_test_definition)
+        test_select_header.addWidget(self.open_test_def_button, stretch=1)
+        self.controls_layout.addLayout(test_select_header)
 
         self.test_select = QComboBox()
-        self.test_select.addItem("")
-
         self.test_select.addItems([f for f in os.listdir(dyno_paths.dyno_test_directory) if f[-4:] == 'yaml'])
-        self.test_select.setCurrentText('Test Selection')
+        self.test_select.setPlaceholderText('Quick Select')
+        self.test_select.setCurrentIndex(-1)  # show the placeholder, arm no test
         self.test_select.currentIndexChanged.connect(self.__load_test)
         self.controls_layout.addWidget(self.test_select)
 
@@ -269,9 +272,17 @@ class Window(QWidget):
         from dyno.src.test_definition_window import TestDefinitionWindow
         if getattr(self, '_test_def_window', None) is None:
             self._test_def_window = TestDefinitionWindow(self.mode)
+            self._test_def_window.test_loaded.connect(self.__on_test_def_loaded)
         self._test_def_window.show()
         self._test_def_window.raise_()
         self._test_def_window.activateWindow()
+
+    def __on_test_def_loaded(self, test_file):
+        # A test previewed successfully in the definition window -> mirror it into
+        # the Quick Select dropdown (which arms it on the controller).
+        if self.test_select.findText(test_file) < 0:
+            self.test_select.addItem(test_file)
+        self.test_select.setCurrentText(test_file)
 
     # called if you change which scope is selected in the dropdown
     def __change_scopes(self):

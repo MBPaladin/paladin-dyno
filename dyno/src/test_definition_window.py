@@ -49,6 +49,10 @@ class _ExpansionThread(QThread):
 
 
 class TestDefinitionWindow(QWidget):
+    # Emitted (with the test filename) when a test expands successfully, so the
+    # main GUI can mirror the selection into its Quick Select dropdown.
+    test_loaded = Signal(str)
+
     def __init__(self, mode, parent=None):
         super().__init__(parent)
         self.mode = mode
@@ -146,3 +150,4 @@ class TestDefinitionWindow(QWidget):
         if result['truncated']:
             msg += '  (truncated at preview limit)'
         self.status.setText(msg)
+        self.test_loaded.emit(self._current_file)
