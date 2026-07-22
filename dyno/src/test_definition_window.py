@@ -100,6 +100,9 @@ class TestDefinitionWindow(QWidget):
         self.choose_button = QPushButton('Choose Test File')
         self.choose_button.clicked.connect(self._choose_file)
         bottom.addWidget(self.choose_button)
+        self.builder_button = QPushButton('Open Test Builder')
+        self.builder_button.clicked.connect(self._open_builder)
+        bottom.addWidget(self.builder_button)
         self.status = QLabel('No test loaded.')
         bottom.addWidget(self.status, stretch=1)
         layout.addLayout(bottom)
@@ -109,7 +112,23 @@ class TestDefinitionWindow(QWidget):
             self, 'Choose Test File', dyno_paths.dyno_test_directory,
             'Test plans (*.yaml *.yml)')
         if path:
-            self.load_test(os.path.basename(path))
+            # Keep tests in subfolders (e.g. ui_generated_tests/) loadable:
+            # TestManager joins this onto the tests directory.
+            rel = os.path.relpath(path, dyno_paths.dyno_test_directory)
+            self.load_test(rel.replace(os.sep, '/'))
+
+    def _open_builder(self):
+        # Lazy import mirrors how the main GUI opens this window. Keep a
+        # reference so the window isn't garbage-collected.
+        from dyno.src.test_builder_window import TestBuilderWindow
+        if getattr(self, '_builder_window', None) is None:
+            self._builder_window = TestBuilderWindow(self.mode)
+            # A saved test loads straight into this preview (which in turn
+            # mirrors it to the main GUI's Quick Select via test_loaded).
+            self._builder_window.test_saved.connect(self.load_test)
+        self._builder_window.show()
+        self._builder_window.raise_()
+        self._builder_window.activateWindow()
 
     def load_test(self, test_file):
         if self._thread is not None and self._thread.isRunning():

@@ -123,7 +123,7 @@ class Logger:
         self.dsets['behavior_indices'] = self.file.create_dataset('behavior_indices', shape=(10, 2), maxshape=(None, 2), dtype=np.int32, chunks=True)
         self.keys_written = 0
         for key in self.log_keys:
-            self.dsets[key] = self.file.create_dataset(key,shape=(0,), chunks=(self.chunk_length,), maxshape=(None,))
+            self.dsets[key] = self.file.create_dataset(key,shape=(0,), chunks=(self.chunk_length,), maxshape=(None,), dtype='f4')
 
 
     def save_cache(self, data):
