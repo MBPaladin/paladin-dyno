@@ -1,19 +1,26 @@
 """
-Test Builder window (third window, opened from the Test Definition window).
+Test Builder window (opened from the main GUI).
 
-Compose an experiment as a sequence of segments (sawtooth / step /
-ramp_release / dwell patterns with a secondary-motor level sweep), see the
-commanded curves live as parameters change, and save to
-tests/ui_generated_tests/<name>.yaml with the recipe embedded so the test
-can be reopened and edited. Saving re-validates through the real
-TestManager path (via test_preview.expand_test), so anything that saves
-green here will load on the rig.
+Two roles in one window:
+
+* Build: compose an experiment as a sequence of segments (sawtooth / step /
+  ramp_release / dwell patterns with a secondary-motor level sweep), see the
+  commanded curves live as parameters change, and save to
+  tests/ui_generated_tests/<name>.yaml with the recipe embedded so the test
+  can be reopened and edited. Saving re-validates through the real
+  TestManager path (via test_preview.expand_test), so anything that saves
+  green here will load on the rig.
+
+* View: open any test yaml. Files with an embedded recipe come back editable;
+  everything else (hand-written yamls, grid searches, loops/imports) is shown
+  read-only as its authoritative per-cycle expansion, with the editing
+  controls greyed out.
 """
 import os
 
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox,
                                QFileDialog, QFormLayout, QGroupBox,
                                QHBoxLayout, QLabel, QLineEdit, QListWidget,
@@ -21,6 +28,27 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox,
 
 from deployment import dyno_paths
 from dyno.src import test_builder, test_preview
+
+# Command curves are piecewise-linear, so striding an expansion to this many
+# points is visually lossless while keeping pyqtgraph responsive.
+_MAX_DISPLAY_POINTS = 20000
+
+
+class _ExpansionThread(QThread):
+    """Runs the (CPU-bound) test expansion off the UI thread."""
+    done = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, test_file, mode):
+        super().__init__()
+        self.test_file = test_file
+        self.mode = mode
+
+    def run(self):
+        try:
+            self.done.emit(test_preview.expand_test(self.test_file, self.mode))
+        except Exception as e:  # surface validation/load errors in the UI
+            self.failed.emit(f"{type(e).__name__}: {e}")
 
 _PLOTS = (('Torque', 'Nm', 'torque'),
           ('Velocity', 'rad/s', 'velocity'),
@@ -37,6 +65,9 @@ def _parse_levels(text):
 class TestBuilderWindow(QWidget):
     # Emitted with the saved test path (relative to the tests directory).
     test_saved = Signal(str)
+    # Emitted when a test loads/saves successfully, so the main GUI can mirror
+    # it into its Quick Select dropdown (which arms it on the controller).
+    test_loaded = Signal(str)
 
     def __init__(self, mode, parent=None):
         super().__init__(parent)
@@ -50,6 +81,8 @@ class TestBuilderWindow(QWidget):
         self.segments = [test_builder.default_segment()]
         self._param_widgets = {}
         self._loading = False  # guard: suppress form->model writes during load
+        self._view_only = False
+        self._expansion_thread = None
         self._build_ui()
         self._select_segment(0)
 
@@ -66,8 +99,11 @@ class TestBuilderWindow(QWidget):
         name_row.addWidget(QLabel('Test name:'))
         self.name_edit = QLineEdit('my_test')
         name_row.addWidget(self.name_edit, stretch=1)
-        self.open_button = QPushButton('Open…')
-        self.open_button.clicked.connect(self._open_existing)
+        self.new_button = QPushButton('New Test')
+        self.new_button.clicked.connect(self._new_test)
+        name_row.addWidget(self.new_button)
+        self.open_button = QPushButton('Open Test…')
+        self.open_button.clicked.connect(self._open_test)
         name_row.addWidget(self.open_button)
         self.save_button = QPushButton('Save Test')
         self.save_button.clicked.connect(self._save)
@@ -84,6 +120,7 @@ class TestBuilderWindow(QWidget):
         self.seg_list.currentRowChanged.connect(self._on_row_changed)
         left.addWidget(self.seg_list, stretch=1)
         seg_buttons = QHBoxLayout()
+        seg_buttons.setContentsMargins(0, 0, 0, 0)
         for label, slot in (('Add', self._add_segment),
                             ('Dup', self._dup_segment),
                             ('Del', self._del_segment),
@@ -92,7 +129,9 @@ class TestBuilderWindow(QWidget):
             btn = QPushButton(label)
             btn.clicked.connect(slot)
             seg_buttons.addWidget(btn)
-        left.addLayout(seg_buttons)
+        self.seg_buttons_wrap = QWidget()
+        self.seg_buttons_wrap.setLayout(seg_buttons)
+        left.addWidget(self.seg_buttons_wrap)
         left_wrap = QWidget()
         left_wrap.setLayout(left)
         left_wrap.setFixedWidth(210)
@@ -101,7 +140,7 @@ class TestBuilderWindow(QWidget):
         # Middle: segment editor --------------------------------------------
         editor = QVBoxLayout()
 
-        roles = QGroupBox('Motors')
+        roles = self.roles_box = QGroupBox('Motors')
         roles_form = QFormLayout(roles)
         self.primary_motor = QComboBox()
         self.primary_motor.addItems(test_builder.MOTORS)
@@ -123,7 +162,7 @@ class TestBuilderWindow(QWidget):
         roles_form.addRow('Settle at level [s]', self.sec_settle)
         editor.addWidget(roles)
 
-        pattern_box = QGroupBox('Pattern')
+        pattern_box = self.pattern_box = QGroupBox('Pattern')
         self.pattern_layout = QFormLayout(pattern_box)
         self.pattern_combo = QComboBox()
         self.pattern_combo.addItems(list(test_builder.PATTERNS))
@@ -392,20 +431,24 @@ class TestBuilderWindow(QWidget):
                                 f'{type(e).__name__}: {e}')
             return
         dur = result['t'][-1] if result['n_cycles'] else 0.0
+        # Show the verified expansion (the exact command stream the rig will
+        # run) in place of the idealized keyframe preview; the next edit
+        # reverts the plot to the live keyframes.
+        self._plot_expansion(result)
         self.status.setText(f'Saved {rel_path}  ({dur:.1f}s, '
                             f'{result["n_cycles"]:,} cycles) — verified.')
         self.name_edit.setText(test_builder.sanitize_name(recipe['name']))
         self.test_saved.emit(rel_path)
+        self.test_loaded.emit(rel_path)
 
-    def _open_existing(self):
-        start_dir = os.path.join(dyno_paths.dyno_test_directory,
-                                 test_builder.GENERATED_TEST_DIR)
-        if not os.path.isdir(start_dir):
-            start_dir = dyno_paths.dyno_test_directory
+    def _open_test(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, 'Open Generated Test', start_dir, 'Test plans (*.yaml *.yml)')
+            self, 'Open Test', dyno_paths.dyno_test_directory,
+            'Test plans (*.yaml *.yml)')
         if not path:
             return
+        rel = os.path.relpath(path, dyno_paths.dyno_test_directory)
+        rel = rel.replace(os.sep, '/')
         try:
             recipe, stale = test_builder.load_recipe(
                 path, dyno_paths.dyno_test_directory)
@@ -413,11 +456,79 @@ class TestBuilderWindow(QWidget):
             self.status.setText(f'Open FAILED — {type(e).__name__}: {e}')
             return
         if recipe is None:
-            self.status.setText(stale[0])
+            # No embedded recipe (hand-written yaml / grid search / loops):
+            # show its authoritative expansion, read-only.
+            self._load_expansion(rel)
             return
+        self._set_view_only(False)
         self.segments = recipe['segments'] or [test_builder.default_segment()]
         self.name_edit.setText(recipe.get('name', 'untitled'))
         self._refresh_list(0)
         self._select_segment(0)
         if stale:
             self.status.setText('Opened with warnings: ' + '; '.join(stale))
+
+    def _new_test(self):
+        self._set_view_only(False)
+        self.segments = [test_builder.default_segment()]
+        self.name_edit.setText('my_test')
+        self._refresh_list(0)
+        self._select_segment(0)
+        self.status.setText('')
+
+    # --- read-only expansion view ------------------------------------------
+
+    def _set_view_only(self, view_only, label=None):
+        self._view_only = view_only
+        for widget in (self.name_edit, self.save_button, self.seg_list,
+                       self.seg_buttons_wrap, self.roles_box, self.pattern_box):
+            widget.setEnabled(not view_only)
+        self.validation_label.setStyleSheet(
+            'color: gray;' if view_only else 'color: #d62728;')
+        self.validation_label.setText(
+            f'Viewing {label} (read-only). Use New Test to start editing.'
+            if view_only else '')
+
+    def _load_expansion(self, rel_path):
+        if self._expansion_thread is not None and self._expansion_thread.isRunning():
+            return  # ignore re-entrant loads while one is in flight
+        self._set_view_only(True, label=rel_path)
+        self._clear_curves()
+        self.status.setText(f'Expanding {rel_path}…')
+        self.open_button.setEnabled(False)
+        self._expansion_thread = _ExpansionThread(rel_path, self.mode)
+        self._expansion_thread.done.connect(
+            lambda result: self._on_expansion_done(rel_path, result))
+        self._expansion_thread.failed.connect(
+            lambda msg: self.status.setText(f'{rel_path}:  FAILED — {msg}'))
+        self._expansion_thread.finished.connect(
+            lambda: self.open_button.setEnabled(True))
+        self._expansion_thread.start()
+
+    def _clear_curves(self):
+        for by_motor in self.curves.values():
+            for curve in by_motor.values():
+                curve.setData([], [])
+
+    def _plot_expansion(self, result):
+        n = result['n_cycles']
+        if n == 0:
+            self._clear_curves()
+            return
+        step = max(1, n // _MAX_DISPLAY_POINTS)
+        t_ds = result['t'][::step]
+        for mode, by_motor in self.curves.items():
+            for motor, curve in by_motor.items():
+                curve.setData(t_ds, result[f'{motor}_{mode}'][::step])
+
+    def _on_expansion_done(self, rel_path, result):
+        self._plot_expansion(result)
+        if result['n_cycles'] == 0:
+            self.status.setText(f'{rel_path}:  no commands produced')
+            return
+        msg = (f"{rel_path}:  {result['t'][-1]:.1f}s test, "
+               f"{result['n_cycles']:,} cycles")
+        if result['truncated']:
+            msg += '  (truncated at preview limit)'
+        self.status.setText(msg)
+        self.test_loaded.emit(rel_path)

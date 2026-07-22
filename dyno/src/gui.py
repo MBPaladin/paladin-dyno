@@ -233,7 +233,7 @@ class Window(QWidget):
         test_select_title.setStyleSheet('font-size: 16px;')
         self.controls_layout.addWidget(test_select_title)
 
-        self.open_test_def_button = QPushButton('Open Test Definition UI')
+        self.open_test_def_button = QPushButton('Open Test Builder')
         self.open_test_def_button.clicked.connect(self.__open_test_definition)
         self.controls_layout.addWidget(self.open_test_def_button)
 
@@ -274,9 +274,9 @@ class Window(QWidget):
     def __open_test_definition(self):
         # Lazy import: keeps GUI start-up light and avoids a hard dependency
         # when running headless. Keep a reference so the window isn't GC'd.
-        from dyno.src.test_definition_window import TestDefinitionWindow
+        from dyno.src.test_builder_window import TestBuilderWindow
         if getattr(self, '_test_def_window', None) is None:
-            self._test_def_window = TestDefinitionWindow(self.mode)
+            self._test_def_window = TestBuilderWindow(self.mode)
             self._test_def_window.test_loaded.connect(self.__on_test_def_loaded)
         self._test_def_window.show()
         self._test_def_window.raise_()
