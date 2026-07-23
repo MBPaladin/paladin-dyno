@@ -410,13 +410,19 @@ class Window(QWidget):
                 self.__save_experiment_notes(log_dir, test_name, notes)
 
         dialog.finished.connect(on_finished)
-        dialog.open()
-        # Center over the main window; some window managers ignore the
-        # parent hint and throw the dialog onto another screen.
+        # Center over the main window; some window managers (WSLg
+        # especially) ignore the parent hint and place the dialog
+        # elsewhere. Set the geometry before showing, then re-assert it
+        # after mapping since WSLg re-places windows post-show.
+        def center():
+            geo = dialog.frameGeometry()
+            geo.moveCenter(self.frameGeometry().center())
+            dialog.move(geo.topLeft())
         dialog.adjustSize()
-        geo = dialog.frameGeometry()
-        geo.moveCenter(self.frameGeometry().center())
-        dialog.move(geo.topLeft())
+        center()
+        dialog.open()
+        pg.Qt.QtCore.QTimer.singleShot(0, center)
+        pg.Qt.QtCore.QTimer.singleShot(100, center)
 
     def __save_experiment_notes(self, log_dir, test_name, notes):
         folder = f"{dyno_paths.dyno_logs_directory}/{log_dir}"
