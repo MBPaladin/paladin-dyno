@@ -230,6 +230,9 @@ class Master:
         os.makedirs(dyno_paths.dyno_logs_directory, exist_ok=True)
         with open(f'{dyno_paths.dyno_logs_directory}/resolved_config.json', 'w') as f:
             json.dump(resolved, f, indent=2, default=str)
+        from dyno.src.config_utils import chown_to_invoking_user
+        chown_to_invoking_user(dyno_paths.dyno_logs_directory,
+                               f'{dyno_paths.dyno_logs_directory}/resolved_config.json')
 
         # --- 4. Transition to OP ---
         self._master.config_map()

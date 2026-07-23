@@ -36,7 +36,7 @@ if '--sim' in sys.argv:
 from dyno.src import logger
 from dyno.src.logger import Logger
 from dyno.src.dyno_controller import Controller
-from dyno.src.config_utils import augment_log_keys
+from dyno.src.config_utils import augment_log_keys, chown_to_invoking_user
 
 from deployment import dyno_paths
 
@@ -415,6 +415,7 @@ class Window(QWidget):
             os.makedirs(folder, exist_ok=True)
             with open(f'{folder}/{base}.txt', 'w') as f:
                 f.write(notes + '\n')
+            chown_to_invoking_user(folder, f'{folder}/{base}.txt')
             print(f'Experiment notes saved to {log_dir}/{base}.txt')
         except OSError as e:
             print(f'Failed to save experiment notes: {e}')

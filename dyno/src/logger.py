@@ -10,7 +10,7 @@ import numpy as np
 import time
 import yaml
 from deployment import dyno_paths
-from dyno.src.config_utils import augment_log_keys
+from dyno.src.config_utils import augment_log_keys, chown_to_invoking_user
 
 
 def log_dir_name(sim=None):
@@ -139,6 +139,7 @@ class Logger:
         if os.path.exists(folder_dir):  # same-second rerun: replace the old run
             shutil.rmtree(folder_dir)
         os.makedirs(folder_dir)
+        chown_to_invoking_user(dyno_paths.dyno_logs_directory, folder_dir)
 
         # File: named after the test yaml that ran, so the log type is
         # readable at a glance.
@@ -146,6 +147,7 @@ class Logger:
         base = os.path.splitext(os.path.basename(test_name))[0] or 'log'
         f_name = f"{folder_dir}/{base}.hdf5"
         self.file = h5py.File(f_name,'w')
+        chown_to_invoking_user(f_name)
 
         # Attach the resolved device configuration (written by the master at
         # bring-up) so every log records exactly what parameters ran.
