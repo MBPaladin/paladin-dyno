@@ -14,11 +14,18 @@ from dyno.src.config_utils import augment_log_keys
 
 
 def log_dir_name(sim=None):
-    """Log folder naming convention: (sim_)yyyy_mm_dd_hh_mm_ss. Shared by the
-    Logger (folder creation) and the GUI (experiment-notes path)."""
+    """Log folder naming convention: (sim_)yyyy_mm_dd_hh_mm_ss, stamped in
+    Pacific time regardless of the machine's timezone. Shared by the Logger
+    (folder creation) and the GUI (experiment-notes path)."""
     if sim is None:
         sim = bool(os.environ.get('DYNO_SIM'))
-    return ('sim_' if sim else '') + time.strftime('%Y_%m_%d_%H_%M_%S')
+    try:
+        from zoneinfo import ZoneInfo
+        from datetime import datetime
+        stamp = datetime.now(ZoneInfo('America/Los_Angeles')).strftime('%Y_%m_%d_%H_%M_%S')
+    except Exception:  # tz database unavailable: fall back to machine-local
+        stamp = time.strftime('%Y_%m_%d_%H_%M_%S')
+    return ('sim_' if sim else '') + stamp
 
 
 class Logger:

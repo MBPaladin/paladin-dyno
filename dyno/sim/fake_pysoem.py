@@ -224,6 +224,13 @@ class AKDBehavior(Behavior):
         self._pending_mode = None
         self._pending_countdown = 0
         self.tau_motor = 0.0
+        # Position-command unwrap state (raw i32 counts). devices.AKD scales
+        # position at 2^32 counts/rev into an int32 PDO field, so the raw
+        # command wraps every half motor revolution; a real drive follows the
+        # wrapped stream incrementally, so we must too (decoding it absolutely
+        # snaps the target by a full revolution at +/-pi and rails the PD).
+        self._pos_cmd_prev_raw = None
+        self._pos_cmd_counts = 0.0
 
     # -- SDO ---------------------------------------------------------------
     def sdo_read(self, index, subindex, size=None, ca=False):
@@ -304,12 +311,26 @@ class AKDBehavior(Behavior):
                 kv = min(self.tau_limit / 0.5, j_motor * 200.0)
                 tau = kv * (v_cmd - omega_m)
             elif self.op_mode == 7:  # position mode: critically damped PD
-                theta_cmd = rx.position_command * 2 * math.pi / 2**32
+                raw = rx.position_command
+                if self._pos_cmd_prev_raw is None:
+                    # Seed the multi-turn command at the unwrapped value
+                    # nearest the current motor position (devices.AKD snaps
+                    # its command to actual_position on mode entry).
+                    theta_counts = theta_m / (2 * math.pi) * 2**32
+                    self._pos_cmd_counts = theta_counts + wrap_i32(
+                        raw - wrap_i32(theta_counts))
+                else:
+                    self._pos_cmd_counts += wrap_i32(raw - self._pos_cmd_prev_raw)
+                self._pos_cmd_prev_raw = raw
+                theta_cmd = self._pos_cmd_counts * 2 * math.pi / 2**32
                 wn = 50.0
                 kp = j_motor * wn * wn
                 kd = 2.0 * j_motor * wn
                 tau = kp * (theta_cmd - theta_m) - kd * omega_m
             tau = max(-self.tau_limit, min(self.tau_limit, tau))
+
+        if self.op_mode != 7 or self.state != 'operation_enabled':
+            self._pos_cmd_prev_raw = None  # re-seed on next position-mode entry
 
         self.tau_motor = tau
         if self.plant is not None:

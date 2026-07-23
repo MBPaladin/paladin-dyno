@@ -6,6 +6,7 @@ from PySide6.QtCore import *
 from PySide6.QtWidgets import *
 import sys
 import os
+import shutil
 import signal
 import multiprocessing
 import yaml
@@ -279,7 +280,8 @@ class Window(QWidget):
         """Shown when a test stops gracefully (stop button, completion, or a
         safety stop). Non-empty notes are saved as <test>.txt next to the log
         hdf5; empty/cancelled leaves no file. An app abort never gets here, so
-        no file is written in that case either."""
+        no file is written in that case either. Typing just 'delete' (case
+        insensitive) deletes the run's entire log folder instead."""
         log_dir = self._active_log_dir
         if log_dir is None:
             return
@@ -288,7 +290,8 @@ class Window(QWidget):
         layout = QVBoxLayout(dialog)
         layout.addWidget(QLabel(f'Test finished: {self._active_log_test}\n'
                                 f'Log folder: {log_dir}\n\n'
-                                'Anything worth remembering about this run?'))
+                                'Anything worth remembering about this run?\n'
+                                "(type just 'delete' to discard this run's log)"))
         text_edit = QTextEdit()
         layout.addWidget(text_edit)
         buttons = QHBoxLayout()
@@ -305,6 +308,16 @@ class Window(QWidget):
         if not notes:
             return
         folder = f"{dyno_paths.dyno_logs_directory}/{log_dir}"
+        if notes.lower() == 'delete':
+            try:
+                if os.path.isdir(folder):
+                    shutil.rmtree(folder)
+                    print(f'Deleted log folder {log_dir} (per experiment notes)')
+                else:
+                    print(f'Log folder {log_dir} not found, nothing to delete')
+            except OSError as e:
+                print(f'Failed to delete log folder {log_dir}: {e}')
+            return
         base = os.path.splitext(os.path.basename(self._active_log_test or 'log'))[0] or 'log'
         try:
             os.makedirs(folder, exist_ok=True)
