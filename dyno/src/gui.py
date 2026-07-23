@@ -373,14 +373,19 @@ class Window(QWidget):
         safety stop). Non-empty notes are saved as <test>.txt next to the log
         hdf5; empty/cancelled leaves no file. An app abort never gets here, so
         no file is written in that case either. Typing just 'delete' (case
-        insensitive) deletes the run's entire log folder instead."""
+        insensitive) deletes the run's entire log folder instead.
+
+        Shown non-modally via open() rather than exec(): exec() would suspend
+        update_data() (this is called from the 30 ms timer), freezing the
+        plots and telemetry drain until the dialog closes."""
         log_dir = self._active_log_dir
         if log_dir is None:
             return
+        test_name = self._active_log_test
         dialog = QDialog(self)
         dialog.setWindowTitle('Experiment Notes')
         layout = QVBoxLayout(dialog)
-        layout.addWidget(QLabel(f'Test finished: {self._active_log_test}\n'
+        layout.addWidget(QLabel(f'Test finished: {test_name}\n'
                                 f'Log folder: {log_dir}\n\n'
                                 'Anything worth remembering about this run?\n'
                                 "(type just 'delete' to discard this run's log)"))
@@ -395,10 +400,25 @@ class Window(QWidget):
         buttons.addWidget(skip_btn)
         layout.addLayout(buttons)
         text_edit.setFocus()
+        # Keep a reference so the dialog isn't GC'd while open.
+        self._notes_dialog = dialog
 
-        notes = text_edit.toPlainText().strip() if dialog.exec() else ''
-        if not notes:
-            return
+        def on_finished(result):
+            self._notes_dialog = None
+            notes = text_edit.toPlainText().strip() if result else ''
+            if notes:
+                self.__save_experiment_notes(log_dir, test_name, notes)
+
+        dialog.finished.connect(on_finished)
+        dialog.open()
+        # Center over the main window; some window managers ignore the
+        # parent hint and throw the dialog onto another screen.
+        dialog.adjustSize()
+        geo = dialog.frameGeometry()
+        geo.moveCenter(self.frameGeometry().center())
+        dialog.move(geo.topLeft())
+
+    def __save_experiment_notes(self, log_dir, test_name, notes):
         folder = f"{dyno_paths.dyno_logs_directory}/{log_dir}"
         if notes.lower() == 'delete':
             try:
@@ -410,7 +430,7 @@ class Window(QWidget):
             except OSError as e:
                 print(f'Failed to delete log folder {log_dir}: {e}')
             return
-        base = os.path.splitext(os.path.basename(self._active_log_test or 'log'))[0] or 'log'
+        base = os.path.splitext(os.path.basename(test_name or 'log'))[0] or 'log'
         try:
             os.makedirs(folder, exist_ok=True)
             with open(f'{folder}/{base}.txt', 'w') as f:
