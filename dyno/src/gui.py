@@ -342,9 +342,15 @@ class Window(QWidget):
                     break
         except OSError:
             pass
-        code = shutil.which('code')
-        if code:
-            subprocess.Popen([code, '-g', f'{self._config_path}:{line}'])
+        # Under sudo (real-time scheduling), PATH is reset to secure_path and
+        # loses the user's `code` shim — resolve and launch it as the invoking
+        # user via their login shell instead.
+        sudo_user = os.environ.get('SUDO_USER')
+        if shutil.which('code'):
+            subprocess.Popen(['code', '-g', f'{self._config_path}:{line}'])
+        elif sudo_user:
+            subprocess.Popen(['sudo', '-u', sudo_user, '-i',
+                              'code', '-g', f'{self._config_path}:{line}'])
         else:
             QDesktopServices.openUrl(QUrl.fromLocalFile(self._config_path))
 
