@@ -117,6 +117,26 @@ class TestTrace:
             if self.settings[motor_key]['control_mode'] == 'position':
                 assert max(abs(rates[motor_key]))  <= self.limits['velocity'], 'Trace velocity of '+str(max(abs(rates[motor_key])))+' exceeds system limits'
 
+                # Corner check: a slope change between adjacent keyframes is a
+                # velocity step the position loop absorbs in ~one cycle -- an
+                # acceleration impulse that spikes torque (inertia * dv/dt).
+                # Flag corners bigger than the accel limit could produce in
+                # CORNER_DT. This is a warning, not an assert, because several
+                # long-standing traces (e.g. the cogging trapezoids discretized
+                # at 0.1 s) technically exceed it; the test builder emits
+                # accel-blended traces that pass cleanly.
+                corner_dt = 0.05  # [s] matches test_builder.CORNER_DT
+                slopes = np.asarray(rates[motor_key], dtype=float)
+                corner_steps = np.abs(np.diff(slopes))
+                step_limit = self.limits['acceleration'] * corner_dt
+                if corner_steps.size and corner_steps.max() > step_limit:
+                    worst = int(np.argmax(corner_steps))
+                    print(f"WARNING: {motor_key} position trace has a corner velocity step of "
+                          f"{corner_steps.max():.3f} rad/s at t={self.trace['time'].iloc[worst+1]:.2f}s "
+                          f"(> {step_limit:.3f} = acceleration limit x {corner_dt}s). "
+                          "Sharp corners cause torque spikes; use accel-limited blends "
+                          "(the test builder applies these automatically).")
+
 
             # if self.settings[motor_key]['control_mode'] == 'position':
             #     d_dt = self.trace['time'][1:] - self.trace['time'][:len(self.trace['time'])-2] # time delta between points

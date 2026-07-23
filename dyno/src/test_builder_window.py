@@ -148,6 +148,13 @@ class TestBuilderWindow(QWidget):
         self.primary_mode = QComboBox()
         self.primary_mode.addItems(test_builder.MODES)
         roles_form.addRow('Pattern control mode', self.primary_mode)
+        self.primary_accel = self._spin(0.001, 1e6,
+                                        test_builder.DEFAULT_POSITION_ACCEL)
+        self.primary_accel.setToolTip('Acceleration used to blend the corners '
+                                      'of position traces (both motors). '
+                                      'Ignored unless a motor is in position '
+                                      'mode.')
+        roles_form.addRow('Position blend accel [units/s²]', self.primary_accel)
         self.secondary_mode = QComboBox()
         self.secondary_mode.addItems(test_builder.MODES)
         roles_form.addRow('Other motor control mode', self.secondary_mode)
@@ -212,6 +219,7 @@ class TestBuilderWindow(QWidget):
         for widget in (self.primary_motor, self.primary_mode, self.secondary_mode):
             widget.currentTextChanged.connect(self._commit_form)
         self.levels_edit.editingFinished.connect(self._commit_form)
+        self.primary_accel.valueChanged.connect(self._commit_form)
         self.sec_rate.valueChanged.connect(self._commit_form)
         self.sec_settle.valueChanged.connect(self._commit_form)
         self.repeats_spin.valueChanged.connect(self._commit_form)
@@ -287,6 +295,8 @@ class TestBuilderWindow(QWidget):
         self._loading = True
         self.primary_motor.setCurrentText(seg['primary']['motor'])
         self.primary_mode.setCurrentText(seg['primary']['control_mode'])
+        self.primary_accel.setValue(
+            seg['primary'].get('accel', test_builder.DEFAULT_POSITION_ACCEL))
         self.secondary_mode.setCurrentText(seg['secondary']['control_mode'])
         self.levels_edit.setText(', '.join(f'{v:g}' for v in seg['secondary']['levels']))
         self.sec_rate.setValue(seg['secondary'].get('rate', 1.0))
@@ -340,7 +350,8 @@ class TestBuilderWindow(QWidget):
         if seg is None or self._loading:
             return
         seg['primary'] = {'motor': self.primary_motor.currentText(),
-                          'control_mode': self.primary_mode.currentText()}
+                          'control_mode': self.primary_mode.currentText(),
+                          'accel': self.primary_accel.value()}
         try:
             levels = _parse_levels(self.levels_edit.text())
         except ValueError:

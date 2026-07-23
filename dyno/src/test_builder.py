@@ -32,6 +32,18 @@ import yaml
 MOTORS = ('input', 'output')
 MODES = ('torque', 'velocity', 'position')
 
+# --- position command shaping ----------------------------------------------
+# A piecewise-linear position trace has a velocity discontinuity at every
+# keyframe corner; the drive's position loop chases it with an inertial torque
+# spike (tau ~ J * dv/dt with dt of one control cycle). Position channels are
+# therefore smoothed with accel-limited parabolic blends, and validation
+# rejects any remaining corner whose velocity step exceeds what the rig's
+# acceleration limit could produce within CORNER_DT.
+DEFAULT_POSITION_ACCEL = 5.0    # [units/s^2] default blend acceleration
+POSITION_BLEND_SAMPLES = 10     # subdivisions per parabolic corner blend
+CORNER_DT = 0.05                # [s] window used to judge corner velocity steps
+END_HOLD_S = 0.5                # [s] trailing hold so the final corner can blend
+
 GENERATED_TEST_DIR = 'ui_generated_tests'   # under the tests directory
 GENERATED_TRACE_DIR = 'ui_generated'        # under tests/traces/
 
@@ -68,7 +80,8 @@ def default_segment(seg_id='SEG1'):
     return {
         'id': seg_id,
         'repeats': 1,
-        'primary': {'motor': 'input', 'control_mode': 'position'},
+        'primary': {'motor': 'input', 'control_mode': 'position',
+                    'accel': DEFAULT_POSITION_ACCEL},
         'secondary': {'control_mode': 'torque', 'levels': [0.0],
                       'rate': 1.0, 'settle_s': 1.0},
         'pattern': 'sawtooth',
@@ -171,10 +184,80 @@ def compile_segment(segment):
         t += abs(sec) / sec_rate
         rows.append((t, 0.0, 0.0))
 
+    # Accel-limited corner blending for position channels (see module
+    # constants). A trailing hold gives the final corner room to blend.
+    chan_modes = ((1, primary['control_mode']), (2, secondary['control_mode']))
+    if any(m == 'position' for _, m in chan_modes):
+        last = rows[-1]
+        rows.append((last[0] + END_HOLD_S, last[1], last[2]))
+    accel = abs(float(primary.get('accel', DEFAULT_POSITION_ACCEL))) or \
+        DEFAULT_POSITION_ACCEL
+    for idx, m in chan_modes:
+        if m == 'position':
+            rows = _smooth_position_corners(rows, idx, accel)
+
     cols = ['time',
             f"{primary['motor']}_motor_{primary['control_mode']}",
             f"{sec_motor}_motor_{secondary['control_mode']}"]
     return cols, rows
+
+
+def _smooth_position_corners(rows, idx, accel):
+    """Replace velocity-discontinuous corners of channel `idx` with parabolic
+    blends of duration |dv|/accel (position and velocity continuous at both
+    ends). Timestamps are only inserted, never shifted, so the other channel
+    stays synchronized (it is linearly interpolated at the new times). A blend
+    is clamped when the neighboring intervals are too short to host it; the
+    residual corner step is then caught by validate_segment."""
+    times = [r[0] for r in rows]
+    vals = [r[idx] for r in rows]
+    other_idx = 2 if idx == 1 else 1
+    other = [r[other_idx] for r in rows]
+
+    def make_row(t, v, o):
+        return (t, v, o) if idx == 1 else (t, o, v)
+
+    def interp_other(t):
+        for k in range(len(times) - 1):
+            if times[k] <= t <= times[k + 1]:
+                dt = times[k + 1] - times[k]
+                f = 0.0 if dt <= 0 else (t - times[k]) / dt
+                return other[k] + f * (other[k + 1] - other[k])
+        return other[-1]
+
+    new_rows = [rows[0]]
+    prev_blend_end = times[0]
+    for i in range(1, len(rows) - 1):
+        dt0 = times[i] - times[i - 1]
+        dt1 = times[i + 1] - times[i]
+        if dt0 <= 0 or dt1 <= 0:
+            new_rows.append(rows[i])
+            continue
+        v0 = (vals[i] - vals[i - 1]) / dt0
+        v1 = (vals[i + 1] - vals[i]) / dt1
+        dv = v1 - v0
+        if abs(dv) < 1e-9:
+            new_rows.append(rows[i])
+            prev_blend_end = times[i]
+            continue
+        # Half the blend sits in each adjacent interval; reserve half of the
+        # following interval for the next corner's blend.
+        room = 2.0 * min(times[i] - prev_blend_end, dt1 / 2.0)
+        T = min(abs(dv) / accel, max(room, 0.0))
+        if T < 1e-6:
+            new_rows.append(rows[i])
+            prev_blend_end = times[i]
+            continue
+        for k in range(POSITION_BLEND_SAMPLES + 1):
+            tau = -T / 2.0 + T * k / POSITION_BLEND_SAMPLES
+            t = times[i] + tau
+            if t <= new_rows[-1][0] + 1e-9:
+                continue
+            v = vals[i] + v0 * tau + dv / (2.0 * T) * (tau + T / 2.0) ** 2
+            new_rows.append(make_row(t, v, interp_other(t)))
+        prev_blend_end = times[i] + T / 2.0
+    new_rows.append(rows[-1])
+    return new_rows
 
 
 # --- validation -------------------------------------------------------------
@@ -221,6 +304,29 @@ def validate_segment(segment, limits=None):
                     issues.append(f'{col}: accel {peak_rate:g} rad/s^2 exceeds limit {limits["acceleration"]:g}')
             elif mode == 'position' and peak_rate > limits['velocity']:
                 issues.append(f'{col}: implied velocity {peak_rate:g} rad/s exceeds limit {limits["velocity"]:g}')
+        if mode == 'position':
+            # Corners must be velocity-continuous (within what the accel limit
+            # can absorb in CORNER_DT); a raw corner is an accel impulse that
+            # spikes torque through the position loop.
+            signed = [(b - a) / (tb - ta) if tb > ta else 0.0
+                      for (ta, a), (tb, b) in zip(zip(times, values),
+                                                  zip(times[1:], values[1:]))]
+            if signed:
+                if abs(signed[0]) > 1e-6:
+                    issues.append(f'{col} starts moving at t=0; add settle '
+                                  'time so the trace starts at rest')
+                if abs(signed[-1]) > 1e-6:
+                    issues.append(f'{col} ends while still moving')
+            if limits:
+                step_limit = limits['acceleration'] * CORNER_DT
+                max_step = max((abs(b - a) for a, b in zip(signed, signed[1:])),
+                               default=0.0)
+                if max_step > step_limit:
+                    issues.append(
+                        f'{col}: corner velocity step {max_step:g} exceeds '
+                        f'{step_limit:g} (accel limit x {CORNER_DT:g}s) — '
+                        'blends were clamped for room; reduce the pattern '
+                        'rate or increase dwell/settle times')
     return issues
 
 
