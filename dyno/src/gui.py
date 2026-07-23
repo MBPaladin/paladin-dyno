@@ -4,10 +4,12 @@ import pyqtgraph as pg
 from PySide6.QtWidgets import QApplication
 from PySide6.QtCore import *
 from PySide6.QtWidgets import *
+from PySide6.QtGui import QDesktopServices
 import sys
 import os
 import shutil
 import signal
+import subprocess
 import multiprocessing
 import yaml
 
@@ -266,9 +268,96 @@ class Window(QWidget):
         self.controls_layout.addWidget(self.stop_button)
         self.stop_button.clicked.connect(self.__stop_test)
 
+        self.__build_safeties_panel()
+
         self.controls_layout.addStretch(1)
         self.main_layout.addWidget(self.plot_widget, stretch=5)
         self.main_layout.addWidget(self.controls_widget, stretch=1)
+
+    def __build_safeties_panel(self):
+        """Collapsible read-only view of the config's `safeties:` section, one
+        row per check: name, live value vs limit (colored by margin), and an
+        'edit' link that opens the rig config in VS Code at that entry's line.
+        The panel is display-only on purpose — limits are changed by editing
+        the config file itself, so the YAML stays the single source of truth."""
+        self._config_path = f"{dyno_paths.dyno_config_directory}/{self.mode}_dyno_config.yaml"
+
+        self.safeties_toggle = QPushButton(f'▸ Safeties')
+        self.safeties_toggle.setCheckable(True)
+        self.safeties_toggle.setStyleSheet('text-align: left; font-size: 16px; border: none;')
+        self.controls_layout.addWidget(self.safeties_toggle)
+
+        panel = QWidget()
+        grid = QGridLayout(panel)
+        grid.setContentsMargins(12, 0, 0, 0)
+        panel.setVisible(False)
+        self.controls_layout.addWidget(panel)
+
+        def toggle(checked):
+            panel.setVisible(checked)
+            self.safeties_toggle.setText(('▾' if checked else '▸') + ' Safeties')
+        self.safeties_toggle.toggled.connect(toggle)
+
+        # Map each safety's telemetry source path back to its log_keys row so
+        # live values come straight from the existing gui_data buffer (the
+        # [name, path] pairs in dyno_params['log_keys'] include the
+        # augment_log_keys sensor entries).
+        path_to_row = {path: self.log_keys.index(name)
+                       for name, path in self.dyno_params.get('log_keys', [])
+                       if name in self.log_keys}
+
+        self._safety_rows = []  # (value_label, buffer_row_or_None, limit)
+        for i, (name, spec) in enumerate(self.dyno_params.get('safeties', {}).items()):
+            if not isinstance(spec, dict) or 'limit' not in spec:
+                continue
+            limit = abs(spec['limit'])
+            grid.addWidget(QLabel(name), i, 0)
+            value_label = QLabel('—')
+            value_label.setAlignment(Qt.AlignmentFlag.AlignRight)
+            grid.addWidget(value_label, i, 1)
+            edit_link = QLabel(f'<a href="{i}">edit</a>')
+            edit_link.linkActivated.connect(
+                lambda _, n=name: self.__open_config_at_safety(n))
+            grid.addWidget(edit_link, i, 2)
+            self._safety_rows.append(
+                (value_label, path_to_row.get(spec.get('source')), limit))
+
+    def __open_config_at_safety(self, safety_name):
+        """Open the rig config in VS Code at the named safety's line
+        (code -g file:line). Falls back to the OS default handler for yaml
+        files if the `code` CLI isn't on PATH."""
+        line = 1
+        try:
+            with open(self._config_path) as f:
+                lines = f.readlines()
+            in_safeties = False
+            for ln, text in enumerate(lines, start=1):
+                stripped = text.strip()
+                if stripped.startswith('safeties:'):
+                    in_safeties = True
+                elif in_safeties and text[:1] not in (' ', '\t', '#', '\n'):
+                    break  # left the safeties block
+                elif in_safeties and stripped.startswith(f'{safety_name}:'):
+                    line = ln
+                    break
+        except OSError:
+            pass
+        code = shutil.which('code')
+        if code:
+            subprocess.Popen([code, '-g', f'{self._config_path}:{line}'])
+        else:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(self._config_path))
+
+    def __update_safeties_panel(self):
+        for value_label, buffer_row, limit in self._safety_rows:
+            if buffer_row is None:
+                value_label.setText(f'— / {limit:g}')
+                continue
+            value = abs(self.gui_data[buffer_row, -1])
+            frac = value / limit if limit else 1.0
+            color = 'red' if frac >= 1.0 else ('orange' if frac >= 0.8 else 'green')
+            value_label.setText(f'{value:.2f} / {limit:g}')
+            value_label.setStyleSheet(f'color: {color};')
 
     def __start_test(self):
         self.control_command_queue.put_nowait(['start_test', 0])
@@ -429,6 +518,7 @@ class Window(QWidget):
             else:
                 self.telemetry_samples = self.telemetry_samples[new_gui_samples*self.gui_decimation:]
 
+        self.__update_safeties_panel()
         self.redraw()
 
     def redraw(self):
