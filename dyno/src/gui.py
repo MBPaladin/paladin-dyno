@@ -30,6 +30,7 @@ if '--sim' in sys.argv:
         os.environ['DYNO_SIM'] = _m
     print('#### SIMULATION MODE ####')
 
+from dyno.src import logger
 from dyno.src.logger import Logger
 from dyno.src.dyno_controller import Controller
 from dyno.src.config_utils import augment_log_keys
@@ -84,6 +85,12 @@ class Window(QWidget):
 
         # make a buffer for incoming telementry
         self.telemetry_samples = []
+
+        # log-flag transition tracking (for log folder naming + notes prompt)
+        self._log_active = False
+        self._active_log_dir = None
+        self._active_log_test = None
+        self._notes_prompt_pending = False
 
         # initialize ui
         self.__build_ui()
@@ -268,8 +275,50 @@ class Window(QWidget):
     def __stop_test(self):
         self.control_command_queue.put_nowait(['stop_test', 0])
 
+    def __prompt_experiment_notes(self):
+        """Shown when a test stops gracefully (stop button, completion, or a
+        safety stop). Non-empty notes are saved as <test>.txt next to the log
+        hdf5; empty/cancelled leaves no file. An app abort never gets here, so
+        no file is written in that case either."""
+        log_dir = self._active_log_dir
+        if log_dir is None:
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle('Experiment Notes')
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel(f'Test finished: {self._active_log_test}\n'
+                                f'Log folder: {log_dir}\n\n'
+                                'Anything worth remembering about this run?'))
+        text_edit = QTextEdit()
+        layout.addWidget(text_edit)
+        buttons = QHBoxLayout()
+        save_btn = QPushButton('Save Notes')
+        save_btn.clicked.connect(dialog.accept)
+        skip_btn = QPushButton('Skip')
+        skip_btn.clicked.connect(dialog.reject)
+        buttons.addWidget(save_btn)
+        buttons.addWidget(skip_btn)
+        layout.addLayout(buttons)
+        text_edit.setFocus()
+
+        notes = text_edit.toPlainText().strip() if dialog.exec() else ''
+        if not notes:
+            return
+        folder = f"{dyno_paths.dyno_logs_directory}/{log_dir}"
+        base = os.path.splitext(os.path.basename(self._active_log_test or 'log'))[0] or 'log'
+        try:
+            os.makedirs(folder, exist_ok=True)
+            with open(f'{folder}/{base}.txt', 'w') as f:
+                f.write(notes + '\n')
+            print(f'Experiment notes saved to {log_dir}/{base}.txt')
+        except OSError as e:
+            print(f'Failed to save experiment notes: {e}')
+
     def __load_test(self):
         self.control_command_queue.put_nowait(['test_def', (self.test_select.currentText(), self.mode)])
+        # Tell the Logger which test is armed so it can name the log file
+        # after the test yaml.
+        self.logging_queue.put_nowait({'test_name': self.test_select.currentText()})
 
     def __open_test_definition(self):
         # Lazy import: keeps GUI start-up light and avoids a hard dependency
@@ -329,11 +378,29 @@ class Window(QWidget):
         while read_queue:
             try:
                 sample = self.telemetry_queue.get_nowait()
+                # Track log-flag transitions in the stream we forward. On
+                # start, stamp the log folder name and send it AHEAD of the
+                # first logged sample so the Logger and this GUI agree on the
+                # folder (notes are written next to the hdf5). On stop, queue
+                # the experiment-notes prompt (shown after the drain loop).
+                log_flag = sample[-2].get('log', False)
+                if log_flag and not self._log_active:
+                    self._log_active = True
+                    self._active_log_dir = logger.log_dir_name()
+                    self._active_log_test = self.test_select.currentText()
+                    self.logging_queue.put_nowait({'log_dir': self._active_log_dir})
+                elif not log_flag and self._log_active:
+                    self._log_active = False
+                    self._notes_prompt_pending = True
                 self.logging_queue.put_nowait(sample) #forward sample to the logging thread
                 self.telemetry_samples.append(sample[:-2])
             except:
                 read_queue = False
                 pass
+
+        if self._notes_prompt_pending:
+            self._notes_prompt_pending = False
+            self.__prompt_experiment_notes()
 
 
         new_gui_samples = int(len(self.telemetry_samples) / self.gui_decimation) # determine how many sample in the data buffer will get replaced

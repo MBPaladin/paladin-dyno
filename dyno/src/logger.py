@@ -1,5 +1,6 @@
 import h5py
 import os
+import shutil
 import signal
 import time
 from PySide6.QtCore import QObject
@@ -10,6 +11,15 @@ import time
 import yaml
 from deployment import dyno_paths
 from dyno.src.config_utils import augment_log_keys
+
+
+def log_dir_name(sim=None):
+    """Log folder naming convention: (sim_)yyyy_mm_dd_hh_mm_ss. Shared by the
+    Logger (folder creation) and the GUI (experiment-notes path)."""
+    if sim is None:
+        sim = bool(os.environ.get('DYNO_SIM'))
+    return ('sim_' if sim else '') + time.strftime('%Y_%m_%d_%H_%M_%S')
+
 
 class Logger:
     def __init__(self, telemetry_queue, mode):
@@ -37,6 +47,10 @@ class Logger:
         self.save = False
         self.active_id = None
         self.data_counter = 0
+        # Naming metadata pushed by the GUI through the logging queue (dict
+        # sentinels among the list-typed telemetry samples): 'test_name' when a
+        # test is armed, 'log_dir' just before the first logged sample.
+        self.meta = {}
 
         print('#'*32)
         print('Logging Initialization')
@@ -58,6 +72,11 @@ class Logger:
                     sample = None
                     read_queue = False
                     pass
+
+                if isinstance(sample, dict):
+                    # metadata sentinel from the GUI, not a telemetry sample
+                    self.meta.update(sample)
+                    sample = None
 
                 if not sample == None:
                     # starts logging
@@ -105,9 +124,20 @@ class Logger:
                     self.telemetry_samples = self.telemetry_samples[chunks_to_write*self.chunk_length:]
 
     def start_logging(self):
-        folder_dir = f"{dyno_paths.dyno_logs_directory}/{str(int(time.time()))}"
-        os.mkdir(folder_dir)
-        f_name = folder_dir+'/log.hdf5'
+        # Folder: (sim_)yyyy_mm_dd_hh_mm_ss. The GUI stamps 'log_dir' just
+        # before the first logged sample so the folder it shows (and writes
+        # experiment notes into) matches ours; fall back to stamping locally.
+        folder = self.meta.get('log_dir') or log_dir_name()
+        folder_dir = f"{dyno_paths.dyno_logs_directory}/{folder}"
+        if os.path.exists(folder_dir):  # same-second rerun: replace the old run
+            shutil.rmtree(folder_dir)
+        os.makedirs(folder_dir)
+
+        # File: named after the test yaml that ran, so the log type is
+        # readable at a glance.
+        test_name = self.meta.get('test_name') or 'log'
+        base = os.path.splitext(os.path.basename(test_name))[0] or 'log'
+        f_name = f"{folder_dir}/{base}.hdf5"
         self.file = h5py.File(f_name,'w')
 
         # Attach the resolved device configuration (written by the master at
