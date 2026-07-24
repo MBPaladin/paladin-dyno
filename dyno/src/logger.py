@@ -22,7 +22,7 @@ def log_dir_name(sim=None):
     try:
         from zoneinfo import ZoneInfo
         from datetime import datetime
-        stamp = datetime.now(ZoneInfo('America/Los_Angeles')).strftime('%Y_%m_%d_%H_%M_%S')
+        stamp = datetime.now(ZoneInfo('America/Los_Angeles')).strftime('%Y-%m-%d_%H%M%S')
     except Exception:  # tz database unavailable: fall back to machine-local
         stamp = time.strftime('%Y_%m_%d_%H_%M_%S')
     return ('sim_' if sim else '') + stamp
