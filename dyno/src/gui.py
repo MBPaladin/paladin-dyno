@@ -372,8 +372,8 @@ class Window(QWidget):
         """Shown when a test stops gracefully (stop button, completion, or a
         safety stop). Non-empty notes are saved as <test>.txt next to the log
         hdf5; empty/cancelled leaves no file. An app abort never gets here, so
-        no file is written in that case either. Typing just 'delete' (case
-        insensitive) deletes the run's entire log folder instead.
+        no file is written in that case either. The 'Delete test log' button
+        deletes the run's entire log folder instead.
 
         Shown non-modally via open() rather than exec(): exec() would suspend
         update_data() (this is called from the 30 ms timer), freezing the
@@ -387,8 +387,7 @@ class Window(QWidget):
         layout = QVBoxLayout(dialog)
         layout.addWidget(QLabel(f'Test finished: {test_name}\n'
                                 f'Log folder: {log_dir}\n\n'
-                                'Anything worth remembering about this run?\n'
-                                "(type just 'delete' to discard this run's log)"))
+                                'Anything worth remembering about this run?'))
         text_edit = QTextEdit()
         layout.addWidget(text_edit)
         buttons = QHBoxLayout()
@@ -396,8 +395,33 @@ class Window(QWidget):
         save_btn.clicked.connect(dialog.accept)
         skip_btn = QPushButton('Skip')
         skip_btn.clicked.connect(dialog.reject)
+        DELETE_RESULT = 2  # distinct from QDialog Accepted (1) / Rejected (0)
+        delete_btn = QPushButton('Delete test log')
+        delete_btn.setStyleSheet('background-color: #c62828; color: white;')
+        # Two-click confirm: first click arms the button, second click (within
+        # 3 s) deletes. Reverts on timeout so a stray click can't linger armed.
+        revert_timer = pg.Qt.QtCore.QTimer(dialog)
+        revert_timer.setSingleShot(True)
+        revert_timer.setInterval(3000)
+
+        def disarm():
+            delete_btn.setText('Delete test log')
+            delete_btn.setStyleSheet('background-color: #c62828; color: white;')
+
+        def on_delete_clicked():
+            if revert_timer.isActive():
+                revert_timer.stop()
+                dialog.done(DELETE_RESULT)
+            else:
+                delete_btn.setText('Really delete? Click again')
+                delete_btn.setStyleSheet('background-color: #7f0000; color: white; font-weight: bold;')
+                revert_timer.start()
+
+        revert_timer.timeout.connect(disarm)
+        delete_btn.clicked.connect(on_delete_clicked)
         buttons.addWidget(save_btn)
         buttons.addWidget(skip_btn)
+        buttons.addWidget(delete_btn)
         layout.addLayout(buttons)
         text_edit.setFocus()
         # Keep a reference so the dialog isn't GC'd while open.
@@ -405,6 +429,9 @@ class Window(QWidget):
 
         def on_finished(result):
             self._notes_dialog = None
+            if result == DELETE_RESULT:
+                self.__delete_test_log(log_dir)
+                return
             notes = text_edit.toPlainText().strip() if result else ''
             if notes:
                 self.__save_experiment_notes(log_dir, test_name, notes)
@@ -424,18 +451,19 @@ class Window(QWidget):
         pg.Qt.QtCore.QTimer.singleShot(0, center)
         pg.Qt.QtCore.QTimer.singleShot(100, center)
 
+    def __delete_test_log(self, log_dir):
+        folder = f"{dyno_paths.dyno_logs_directory}/{log_dir}"
+        try:
+            if os.path.isdir(folder):
+                shutil.rmtree(folder)
+                print(f'Deleted log folder {log_dir}')
+            else:
+                print(f'Log folder {log_dir} not found, nothing to delete')
+        except OSError as e:
+            print(f'Failed to delete log folder {log_dir}: {e}')
+
     def __save_experiment_notes(self, log_dir, test_name, notes):
         folder = f"{dyno_paths.dyno_logs_directory}/{log_dir}"
-        if notes.lower() == 'delete':
-            try:
-                if os.path.isdir(folder):
-                    shutil.rmtree(folder)
-                    print(f'Deleted log folder {log_dir} (per experiment notes)')
-                else:
-                    print(f'Log folder {log_dir} not found, nothing to delete')
-            except OSError as e:
-                print(f'Failed to delete log folder {log_dir}: {e}')
-            return
         base = os.path.splitext(os.path.basename(test_name or 'log'))[0] or 'log'
         try:
             os.makedirs(folder, exist_ok=True)
