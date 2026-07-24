@@ -44,12 +44,13 @@ Each seg#####.npz holds, for the cycles in that segment:
   status  uint8 (n,4)   ELM3004 per-channel status byte (PAI)
   meta    json string   segment index, start/stop times, cycles, wkc errors
 
-Usage (on the dyno host, needs root for SCHED_FIFO):
-  sudo DYNO_ROOT=/path/to/paladin-dyno \
-    /usr/bin/python3 dyno/jitter_bench/soak_test.py --hours 24
+Usage (on the dyno host; use the venv python, which setup.sh grants
+cap_net_raw + cap_sys_nice so no sudo is needed):
+  DYNO_ROOT=/path/to/paladin-dyno \
+    .venv/bin/python dyno/jitter_bench/soak_test.py --hours 24
 
   # unattended: survives the SSH session dropping, Ctrl-C / SIGTERM flush cleanly
-  sudo nohup python3 dyno/jitter_bench/soak_test.py --hours 24 \
+  nohup .venv/bin/python dyno/jitter_bench/soak_test.py --hours 24 \
        > soak.out 2>&1 &
 
   # post-run analysis streams the segments (never loads 24 h into RAM):

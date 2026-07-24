@@ -11,22 +11,6 @@ ordering (it was previously copy-pasted in all three places).
 import os
 
 
-def chown_to_invoking_user(*paths):
-    """The dyno stack runs under sudo, so everything it creates is root-owned.
-    Call this right after creating a file/dir in the logs tree to hand
-    ownership back to the invoking user (replaces the post-run `chown -R` in
-    the launch scripts). No-op when not under sudo (or on Windows)."""
-    uid = os.environ.get('SUDO_UID')
-    if uid is None or not hasattr(os, 'chown'):
-        return
-    gid = int(os.environ.get('SUDO_GID', -1))
-    for path in paths:
-        try:
-            os.chown(path, int(uid), gid)
-        except OSError as e:
-            print(f'Could not chown {path} to invoking user: {e}')
-
-
 def _mark_leaves(provenance, path, value, src):
     if isinstance(value, dict):
         for k, v in value.items():

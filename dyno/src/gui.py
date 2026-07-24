@@ -36,7 +36,7 @@ if '--sim' in sys.argv:
 from dyno.src import logger
 from dyno.src.logger import Logger
 from dyno.src.dyno_controller import Controller
-from dyno.src.config_utils import augment_log_keys, chown_to_invoking_user
+from dyno.src.config_utils import augment_log_keys
 
 from deployment import dyno_paths
 
@@ -342,10 +342,7 @@ class Window(QWidget):
                     break
         except OSError:
             pass
-        # Under sudo, PATH loses the user's `code` shim (in WSL it's appended
-        # by Windows interop, so even a login shell can't recover it). The
-        # launch script resolves it pre-sudo into DYNO_CODE_CLI.
-        code = os.environ.get('DYNO_CODE_CLI') or shutil.which('code')
+        code = shutil.which('code')
         if code:
             subprocess.Popen([code, '-g', f'{self._config_path}:{line}'])
         else:
@@ -469,7 +466,6 @@ class Window(QWidget):
             os.makedirs(folder, exist_ok=True)
             with open(f'{folder}/{base}.txt', 'w') as f:
                 f.write(notes + '\n')
-            chown_to_invoking_user(folder, f'{folder}/{base}.txt')
             print(f'Experiment notes saved to {log_dir}/{base}.txt')
         except OSError as e:
             print(f'Failed to save experiment notes: {e}')
