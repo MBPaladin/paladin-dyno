@@ -460,15 +460,45 @@ class Window(QWidget):
             print(f'Failed to delete log folder {log_dir}: {e}')
 
     def __save_experiment_notes(self, log_dir, test_name, notes):
+        """Re-render the run's companion report with the operator's notes on
+        top. The Logger already wrote the setup half when the test stopped;
+        this rewrites the whole file rather than overwriting it, so the two
+        writers never clobber each other. Falls back to a notes-only file if
+        the log has no resolved config to render (e.g. a pre-existing log)."""
+        from dyno.src import setup_summary
+
         folder = f"{dyno_paths.dyno_logs_directory}/{log_dir}"
         base = os.path.splitext(os.path.basename(test_name or 'log'))[0] or 'log'
+        path = setup_summary.report_path(folder, base)
         try:
             os.makedirs(folder, exist_ok=True)
-            with open(f'{folder}/{base}.txt', 'w') as f:
-                f.write(notes + '\n')
+            resolved, meta = self.__read_log_setup(folder, base)
+            if resolved is None:
+                with open(path, 'w') as f:
+                    f.write(notes + '\n')
+            else:
+                setup_summary.write_report(path, resolved, meta, notes=notes)
             print(f'Experiment notes saved to {log_dir}/{base}.txt')
         except OSError as e:
             print(f'Failed to save experiment notes: {e}')
+
+    def __read_log_setup(self, folder, base):
+        """Read the just-closed log's resolved config so the notes rewrite can
+        regenerate the setup section. Returns (None, {}) if unavailable."""
+        import json
+        import h5py
+
+        log_path = f'{folder}/{base}.hdf5'
+        try:
+            with h5py.File(log_path, 'r') as f:
+                if 'resolved_config' not in f.attrs:
+                    return None, {}
+                resolved = json.loads(f.attrs['resolved_config'])
+                from dyno.src import setup_summary
+                return resolved, setup_summary.meta_from_log(log_path, f)
+        except (OSError, ValueError) as e:
+            print(f'Could not read setup from {log_path}: {e}')
+            return None, {}
 
     def __load_test(self):
         self.control_command_queue.put_nowait(['test_def', (self.test_select.currentText(), self.mode)])
