@@ -43,6 +43,19 @@ class Controller(Master):
         self.generated_cmd = None
         self.test_definition = None
         self._test_init_thread = None
+        # Handoff slot for a test loaded on the init thread: (generation,
+        # TestManager). Only _cmd_check (control thread) moves it into
+        # test_definition — see _cmd_check.
+        self._pending_test_definition = None
+        # Bumped every time the armed test changes. A load still running when
+        # the operator re-arms or disarms carries a stale generation and is
+        # dropped, rather than resurfacing a test that was already dismissed.
+        self._test_load_generation = 0
+        # (generation, test_file) currently loading, and (generation, message)
+        # for one that failed. Both are reported to the GUI and both go stale
+        # on their own when the generation moves past them.
+        self._loading_test = None
+        self._test_load_error = None
 
         self._aux_funcs = []
         if self.mode == 'actuator_production':
@@ -84,12 +97,40 @@ class Controller(Master):
         self._safe_default_command['input_command'] = 0
         self._safe_default_command['output_command'] = 0
 
+    def _control_state(self):
+        """Rig state for the GUI's status indicator (telemetry slot -1).
+
+        The GUI can see none of this on its own: test_definition lives in this
+        process and drive faults are not in log_keys, so the GUI could only
+        report what it ASKED for -- which is wrong for as long as a load is in
+        flight, and never learns that a load failed here. Slot -1 was
+        previously always None and both consumers slice it off (sample[:-2]),
+        so filling it in cannot shift plot or log columns.
+
+        `_loading_test` / `_test_load_error` are reported only while their
+        generation is current, so a superseded load reports nothing.
+        """
+        current = self._test_load_generation
+        return {
+            'armed': self.test_definition.name if self.test_definition else None,
+            'loading': (self._loading_test[1]
+                        if self._loading_test and self._loading_test[0] == current
+                        else None),
+            'load_error': (self._test_load_error[1]
+                           if self._test_load_error
+                           and self._test_load_error[0] == current else None),
+            'test_active': self._test_active,
+            'fault': bool(self.devices.DUT.fault or self.devices.LOAD.fault),
+        }
+
     def _send_telemetry(self):
         self.logging_state = {'log': False} # Default to not logging
         if self._test_active and 'log_flag' in self.current_cmd:
             self.logging_state = {'log': True, 'behavior_id': self.current_cmd['log_flag']}
         elif self._test_active: # If test is active but no specific log_flag
             self.logging_state = {'log': True}
+
+        self.control_state = self._control_state()
 
         self.time = time.perf_counter() - self.t_offset
 
@@ -101,6 +142,22 @@ class Controller(Master):
 
     # recieves and manages commands from the GUI
     def _cmd_check(self):
+        # Publish a background-loaded test, on this (the control) thread.
+        # TestManager.__init__ leaves the instance unusable until reset(), and
+        # the init thread can finish AFTER start_test has already reset the
+        # previous test -- assigning from that thread would hand step() a test
+        # with no command generator and kill the control loop mid-run. Holding
+        # the swap here means test_definition only ever changes between tests.
+        if self._pending_test_definition is not None and not self._test_active:
+            generation, test = self._pending_test_definition
+            self._pending_test_definition = None
+            if generation == self._test_load_generation:
+                self.test_definition = test
+                self._loading_test = None
+                print(f'Controller: {test.name} armed')
+            else:
+                print(f'Controller: dropped superseded load of {test.name}')
+
         read_queue = True
         while read_queue:
             try:
@@ -128,15 +185,47 @@ class Controller(Master):
                 elif cmd[0] == 'test_def':
                     if not self._test_active:
                         self._get_limits()
+                        self._test_load_generation += 1
+                        generation = self._test_load_generation
+                        self._loading_test = (generation, cmd[1][0])
+
                         # Define the target function for the thread
                         def load_test(file, mode, limits):
-                            self.test_definition = TestManager(file, mode, limits)
+                            # This runs off the control loop, so an exception
+                            # here would otherwise die with the thread and
+                            # leave the GUI waiting forever. Report it instead
+                            # -- these are the limit asserts checked against
+                            # the drives' real limits, which the GUI's
+                            # config-based pre-check cannot see.
+                            try:
+                                test = TestManager(file, mode, limits)
+                                test.reset()  # usable before the loop sees it
+                            except Exception as e:
+                                self._test_load_error = (generation,
+                                                         f'{type(e).__name__}: {e}')
+                                print(f'Controller: FAILED to load {file}: {e}')
+                                return
+                            self._pending_test_definition = (generation, test)
                             print("Controller: TestManager ready.")
 
                         self._test_init_thread = threading.Thread(target=load_test, args=(cmd[1][0],cmd[1][1], self.limits))
                         self._test_init_thread.start()
                     else:
                         print('Please re-select test when dyno is not active')
+
+                elif cmd[0] == 'clear_test':
+                    # Disarm. The GUI sends this whenever it stops vouching for
+                    # the armed test (a new pick, a failed load), because it
+                    # cannot clear test_definition itself — without this the
+                    # previous test stays loaded here and Start would run it.
+                    if not self._test_active:
+                        self._test_load_generation += 1  # drop any load in flight
+                        self._pending_test_definition = None
+                        if self.test_definition is not None:
+                            print(f'Controller: {self.test_definition.name} disarmed')
+                        self.test_definition = None
+                    else:
+                        print('Unable to disarm: test already active')
 
                 elif cmd[0] == 'shutdown':
                     print('Shutdown command recieved by control loop')
@@ -230,6 +319,7 @@ class Controller(Master):
                 self.devices.DUT.sw_enable = False
                 self.devices.LOAD.sw_enable = False
 
+        # Both are rebuilt in _send_telemetry, below.
         self.control_state = None
         self.logging_state = None
 

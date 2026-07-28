@@ -33,12 +33,50 @@ if '--sim' in sys.argv:
         os.environ['DYNO_SIM'] = _m
     print('#### SIMULATION MODE ####')
 
-from dyno.src import logger
+from dyno.src import logger, test_builder
 from dyno.src.logger import Logger
 from dyno.src.dyno_controller import Controller
 from dyno.src.config_utils import augment_log_keys
 
 from deployment import dyno_paths
+
+
+class StatusLight(QWidget):
+    """Stack-light-style state indicator: a colored lamp plus a caption.
+
+    Colors follow the physical tower light `dyno_controller._write_led` drives
+    on the production rig — green for executing, amber for ready, red for a
+    fault or a refused action — so the screen and the bench read the same.
+    """
+
+    COLORS = {'idle': '#6e6e6e', 'checking': '#c8a200', 'armed': '#c8a200',
+              'running': '#2e9e3e', 'error': '#c62828'}
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 2, 0, 2)
+        self.lamp = QLabel()
+        self.lamp.setFixedSize(14, 14)
+        layout.addWidget(self.lamp, alignment=Qt.AlignmentFlag.AlignTop)
+        self.caption = QLabel()
+        self.caption.setWordWrap(True)
+        layout.addWidget(self.caption, stretch=1)
+        self.state = None
+        self.set_state('idle', 'No test armed')
+
+    def set_state(self, state, text):
+        # Re-derived every GUI tick, so bail on a no-op: setStyleSheet always
+        # forces a style recompute even when nothing changed.
+        if state == self.state and text == self.caption.text():
+            return
+        self.state = state
+        color = self.COLORS.get(state, self.COLORS['idle'])
+        self.lamp.setStyleSheet(f'background-color: {color}; '
+                                'border: 1px solid #202020; border-radius: 7px;')
+        self.caption.setStyleSheet(f'color: {color};')
+        self.caption.setText(text)
+
 
 class Window(QWidget):
 
@@ -95,6 +133,22 @@ class Window(QWidget):
         self._active_log_test = None
         self._notes_prompt_pending = False
 
+        # Arming state, in the order a test moves through it:
+        #   _pending_arm    being expanded here, to catch a bad plan early
+        #   _requested_arm  queued to the controller, not yet confirmed
+        #   _armed_test     the controller reports holding it — the only one
+        #                   of the three that means "this is what Start runs"
+        # _arm_error is a sticky failure message, cleared by the next arm.
+        self._pending_arm = None
+        self._requested_arm = None
+        self._armed_test = None
+        self._armed_caption = ''
+        self._armed_stale = False
+        self._arm_error = None
+        self._controller_fault = False
+        self._arm_threads = []  # QThreads must outlive their run()
+        self._syncing_select = False
+
         # initialize ui
         self.__build_ui()
 
@@ -130,8 +184,7 @@ class Window(QWidget):
 
         if '--load_test' in sys.argv:
             idx = sys.argv.index('--load_test')
-            test_name = sys.argv[idx + 1]
-            self.test_select.setCurrentText(test_name)
+            self.arm_test(sys.argv[idx + 1])
 
     def cli(self, *cmd):
         self.cli_command.emit(cmd)
@@ -149,8 +202,9 @@ class Window(QWidget):
             self.__stop_test()
 
         elif args[0] == 'load_test' and len(args) > 1:
-            self.test_select.setCurrentText(args[1])
-            self.__load_test()
+            # Returns before the plan is verified; the status light reports the
+            # outcome, and start_test says so if it is still checking.
+            self.arm_test(args[1])
 
         elif args[0] == 'shutdown':
             self.close_processes()
@@ -159,6 +213,11 @@ class Window(QWidget):
     def close_processes(self):
         self.control_command_queue.put_nowait(['shutdown', 0])
         print('\nShutdown request sent to control thread')
+
+        # Let any in-flight test-plan check finish first: a QThread destroyed
+        # while it is still running aborts the process.
+        for thread in self._arm_threads:
+            thread.wait(5000)
 
         # joining is a good way to check that the thread terminated.
         if self.logging_process.is_alive():
@@ -247,12 +306,20 @@ class Window(QWidget):
         self.open_test_def_button.clicked.connect(self.__open_test_definition)
         self.controls_layout.addWidget(self.open_test_def_button)
 
+        self.load_test_file_button = QPushButton('Load Test File…')
+        self.load_test_file_button.clicked.connect(self.__load_test_file)
+        self.controls_layout.addWidget(self.load_test_file_button)
+
         self.test_select = QComboBox()
-        self.test_select.addItems([f for f in os.listdir(dyno_paths.dyno_test_directory) if f[-4:] == 'yaml'])
         self.test_select.setPlaceholderText('Quick Select')
-        self.test_select.setCurrentIndex(-1)  # show the placeholder, arm no test
-        self.test_select.currentIndexChanged.connect(self.__load_test)
+        self.test_select.currentIndexChanged.connect(self.__on_test_selected)
+        self.__refresh_test_list()
         self.controls_layout.addWidget(self.test_select)
+
+        # What is actually armed / running. The dropdown above only records
+        # what was picked; this is the state the controller is in.
+        self.status_light = StatusLight()
+        self.controls_layout.addWidget(self.status_light)
 
         title_label = QLabel('Test Controls', alignment=Qt.AlignmentFlag.AlignCenter)
         title_label.setStyleSheet('font-size: 16px;')
@@ -360,6 +427,10 @@ class Window(QWidget):
             value_label.setStyleSheet(f'color: {color};')
 
     def __start_test(self):
+        # Never blocked on the arming state: starting with nothing armed
+        # energizes the drives at zero command, which is a real bring-up
+        # workflow. The indicator already says continuously whether a test is
+        # armed, so there is nothing to add here.
         self.control_command_queue.put_nowait(['start_test', 0])
 
     def __stop_test(self):
@@ -500,11 +571,195 @@ class Window(QWidget):
             print(f'Could not read setup from {log_path}: {e}')
             return None, {}
 
-    def __load_test(self):
-        self.control_command_queue.put_nowait(['test_def', (self.test_select.currentText(), self.mode)])
+    # --- arming -----------------------------------------------------------
+    # Every way of choosing a test (Quick Select, Load Test File, the Test
+    # Builder, --load_test / the CLI) funnels through arm_test.
+
+    def arm_test(self, test_file):
+        """Verify `test_file` loads, then ask the controller to arm it.
+
+        Two checks, because neither alone is enough. Here: expand the plan
+        through the same TestManager + validation path the rig uses, so a bad
+        plan is caught before it is queued at all — but against the config's
+        motor limits, not the limits the drives report over SDO. There: the
+        controller re-validates against the real limits, and reports the
+        outcome back through control_state. Nothing counts as armed until that
+        report arrives (see __reconcile_controller).
+        """
+        if self._log_active:
+            self._arm_error = f'Test running — stop it before arming {test_file}'
+            self.__refresh_status()
+            return
+
+        # Disarm first. From here until the controller confirms, nothing is
+        # armed, so a Start in that window can never run the previous test.
+        self.__disarm()
+        self.__select_in_dropdown(test_file)
+        self._pending_arm = test_file
+        self.__refresh_status()
+
+        # Lazy import (see __open_test_definition) — same worker the builder
+        # runs its previews on.
+        from dyno.src.test_builder_window import ExpansionThread
+        self._arm_threads = [t for t in self._arm_threads if t.isRunning()]
+        thread = ExpansionThread(test_file, self.mode)
+        thread.done.connect(
+            lambda result, f=test_file: self.__on_arm_checked(f, result))
+        thread.failed.connect(
+            lambda msg, f=test_file: self.__on_arm_failed(f, msg))
+        self._arm_threads.append(thread)
+        thread.start()
+
+    def __on_arm_checked(self, test_file, result):
+        if test_file != self._pending_arm:
+            return  # superseded by a later selection
+        self._pending_arm = None
+        self._requested_arm = test_file
+        self.control_command_queue.put_nowait(['test_def', (test_file, self.mode)])
         # Tell the Logger which test is armed so it can name the log file
         # after the test yaml.
-        self.logging_queue.put_nowait({'test_name': self.test_select.currentText()})
+        self.logging_queue.put_nowait({'test_name': test_file})
+        duration = result['t'][-1] if result['n_cycles'] else 0.0
+        # `truncated` is a preview cap (MAX_CYCLES), not a problem with the
+        # plan — the rig runs the whole thing, so say so and arm it anyway.
+        note = ' — preview capped, full test is longer' if result['truncated'] else ''
+        # Held until the controller confirms it holds the plan.
+        self._armed_caption = (f'Armed: {test_file}\n'
+                               f'{duration:.1f} s, {result["n_cycles"]:,} cycles{note}')
+        self.__refresh_status()
+
+    def __on_arm_failed(self, test_file, msg):
+        if test_file != self._pending_arm:
+            return
+        self._pending_arm = None
+        self.__arm_failed(f'{test_file} FAILED to load — {msg}')
+
+    def __arm_failed(self, message):
+        # arm_test disarms before requesting, so normally nothing is loaded on
+        # the controller either — but report what is actually armed rather than
+        # asserting it. Clear the dropdown too, so no part of the panel implies
+        # the failed plan is ready.
+        self._syncing_select = True
+        self.test_select.setCurrentIndex(-1)
+        self._syncing_select = False
+        self._arm_error = message + ('\nNothing is armed.' if self._armed_test
+                                     is None else
+                                     f'\nStill armed: {self._armed_test}')
+        self.__refresh_status()
+
+    def __disarm(self):
+        """Clear the armed test everywhere: this window, the controller, and
+        the Logger's file naming.
+
+        The controller owns test_definition, so a GUI-only reset would leave
+        the previous plan loaded and runnable behind a light saying nothing is
+        armed — the same confusion as before, pointing the more dangerous way.
+        """
+        self._pending_arm = None
+        self._requested_arm = None
+        self._armed_test = None
+        self._armed_caption = ''
+        self._armed_stale = False
+        self._arm_error = None
+        self.control_command_queue.put_nowait(['clear_test', 0])
+        self.logging_queue.put_nowait({'test_name': None})
+
+    def __reconcile_controller(self, state):
+        """Fold the controller's reported state (telemetry slot -1) into ours.
+
+        This is what makes the indicator honest: until the controller says it
+        holds the plan, the GUI has only asked for it.
+        """
+        self._controller_fault = bool(state.get('fault'))
+        armed = state.get('armed')
+        if self._requested_arm is not None:
+            # TestManager names itself test_file.split('.')[0] — derive the same.
+            if armed == self._requested_arm.split('.')[0]:
+                self._armed_test = self._requested_arm
+                self._requested_arm = None
+            elif state.get('load_error'):
+                # The controller's own validation rejected it — limit asserts
+                # against the drives' real limits, which our pre-check cannot
+                # see.
+                failed, self._requested_arm = self._requested_arm, None
+                self.__arm_failed(f'{failed} REJECTED by the controller — '
+                                  f'{state["load_error"]}')
+        if armed is None:
+            # The controller holds nothing, whatever we believed. This only
+            # ever narrows our claim to match it, which is the safe direction.
+            self._armed_test = None
+
+    def __set_status(self, state, text):
+        self.status_light.set_state(state, text)
+
+    def __refresh_status(self):
+        """Derive the indicator from state, most urgent first. Called on every
+        GUI tick, so it must stay a pure function of the fields it reads."""
+        if self._controller_fault:
+            self.__set_status('error', 'DRIVE FAULT — clear the fault before '
+                                       'running')
+        elif self._log_active:
+            self.__set_status('running', f'Running: {self._armed_test}')
+        elif self._arm_error:
+            self.__set_status('error', self._arm_error)
+        elif self._pending_arm:
+            self.__set_status('checking', f'Checking {self._pending_arm}…')
+        elif self._requested_arm:
+            self.__set_status(
+                'checking', f'Loading {self._requested_arm} on the controller…')
+        elif self._armed_test and self._armed_stale:
+            self.__set_status(
+                'error', f'{self._armed_caption}\nEdited in the Test Builder — '
+                         'save and re-arm, or this runs the file as it was.')
+        elif self._armed_test:
+            self.__set_status('armed', self._armed_caption)
+        else:
+            self.__set_status('idle', 'No test armed')
+
+    def __refresh_test_list(self):
+        current = self.test_select.currentText()
+        self._syncing_select = True
+        self.test_select.clear()
+        self.test_select.addItems(
+            test_builder.list_test_files(dyno_paths.dyno_test_directory))
+        # findText -> -1 when the previous pick is gone, which shows the
+        # placeholder. Selection here never re-arms; arm_test owns that.
+        self.test_select.setCurrentIndex(self.test_select.findText(current))
+        self._syncing_select = False
+
+    def __select_in_dropdown(self, test_file):
+        self._syncing_select = True
+        if self.test_select.findText(test_file) < 0:
+            self.test_select.addItem(test_file)
+        self.test_select.setCurrentText(test_file)
+        self._syncing_select = False
+
+    def __on_test_selected(self, index):
+        if self._syncing_select or index < 0:
+            return
+        self.arm_test(self.test_select.itemText(index))
+
+    def __load_test_file(self):
+        """Pick a test plan off disk and arm it.
+
+        Constrained to the tests directory: TestManager resolves the plan and
+        its trace csvs relative to that root, so a file from elsewhere cannot
+        run as-is (see test_builder.rel_test_path)."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, 'Load Test File', dyno_paths.dyno_test_directory,
+            'Test plans (*.yaml *.yml)')
+        if not path:
+            return
+        rel = test_builder.rel_test_path(path, dyno_paths.dyno_test_directory)
+        if rel is None:
+            self._arm_error = (
+                f'{os.path.basename(path)} is outside '
+                f'{dyno_paths.dyno_test_directory} — copy it, and any trace '
+                'csvs it references, into the tests directory first.')
+            self.__refresh_status()
+            return
+        self.__refresh_test_list()
+        self.arm_test(rel)
 
     def __open_test_definition(self):
         # Lazy import: keeps GUI start-up light and avoids a hard dependency
@@ -512,17 +767,21 @@ class Window(QWidget):
         from dyno.src.test_builder_window import TestBuilderWindow
         if getattr(self, '_test_def_window', None) is None:
             self._test_def_window = TestBuilderWindow(self.mode)
-            self._test_def_window.test_loaded.connect(self.__on_test_def_loaded)
+            self._test_def_window.test_loaded.connect(self.arm_test)
+            self._test_def_window.test_saved.connect(
+                lambda _: self.__refresh_test_list())
+            self._test_def_window.test_dirty.connect(self.__on_test_def_dirty)
         self._test_def_window.show()
         self._test_def_window.raise_()
         self._test_def_window.activateWindow()
 
-    def __on_test_def_loaded(self, test_file):
-        # A test previewed successfully in the definition window -> mirror it into
-        # the Quick Select dropdown (which arms it on the controller).
-        if self.test_select.findText(test_file) < 0:
-            self.test_select.addItem(test_file)
-        self.test_select.setCurrentText(test_file)
+    def __on_test_def_dirty(self):
+        # The builder's recipe no longer matches the file it handed us. What is
+        # armed still runs the file on disk, so keep it armed and flag it.
+        if self._armed_test is None or self._log_active:
+            return
+        self._armed_stale = True
+        self.__refresh_status()
 
     # called if you change which scope is selected in the dropdown
     def __change_scopes(self):
@@ -560,6 +819,7 @@ class Window(QWidget):
         mode_offset = {4: 0, 3: 1, 7: 2} # lookup table to determine how to map a command for a given mode into the telemetry sample. This is done mainly so that the telemetry sample can return the control mode + command, vs. the control mode, + command + 2 more NAN commands
 
         # pull samples from telemetry queue
+        control_state = None
         read_queue = True
         while read_queue:
             try:
@@ -573,16 +833,25 @@ class Window(QWidget):
                 if log_flag and not self._log_active:
                     self._log_active = True
                     self._active_log_dir = logger.log_dir_name()
-                    self._active_log_test = self.test_select.currentText()
+                    # The armed plan, not the dropdown text — the two differ
+                    # whenever a pick failed to load.
+                    self._active_log_test = self._armed_test
                     self.logging_queue.put_nowait({'log_dir': self._active_log_dir})
                 elif not log_flag and self._log_active:
                     self._log_active = False
                     self._notes_prompt_pending = True
+                # Slot -1: the controller's own view of what it holds. Keep the
+                # newest; it is reconciled once, after the drain.
+                control_state = sample[-1]
                 self.logging_queue.put_nowait(sample) #forward sample to the logging thread
                 self.telemetry_samples.append(sample[:-2])
             except:
                 read_queue = False
                 pass
+
+        if control_state is not None:
+            self.__reconcile_controller(control_state)
+        self.__refresh_status()
 
         if self._notes_prompt_pending:
             self._notes_prompt_pending = False

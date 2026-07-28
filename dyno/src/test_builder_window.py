@@ -34,8 +34,11 @@ from dyno.src import test_builder, test_preview
 _MAX_DISPLAY_POINTS = 20000
 
 
-class _ExpansionThread(QThread):
-    """Runs the (CPU-bound) test expansion off the UI thread."""
+class ExpansionThread(QThread):
+    """Runs the (CPU-bound) test expansion off the UI thread.
+
+    Shared with the main GUI, which uses the same expansion to verify a plan
+    loads before arming it."""
     done = Signal(object)
     failed = Signal(str)
 
@@ -65,9 +68,12 @@ def _parse_levels(text):
 class TestBuilderWindow(QWidget):
     # Emitted with the saved test path (relative to the tests directory).
     test_saved = Signal(str)
-    # Emitted when a test loads/saves successfully, so the main GUI can mirror
-    # it into its Quick Select dropdown (which arms it on the controller).
+    # Emitted when a test opens/saves successfully, so the main GUI can arm it.
     test_loaded = Signal(str)
+    # Emitted when the recipe in this window diverges from the file the main
+    # GUI armed. What runs is the file on disk, so the main window must stop
+    # advertising the armed test as matching what is plotted here.
+    test_dirty = Signal()
 
     def __init__(self, mode, parent=None):
         super().__init__(parent)
@@ -83,6 +89,9 @@ class TestBuilderWindow(QWidget):
         self._loading = False  # guard: suppress form->model writes during load
         self._view_only = False
         self._expansion_thread = None
+        # Hash of the recipe as last handed to the main GUI; None means nothing
+        # of ours is armed (or what is armed has no editable recipe).
+        self._armed_hash = None
         self._build_ui()
         self._select_segment(0)
 
@@ -417,7 +426,23 @@ class TestBuilderWindow(QWidget):
         self.validation_label.setText('\n'.join(issues))
         self.status.setText(f'Total duration: {t_offset:.1f} s '
                             f'({len(self.segments)} segment(s))')
+        self._check_dirty()
         return issues
+
+    def _check_dirty(self):
+        """Announce (once) that the recipe no longer matches the armed file."""
+        if self._armed_hash is None:
+            return
+        if test_builder.recipe_hash(self._recipe()) != self._armed_hash:
+            self._armed_hash = None
+            self.test_dirty.emit()
+
+    def _announce_loaded(self, rel_path, editable):
+        """Hand a test to the main GUI to arm, and take the baseline the
+        dirty check compares against."""
+        self._armed_hash = (test_builder.recipe_hash(self._recipe())
+                            if editable else None)
+        self.test_loaded.emit(rel_path)
 
     # --- save / open -------------------------------------------------------
 
@@ -450,7 +475,7 @@ class TestBuilderWindow(QWidget):
                             f'{result["n_cycles"]:,} cycles) — verified.')
         self.name_edit.setText(test_builder.sanitize_name(recipe['name']))
         self.test_saved.emit(rel_path)
-        self.test_loaded.emit(rel_path)
+        self._announce_loaded(rel_path, editable=True)
 
     def _open_test(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -458,8 +483,13 @@ class TestBuilderWindow(QWidget):
             'Test plans (*.yaml *.yml)')
         if not path:
             return
-        rel = os.path.relpath(path, dyno_paths.dyno_test_directory)
-        rel = rel.replace(os.sep, '/')
+        rel = test_builder.rel_test_path(path, dyno_paths.dyno_test_directory)
+        if rel is None:
+            self.status.setText(
+                f'{os.path.basename(path)} is outside '
+                f'{dyno_paths.dyno_test_directory} — tests (and the trace csvs '
+                'they reference) must live under the tests directory to run.')
+            return
         try:
             recipe, stale = test_builder.load_recipe(
                 path, dyno_paths.dyno_test_directory)
@@ -472,15 +502,21 @@ class TestBuilderWindow(QWidget):
             self._load_expansion(rel)
             return
         self._set_view_only(False)
+        self._armed_hash = None  # _select_segment must not fire a stale dirty
         self.segments = recipe['segments'] or [test_builder.default_segment()]
         self.name_edit.setText(recipe.get('name', 'untitled'))
         self._refresh_list(0)
         self._select_segment(0)
-        if stale:
-            self.status.setText('Opened with warnings: ' + '; '.join(stale))
+        # The file on disk is what the rig would run, so arm it even when the
+        # recipe is stale — but say so, because the plot above is drawn from the
+        # recipe and the run would use the (differing) csvs next to it.
+        self.status.setText(f'Opened {rel}' if not stale else
+                            f'Opened {rel} with warnings: ' + '; '.join(stale))
+        self._announce_loaded(rel, editable=True)
 
     def _new_test(self):
         self._set_view_only(False)
+        self._armed_hash = None
         self.segments = [test_builder.default_segment()]
         self.name_edit.setText('my_test')
         self._refresh_list(0)
@@ -507,7 +543,7 @@ class TestBuilderWindow(QWidget):
         self._clear_curves()
         self.status.setText(f'Expanding {rel_path}…')
         self.open_button.setEnabled(False)
-        self._expansion_thread = _ExpansionThread(rel_path, self.mode)
+        self._expansion_thread = ExpansionThread(rel_path, self.mode)
         self._expansion_thread.done.connect(
             lambda result: self._on_expansion_done(rel_path, result))
         self._expansion_thread.failed.connect(
@@ -542,4 +578,4 @@ class TestBuilderWindow(QWidget):
         if result['truncated']:
             msg += '  (truncated at preview limit)'
         self.status.setText(msg)
-        self.test_loaded.emit(rel_path)
+        self._announce_loaded(rel_path, editable=False)

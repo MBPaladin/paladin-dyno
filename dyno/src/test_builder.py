@@ -388,6 +388,41 @@ def build_yaml_dict(recipe):
     }
 
 
+def rel_test_path(path, tests_dir):
+    """Return `path` in the '/'-separated, tests-dir-relative form TestManager
+    consumes, or None if it lies outside that tree.
+
+    TestManager resolves both the plan (`{tests}/{file}`) and every `trace_file`
+    a behavior references (`{tests}/traces/{file}`) relative to the tests
+    directory, so a plan stored anywhere else cannot run as-is: the yaml may
+    well open while its traces silently miss. Callers reject rather than
+    guess."""
+    tests_root = os.path.realpath(tests_dir)
+    target = os.path.realpath(path)
+    try:
+        if os.path.commonpath([tests_root, target]) != tests_root:
+            return None
+    except ValueError:  # different drives (Windows) -> never inside
+        return None
+    return os.path.relpath(target, tests_root).replace(os.sep, '/')
+
+
+def list_test_files(tests_dir):
+    """Every runnable test plan under the tests directory, as '/'-separated
+    relative paths. Recursive, so generated tests under ui_generated_tests/
+    are listed under the same name they are armed with (a flat listing showed
+    them only after the builder mirrored them in, and as a different string).
+    `traces/` is skipped — it holds the CSVs behaviors reference, not plans."""
+    found = []
+    for root, dirs, files in os.walk(tests_dir):
+        dirs[:] = [d for d in dirs if d != 'traces']
+        for name in files:
+            if name.endswith(('.yaml', '.yml')):
+                rel = os.path.relpath(os.path.join(root, name), tests_dir)
+                found.append(rel.replace(os.sep, '/'))
+    return sorted(found)
+
+
 def save_test(recipe, tests_dir):
     """Write the yaml + csv artifacts. Returns the test file path relative to
     the tests directory (the form TestManager / the GUI consume)."""
