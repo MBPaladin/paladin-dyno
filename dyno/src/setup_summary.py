@@ -63,6 +63,34 @@ NO_NOTES = '(none recorded)'
 # Drives get listed before sensors before everything else.
 _DRIVE_CLASSES = ('AKD', 'AXON')
 
+# Where the config files actually live, relative to the repo root -- used to
+# turn provenance labels into paths a reader can go open.
+_CONFIG_DIR = 'dyno/config'
+
+
+def _config_file(resolved):
+    """The rig config yaml this run was resolved from. master.py/gui.py load it
+    as <mode>_dyno_config.yaml, so the mode recorded in the log names it."""
+    mode = resolved.get('mode')
+    return f'{_CONFIG_DIR}/{mode}_dyno_config.yaml' if mode else 'dyno config'
+
+
+def _source_label(raw, config_file):
+    """Expand a provenance label into the specific file it came from.
+
+    devices.py records sources as the bare strings 'dyno config' and
+    'absorbers.yaml:<drive>' (see deep_merge callers). Neither says which file
+    on disk, which is the whole question a reader has when a value looks wrong.
+    Expanding here rather than in devices.py keeps the stored resolved_config
+    exactly as post-processing already expects it."""
+    if not raw:
+        return ''
+    if raw == 'dyno config':
+        return config_file
+    if raw.startswith('absorbers.yaml:'):
+        return f'{_CONFIG_DIR}/absorbers.yaml -> {raw.split(":", 1)[1]}'
+    return raw
+
 
 def _looks_like_channels(params):
     """True when a module's params are keyed by channel (ch1..ch8) rather than
@@ -112,6 +140,7 @@ def build_rows(resolved):
     they read as 'load_torque / ELM3004 ch1' instead of 'adc_1 / ch1.fs_v'.
     Devices with no parameters are skipped -- see build_overview."""
     drives, sensors, other = [], [], []
+    config_file = _config_file(resolved)
 
     for device_name, entry in resolved.get('devices', {}).items():
         klass = entry.get('class', '?')
@@ -125,7 +154,7 @@ def build_rows(resolved):
                 # master.py stamps the yaml key onto every sensor config as
                 # 'name' before routing it to the module.
                 label = channel_params.get('name') or f'{device_name} {channel}'
-                source = f'dyno config: sensors.{label}'
+                source = f'{config_file} -> sensors.{label}'
                 for key in sorted(k for k in channel_params if k != 'name'):
                     units, desc = _info(key)
                     sensors.append((label, f'{klass} {channel}', key,
@@ -138,7 +167,7 @@ def build_rows(resolved):
         for key in sorted(flat):
             units, desc = _info(key)
             bucket.append((device_name, klass, key, _fmt(flat[key]), units, desc,
-                           provenance.get(key, '')))
+                           _source_label(provenance.get(key, ''), config_file)))
 
     return drives + sensors + other
 

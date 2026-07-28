@@ -1,4 +1,5 @@
 import h5py
+import json
 import os
 import shutil
 import signal
@@ -10,6 +11,7 @@ import numpy as np
 import time
 import yaml
 from deployment import dyno_paths
+from dyno.src import setup_summary
 from dyno.src.config_utils import augment_log_keys
 
 
@@ -51,6 +53,10 @@ class Logger:
 
         self.file = None
         self.data_dset = None
+        # Set per run in start_logging; used to write the companion report.
+        self.resolved = None
+        self.log_folder = None
+        self.log_base = None
         self.save = False
         self.active_id = None
         self.data_counter = 0
@@ -146,14 +152,24 @@ class Logger:
         base = os.path.splitext(os.path.basename(test_name))[0] or 'log'
         f_name = f"{folder_dir}/{base}.hdf5"
         self.file = h5py.File(f_name,'w')
+        self.log_folder = folder_dir
+        self.log_base = base
 
         # Attach the resolved device configuration (written by the master at
-        # bring-up) so every log records exactly what parameters ran.
+        # bring-up) so every log records exactly what parameters ran. Kept
+        # parsed as well, to render the companion report when the log closes.
         resolved_path = f"{dyno_paths.dyno_logs_directory}/resolved_config.json"
+        self.resolved = None
         if os.path.exists(resolved_path):
             with open(resolved_path, 'r') as f:
-                self.file.attrs['resolved_config'] = f.read()
-        
+                raw = f.read()
+            self.file.attrs['resolved_config'] = raw
+            try:
+                self.resolved = json.loads(raw)
+            except ValueError as e:
+                print(f'Logger: resolved_config.json is not valid JSON ({e}); '
+                      'skipping the companion setup report')
+
         # makes the HDF5 file and the datasets within it that are needed
         self.dsets = {}
         self.dsets['behavior_ids'] = self.file.create_dataset('behavior_ids', shape=(10,), maxshape=(None,), dtype=h5py.string_dtype())
@@ -180,10 +196,54 @@ class Logger:
         self.dsets['behavior_ids'].resize(len(setpoint_strings), axis=0)
         self.dsets['behavior_indices'].resize(len(setpoint_strings), axis=0)
 
-        # save any data in the buffer and close the file
-        self.save_cache(new_data)
+        # save any data in the buffer and close the file. The buffer can be
+        # empty here: the flush in run() clears it outright when a chunk lands
+        # exactly on the boundary, so a stop arriving on the very next sample
+        # leaves nothing. np.array([]) has no second axis, and save_cache would
+        # raise before the close below -- taking the whole log with it.
+        if new_data.ndim == 2 and new_data.shape[1]:
+            self.save_cache(new_data)
         self.telemetry_samples = []
+
+        # Read the run's shape while the datasets are still open; the report
+        # quotes duration and sample count.
+        report_meta = self._report_meta()
+
         self.file.close()
         self.file = None
         self.data_dset = None
         self.data_counter = 0
+
+        self._write_companion_report(report_meta)
+
+    def _report_meta(self):
+        meta = {'test_name': self.log_base,
+                'log_dir': os.path.basename(self.log_folder or ''),
+                'logged_at': time.strftime('%Y-%m-%d %H:%M:%S')}
+        time_dset = self.dsets.get('time')
+        if time_dset is not None and time_dset.shape[0]:
+            meta['samples'] = f'{time_dset.shape[0]:,}'
+            meta['duration'] = f'{float(time_dset[-1]) - float(time_dset[0]):.1f} s'
+        return meta
+
+    def _write_companion_report(self, meta):
+        """Write the run's <test>.txt setup report as soon as the log closes,
+        so a run still has a readable record when the operator skips the notes
+        dialog or the app aborts before it ever appears.
+
+        notes=None keeps anything already in the file. That matters because the
+        GUI opens the notes dialog BEFORE we get here -- it forwards the stop
+        sample to our queue and prompts in the same tick, while our run loop
+        sleeps up to 100 ms before picking it up -- so a fast operator can save
+        notes first. Neither writer has to win that race.
+
+        A broken report is never allowed to cost a test: the hdf5 is closed and
+        safe by this point, so anything thrown here is reported and swallowed."""
+        if self.resolved is None:
+            return
+        try:
+            path = setup_summary.report_path(self.log_folder, self.log_base)
+            setup_summary.write_report(path, self.resolved, meta)
+            print(f'Setup report written to {os.path.basename(path)}')
+        except Exception as e:
+            print(f'Failed to write setup report: {e}')
