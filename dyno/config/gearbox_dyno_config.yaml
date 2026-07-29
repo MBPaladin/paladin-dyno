@@ -45,6 +45,7 @@ expected_slave_layout: # This section captures parameters required to initialize
         k_tanh: 0.022 # defines tanh saturation curve along with kt
       motor_limits: # commands that exceed this value are clipped as they go out to the motor
         torque: 10 # Nm, abs(commands) > limit, are clipped
+        continuous_torque: 4 # Nm, continuous rating; grid_search cools down after points above this
         velocity: 350 # rad/s, abs(commands) > limit, are clipped
         acceleration: 400 #Rad/s^2
         rotatum: 40 #Nm/s, 4 x peak torque value
@@ -60,6 +61,7 @@ expected_slave_layout: # This section captures parameters required to initialize
         k_tanh: 0.016
       motor_limits:
         torque: 330
+        continuous_torque: 110 # Nm, continuous rating; grid_search cools down after points above this
         velocity: 12
         acceleration: 12 #Rad/s^2
         rotatum: 1320 #Nm/s, 4 x peak torque value

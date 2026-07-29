@@ -237,8 +237,12 @@ class GridSearch:
             for key in ['input_motor', 'output_motor']
         }
         
-        # Hard coded values to limit RMS torques during a test
-        if self.input_mode == 'torque':
+        # Continuous-torque rating used by the cooldown logic below. Builder
+        # generated tests bake the resolved rating into settings; hand-written
+        # yamls without it fall back to the historical hardcodes.
+        if 'continuous_torque' in self.settings:
+            self.t_limit = abs(float(self.settings['continuous_torque']))
+        elif self.input_mode == 'torque':
             self.t_limit = 4
         elif self.output_mode == 'torque':
             self.t_limit = 110

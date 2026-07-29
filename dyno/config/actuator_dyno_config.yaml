@@ -53,6 +53,7 @@ expected_slave_layout: # This section captures parameters required to initialize
         k_tanh: 0.016
       motor_limits:
         torque: 330
+        continuous_torque: 110 # Nm, continuous rating; grid_search cools down after points above this
         velocity: 12
         acceleration: 12 #Rad/s^2
         rotatum: 1320 #Nm/s, 4 x peak torque value
@@ -65,6 +66,7 @@ expected_slave_layout: # This section captures parameters required to initialize
       esi_file_name: dyno-debug-esi-extra-filters.xml
       motor_limits:
         torque: 30
+        continuous_torque: 4 # Nm, continuous rating; grid_search cools down after points above this
         velocity: 6
 
 

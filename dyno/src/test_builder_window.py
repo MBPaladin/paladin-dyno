@@ -84,6 +84,10 @@ class TestBuilderWindow(QWidget):
             self.limits = test_preview.limits_from_config(mode)
         except Exception:
             self.limits = None  # config unavailable: skip limit checks live
+        try:
+            self._cont_torque_cfg = test_preview.continuous_torque_from_config(mode)
+        except Exception:
+            self._cont_torque_cfg = {'input': None, 'output': None}
         self.segments = [test_builder.default_segment()]
         self._param_widgets = {}
         self._loading = False  # guard: suppress form->model writes during load
@@ -193,6 +197,13 @@ class TestBuilderWindow(QWidget):
         self.validation_label.setWordWrap(True)
         self.validation_label.setStyleSheet('color: #d62728;')
         editor.addWidget(self.validation_label)
+
+        # Non-blocking warnings (e.g. a gridpoint's stored continuous-torque
+        # rating differing from the current rig config's default).
+        self.warn_label = QLabel('')
+        self.warn_label.setWordWrap(True)
+        self.warn_label.setStyleSheet('color: #e6a700;')
+        editor.addWidget(self.warn_label)
 
         editor_wrap = QWidget()
         editor_wrap.setLayout(editor)
@@ -313,6 +324,7 @@ class TestBuilderWindow(QWidget):
         self.repeats_spin.setValue(int(seg.get('repeats', 1)))
         self.pattern_combo.setCurrentText(seg['pattern'])
         self._rebuild_param_widgets(seg)
+        self._apply_gridpoint_state(seg)
         self._loading = False
         self._update_preview()
 
@@ -342,12 +354,43 @@ class TestBuilderWindow(QWidget):
             self.pattern_layout.addRow(label, widget)
             self._param_widgets[key] = widget
 
+    def _cont_torque_default(self, motor):
+        """Config-sourced continuous-torque rating for `motor`, falling back to
+        the GridSearch hardcodes when the config doesn't define one."""
+        value = self._cont_torque_cfg.get(motor)
+        return value if value is not None else \
+            test_builder.GRID_CONT_TORQUE_FALLBACK[motor]
+
+    def _apply_gridpoint_state(self, seg):
+        """Grey out the fields a gridpoint segment doesn't use (position blend
+        accel, level ramp/settle -- grid_search has its own settle/transition
+        settings -- and repeats, which grid segments don't support)."""
+        grid = test_builder.is_gridpoint(seg)
+        for widget in (self.primary_accel, self.sec_rate, self.sec_settle,
+                       self.repeats_spin):
+            widget.setEnabled(not grid)
+
     def _on_pattern_changed(self, pattern):
         seg = self._current_segment()
         if seg is None or self._loading:
             return
         seg['pattern'] = pattern
         seg['params'] = {k: v[1] for k, v in test_builder.PATTERNS[pattern].items()}
+        if pattern == 'gridpoint':
+            # Grid searches only run velocity x torque; snap the modes to that
+            # pair and seed the continuous-torque rating from the rig config.
+            self._loading = True
+            if {self.primary_mode.currentText(),
+                    self.secondary_mode.currentText()} != {'velocity', 'torque'}:
+                self.primary_mode.setCurrentText('velocity')
+                self.secondary_mode.setCurrentText('torque')
+            self._loading = False
+            torque_motor = (self.primary_motor.currentText()
+                            if self.primary_mode.currentText() == 'torque'
+                            else ('output' if self.primary_motor.currentText() == 'input'
+                                  else 'input'))
+            seg['params']['continuous_torque'] = self._cont_torque_default(torque_motor)
+        self._apply_gridpoint_state(seg)
         self._rebuild_param_widgets(seg)
         item = self.seg_list.currentItem()
         if item:
@@ -358,6 +401,16 @@ class TestBuilderWindow(QWidget):
         seg = self._current_segment()
         if seg is None or self._loading:
             return
+        if test_builder.is_gridpoint(seg):
+            # Keep the other motor on the complementary mode of the
+            # velocity/torque pair as the pattern-motor mode changes.
+            prim = self.primary_mode.currentText()
+            if prim in ('velocity', 'torque'):
+                other = 'torque' if prim == 'velocity' else 'velocity'
+                if self.secondary_mode.currentText() != other:
+                    self.secondary_mode.blockSignals(True)
+                    self.secondary_mode.setCurrentText(other)
+                    self.secondary_mode.blockSignals(False)
         seg['primary'] = {'motor': self.primary_motor.currentText(),
                           'control_mode': self.primary_mode.currentText(),
                           'accel': self.primary_accel.value()}
@@ -370,7 +423,8 @@ class TestBuilderWindow(QWidget):
                             'levels': levels,
                             'rate': self.sec_rate.value(),
                             'settle_s': self.sec_settle.value()}
-        seg['repeats'] = self.repeats_spin.value()
+        seg['repeats'] = (1 if test_builder.is_gridpoint(seg)
+                          else self.repeats_spin.value())
         params = {}
         for key, widget in self._param_widgets.items():
             typ = test_builder.PATTERNS[seg['pattern']][key][2]
@@ -406,7 +460,13 @@ class TestBuilderWindow(QWidget):
             issues.extend(f"[{seg['id']}] {m}"
                           for m in test_builder.validate_segment(seg, self.limits))
             try:
-                cols, rows = test_builder.compile_segment(seg)
+                if test_builder.is_gridpoint(seg):
+                    # Approximate keyframes (cooldowns not modeled); the
+                    # post-save expansion shows the exact command stream.
+                    cols, rows = test_builder.gridpoint_preview_rows(
+                        seg, self.limits)
+                else:
+                    cols, rows = test_builder.compile_segment(seg)
             except Exception as e:
                 issues.append(f"[{seg['id']}] {type(e).__name__}: {e}")
                 continue
@@ -424,10 +484,33 @@ class TestBuilderWindow(QWidget):
         for (motor, mode), (ts, vs) in series.items():
             self.curves[mode][motor].setData(np.array(ts), np.array(vs))
         self.validation_label.setText('\n'.join(issues))
+        self._update_grid_warning()
         self.status.setText(f'Total duration: {t_offset:.1f} s '
                             f'({len(self.segments)} segment(s))')
         self._check_dirty()
         return issues
+
+    def _update_grid_warning(self):
+        """Yellow-flag the current gridpoint segment's continuous-torque field
+        when its value differs from the rig config's default (e.g. a recipe
+        saved under an older config, or a deliberate per-test override)."""
+        seg = self._current_segment()
+        warning = ''
+        stale = False
+        if seg is not None and test_builder.is_gridpoint(seg):
+            motor = test_builder.gridpoint_torque_motor(seg)
+            if motor is not None:
+                default = self._cont_torque_default(motor)
+                value = float(seg['params'].get('continuous_torque', default))
+                stale = abs(value - default) > 1e-9
+                if stale:
+                    warning = (f'Continuous torque {value:g} Nm differs from '
+                               f'the {motor} motor config default '
+                               f'({default:g} Nm)')
+        widget = self._param_widgets.get('continuous_torque')
+        if widget is not None:
+            widget.setStyleSheet('background-color: #fff3b0;' if stale else '')
+        self.warn_label.setText(warning)
 
     def _check_dirty(self):
         """Announce (once) that the recipe no longer matches the armed file."""
@@ -535,6 +618,8 @@ class TestBuilderWindow(QWidget):
         self.validation_label.setText(
             f'Viewing {label} (read-only). Use New Test to start editing.'
             if view_only else '')
+        if view_only:
+            self.warn_label.setText('')
 
     def _load_expansion(self, rel_path):
         if self._expansion_thread is not None and self._expansion_thread.isRunning():

@@ -70,6 +70,23 @@ def limits_from_config(mode):
     }
 
 
+def continuous_torque_from_config(mode):
+    """Per-motor continuous-torque ratings from the rig config, keyed by the
+    command-stream motor names (DUT -> 'input', LOAD -> 'output'). None where
+    the config doesn't define `motor_limits.continuous_torque`; callers fall
+    back to the GridSearch hardcodes (see test_builder.GRID_CONT_TORQUE_FALLBACK)."""
+    with open(f"{dyno_paths.dyno_config_directory}/{mode}_dyno_config.yaml") as f:
+        cfg = yaml.safe_load(f)
+    names = {'DUT': 'input', 'LOAD': 'output'}
+    out = {'input': None, 'output': None}
+    for slave in cfg.get('expected_slave_layout', []):
+        motor = names.get(slave.get('name'))
+        if motor:
+            value = slave.get('params', {}).get('motor_limits', {}).get('continuous_torque')
+            out[motor] = None if value is None else abs(float(value))
+    return out
+
+
 def _cycle_time_s():
     with open(f"{dyno_paths.dyno_config_directory}/master_config.yaml") as f:
         return yaml.safe_load(f)['cycle_time_us'] / 1e6
