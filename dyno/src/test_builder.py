@@ -10,6 +10,10 @@ the hand-written generate_*.py scripts in tests/traces produce, and the
 whole recipe compiles to a normal `behaviors:` test yaml that the runner
 executes with no knowledge of the builder.
 
+The `gridpoint` pattern is the exception: it compiles to a `grid_search`
+behavior (no trace csv), preserving that behavior's per-setpoint log flags
+for post-processing.
+
 The recipe is embedded in the generated yaml under a `builder:` key (which
 TestManager ignores) so a saved test is a single self-describing file that
 the builder can reopen and edit. Generated artifacts:
@@ -73,7 +77,122 @@ PATTERNS = {
     'dwell': {
         'duration_s': ('Duration [s]', 5.0, float),
     },
+    # Compiles to a real `grid_search` behavior (not a trace): every gridpoint
+    # gets its own log flag with ramps/settles untagged, so post-processing can
+    # group by flag. Axes: pattern-motor levels x other-motor levels, with the
+    # pattern/other control modes required to be the velocity/torque pair.
+    'gridpoint': {
+        'levels':               ('Pattern-motor levels (comma separated)',
+                                 [15.0, 30.0, 60.0, 100.0], list),
+        'duration_per_point_s': ('Hold per gridpoint [s]', 3.0, float),
+        'settle_time_s':        ('Settle before logging [s]', 0.5, float),
+        'transition_rate':      ('Transition rate (fraction of limit)', 0.25, float),
+        'velocity_inner':       ('Velocity is inner loop (default: torque)', False, bool),
+        'continuous_torque':    ('Continuous torque rating [Nm]', 110.0, float),
+    },
 }
+
+# Fallbacks mirroring the GridSearch hardcodes, used when the rig config has no
+# `motor_limits.continuous_torque` for the motor commanded in torque mode.
+GRID_CONT_TORQUE_FALLBACK = {'input': 4.0, 'output': 110.0}
+
+
+def is_gridpoint(segment):
+    return segment.get('pattern') == 'gridpoint'
+
+
+def gridpoint_torque_motor(segment):
+    """The motor commanded in torque mode ('input'/'output'), or None if the
+    segment's modes aren't the velocity/torque pair grid_search requires."""
+    primary = segment['primary']
+    sec_motor = 'output' if primary['motor'] == 'input' else 'input'
+    modes = {primary['motor']: primary['control_mode'],
+             sec_motor: segment['secondary']['control_mode']}
+    if set(modes.values()) != {'velocity', 'torque'}:
+        return None
+    return next(m for m, mode in modes.items() if mode == 'torque')
+
+
+def gridpoint_settings(segment):
+    """The `grid_search` behavior settings a gridpoint segment compiles to.
+    loop_order[0] is the outer axis; torque is the inner loop by default
+    because torque transitions settle much faster than velocity ones."""
+    primary = segment['primary']
+    secondary = segment['secondary']
+    sec_motor = 'output' if primary['motor'] == 'input' else 'input'
+    params = segment.get('params', {})
+    p = lambda key: _param(params, 'gridpoint', key)
+    loop_order = (['torque', 'velocity'] if p('velocity_inner')
+                  else ['velocity', 'torque'])
+    return {
+        primary['motor'] + '_motor': {
+            'control_mode': primary['control_mode'],
+            'command_list': [float(v) for v in p('levels')]},
+        sec_motor + '_motor': {
+            'control_mode': secondary['control_mode'],
+            'command_list': [float(v) for v in secondary.get('levels', [0.0])]},
+        'loop_order': loop_order,
+        'duration_per_point_s': float(p('duration_per_point_s')),
+        'settle_time_s': float(p('settle_time_s')),
+        'transition_rate': float(p('transition_rate')),
+        'continuous_torque': float(p('continuous_torque')),
+    }
+
+
+def gridpoint_preview_rows(segment, limits=None):
+    """Approximate keyframes for the live plot, in compile_segment's
+    (cols, rows) form. Ramp rates come from transition_rate x rig limits like
+    GridSearch.ramp; the cooldown holds GridSearch inserts above the continuous
+    torque rating are not modeled. The post-save expansion is exact."""
+    if gridpoint_torque_motor(segment) is None:
+        raise ValueError('gridpoint needs one motor in velocity and one in torque')
+    settings = gridpoint_settings(segment)
+    primary = segment['primary']
+    sec_motor = 'output' if primary['motor'] == 'input' else 'input'
+    prim_mode = primary['control_mode']
+    sec_mode = segment['secondary']['control_mode']
+
+    tr = settings['transition_rate']
+    rates = {'velocity': tr * (limits['acceleration'] if limits else 1.0),
+             'torque': tr * (limits['rotatum'] if limits else 1.0)}
+    axes = {prim_mode: settings[primary['motor'] + '_motor']['command_list'],
+            sec_mode: settings[sec_motor + '_motor']['command_list']}
+    outer_mode, inner_mode = settings['loop_order']
+
+    state = {'velocity': 0.0, 'torque': 0.0}
+    rows = [(0.0, 0.0, 0.0)]
+    t = 0.0
+
+    def emit():
+        rows.append((t, state[prim_mode], state[sec_mode]))
+
+    def goto(setpoint):
+        nonlocal t
+        dt = max(abs(setpoint[m] - state[m]) / max(rates[m], 1e-12)
+                 for m in setpoint)
+        state.update(setpoint)
+        if dt > 0:
+            t += dt
+            emit()
+
+    def hold(duration):
+        nonlocal t
+        if duration > 0:
+            t += duration
+            emit()
+
+    for outer in axes[outer_mode]:
+        for inner in axes[inner_mode]:
+            goto({outer_mode: float(outer), inner_mode: float(inner)})
+            hold(settings['settle_time_s'])
+            hold(settings['duration_per_point_s'])
+    goto({'velocity': 0.0, 'torque': 0.0})
+    hold(0.1)  # matches GridSearch's trailing hold at zero
+
+    cols = ['time',
+            f"{primary['motor']}_motor_{prim_mode}",
+            f"{sec_motor}_motor_{sec_mode}"]
+    return cols, rows
 
 
 def default_segment(seg_id='SEG1'):
@@ -154,6 +273,9 @@ def compile_segment(segment):
     stepping through its levels: ramp to level -> settle -> run pattern ->
     next level, ending with a ramp back to 0.
     """
+    if is_gridpoint(segment):
+        raise ValueError('gridpoint segments compile to a grid_search '
+                         'behavior, not a trace')
     pattern = segment['pattern']
     params = segment.get('params', {})
     primary = segment['primary']
@@ -269,6 +391,8 @@ _FORBIDDEN_MODE_PAIRS = ({'position', 'position'}, {'velocity', 'velocity'},
 def validate_segment(segment, limits=None):
     """Return a list of human-readable issues (empty = clean). Mirrors the
     TestTrace asserts so problems surface while editing, not at load time."""
+    if is_gridpoint(segment):
+        return _validate_gridpoint(segment, limits)
     issues = []
     primary = segment['primary']
     secondary = segment['secondary']
@@ -330,6 +454,34 @@ def validate_segment(segment, limits=None):
     return issues
 
 
+def _validate_gridpoint(segment, limits=None):
+    """Mirrors the GridSearch asserts so problems surface while editing."""
+    if gridpoint_torque_motor(segment) is None:
+        return ['gridpoint needs one motor in velocity mode and one in torque']
+    issues = []
+    settings = gridpoint_settings(segment)
+    for motor in MOTORS:
+        chan = settings[motor + '_motor']
+        if not chan['command_list']:
+            issues.append(f'{motor} motor has no levels')
+            continue
+        if limits:
+            peak = max(abs(v) for v in chan['command_list'])
+            limit = limits.get(chan['control_mode'])
+            if limit is not None and peak > limit:
+                issues.append(f"{motor}_motor_{chan['control_mode']}: peak "
+                              f'{peak:g} exceeds limit {limit:g}')
+    if settings['duration_per_point_s'] <= 0:
+        issues.append('Hold per gridpoint must be > 0')
+    if settings['settle_time_s'] < 0:
+        issues.append('Settle time must be >= 0')
+    if not 0 < settings['transition_rate'] <= 1:
+        issues.append('Transition rate must be in (0, 1]')
+    if settings['continuous_torque'] <= 0:
+        issues.append('Continuous torque rating must be > 0')
+    return issues
+
+
 def validate_recipe(recipe, limits=None):
     issues = []
     if not recipe.get('segments'):
@@ -367,6 +519,12 @@ def build_yaml_dict(recipe):
     name = sanitize_name(recipe['name'])
     behaviors = []
     for seg in recipe['segments']:
+        if is_gridpoint(seg):
+            # Real grid_search behavior: per-setpoint log flags, no trace csv.
+            # Repeats are ignored (the UI pins them to 1 for gridpoints).
+            behaviors.append({'id': seg['id'], 'type': 'grid_search',
+                              'settings': gridpoint_settings(seg)})
+            continue
         primary = seg['primary']
         secondary = seg['secondary']
         sec_motor = 'output' if primary['motor'] == 'input' else 'input'
@@ -435,6 +593,8 @@ def save_test(recipe, tests_dir):
     os.makedirs(trace_dir, exist_ok=True)
 
     for seg in recipe['segments']:
+        if is_gridpoint(seg):
+            continue  # compiles to a grid_search behavior, no trace csv
         cols, rows = compile_segment(seg)
         csv_path = os.path.join(trace_dir, f"{name}__{seg['id']}.csv")
         with open(csv_path, 'w', newline='') as f:
@@ -470,6 +630,8 @@ def load_recipe(yaml_path, tests_dir=None):
         name = sanitize_name(recipe.get('name', ''))
         trace_dir = os.path.join(tests_dir, 'traces', GENERATED_TRACE_DIR)
         for seg in recipe.get('segments', []):
+            if is_gridpoint(seg):
+                continue  # no trace csv to compare
             csv_path = os.path.join(trace_dir, f"{name}__{seg['id']}.csv")
             try:
                 with open(csv_path, newline='') as f:

@@ -124,6 +124,7 @@ expected_slave_layout:
         k_tanh: 0.018
       motor_limits:
         torque: 450
+        continuous_torque: 110 # Nm, continuous rating; grid_search cools down after points above this
         velocity: 13
         acceleration: 12 #Rad/s^2
         rotatum: 1800 #Nm/s, 4 x peak torque value
@@ -154,6 +155,7 @@ expected_slave_layout:
         k_tanh: 0.025
       motor_limits:
         torque: 100
+        continuous_torque: 4 # Nm, continuous rating; grid_search cools down after points above this
         velocity: 63
         acceleration: 12 #Rad/s^2
         rotatum: 320 #Nm/s, 4 x peak torque value
