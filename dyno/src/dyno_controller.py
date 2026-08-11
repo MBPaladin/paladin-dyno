@@ -26,7 +26,17 @@ class Controller(Master):
             self.dyno_params = yaml.safe_load(f)
 
         self._expected_slave_layout = self.dyno_params['expected_slave_layout']
-        
+
+        # Load-only bringup. The DUT drive is still enumerated, read, and logged
+        # -- only actuation is withheld: it is never enabled, never commanded,
+        # and its fault state never gates or trips a test. Set `load_only: true`
+        # in <mode>_dyno_config.yaml. Without this, start_test enables BOTH
+        # drives unconditionally, which is not what you want on a rig whose DUT
+        # side has no motor or coupling fitted yet.
+        self._load_only = bool(self.dyno_params.get('load_only', False))
+        if self._load_only:
+            print('Controller: LOAD-ONLY mode -- DUT will not be enabled or commanded')
+
         super().__init__(slave_layout = self._expected_slave_layout)
 
         self._telemetry_queue = telemetry_queue
@@ -120,7 +130,8 @@ class Controller(Master):
                            if self._test_load_error
                            and self._test_load_error[0] == current else None),
             'test_active': self._test_active,
-            'fault': bool(self.devices.DUT.fault or self.devices.LOAD.fault),
+            'fault': bool(self.devices.LOAD.fault
+                          or (not self._load_only and self.devices.DUT.fault)),
         }
 
     def _send_telemetry(self):
@@ -165,13 +176,14 @@ class Controller(Master):
                 if cmd[0] == 'start_test':
                     if self._test_active:
                         print('Unable to start test: Test already active')
-                    elif self.devices.DUT.fault:
+                    elif not self._load_only and self.devices.DUT.fault:
                         print('Unable to start test: DUT in fault state')
                     elif self.devices.LOAD.fault:
                         print('Unable to start test: LOAD in fault state')
                     else:
                         self.pull_cmd = True
-                        self.devices.DUT.sw_enable = True
+                        if not self._load_only:
+                            self.devices.DUT.sw_enable = True
                         self.devices.LOAD.sw_enable = True
                         if not self.test_definition == None:
                             self._test_active = True
@@ -258,7 +270,7 @@ class Controller(Master):
                 print(f'Safety triggered, {check_name} of {value} exceeds limit of {limit}')
                 return True
 
-        if self.devices.DUT.fault:
+        if not self._load_only and self.devices.DUT.fault:
             print('Safety triggered, DUT is in fault state')
             return True
 
@@ -269,6 +281,18 @@ class Controller(Master):
         return False
     
     def _get_limits(self):
+        # Load-only: nothing is driven through the DUT, so its (usually much
+        # lower, gear-reduced) ratings must not clamp what the load motor is
+        # allowed to do. LOAD's own limits govern.
+        if self._load_only:
+            self.limits = {
+                'torque': abs(self.devices.LOAD.torque_limit),
+                'velocity': abs(self.devices.LOAD.velocity_limit),
+                'acceleration': abs(self.devices.LOAD.acceleration_limit),
+                'rotatum': abs(self.devices.LOAD.rotatum_limit)
+            }
+            return
+
         self.limits = {
             'torque': min(abs(self.devices.DUT.torque_limit),abs(self.devices.LOAD.torque_limit)),
             'velocity': min(abs(self.devices.DUT.velocity_limit),abs(self.devices.LOAD.velocity_limit)),
@@ -279,7 +303,11 @@ class Controller(Master):
     def step(self):
         self.data_counter += 1
 
-        if self.devices.LOAD.position_offset == 0 and not self.devices.DUT.position == 0:
+        # Aligning LOAD's position frame to DUT's only means something when the
+        # two are mechanically coupled, which load-only assumes they are not.
+        if (not self._load_only
+                and self.devices.LOAD.position_offset == 0
+                and not self.devices.DUT.position == 0):
             self.devices.LOAD.position_offset = self.devices.DUT.position - self.devices.LOAD.position
 
         if self._test_active:
@@ -291,7 +319,7 @@ class Controller(Master):
                 self.pull_cmd = False
 
             if not self.generated_cmd == None and not self.shutdown:
-                if self.generated_cmd['input_mode'] != self.devices.DUT.mode:
+                if not self._load_only and self.generated_cmd['input_mode'] != self.devices.DUT.mode:
                     if not self.devices.DUT.switching_modes:
                         self.devices.DUT.command_operating_mode(self.generated_cmd['input_mode'])
                         self._safe_default_command['input_mode'] = self.current_cmd['input_mode']
@@ -305,7 +333,13 @@ class Controller(Master):
                         self._safe_default_command['output_command'] = self.current_cmd['output_command']
                         
 
-                if self.devices.DUT.mode == self.generated_cmd['input_mode'] and self.devices.LOAD.mode == self.generated_cmd['output_mode'] and not self.devices.DUT.switching_modes and not self.devices.LOAD.switching_modes:
+                # Load-only never commands DUT into a mode, so waiting for it to
+                # report one would stall the test at the first command forever.
+                dut_ready = self._load_only or (
+                    self.devices.DUT.mode == self.generated_cmd['input_mode']
+                    and not self.devices.DUT.switching_modes)
+
+                if dut_ready and self.devices.LOAD.mode == self.generated_cmd['output_mode'] and not self.devices.LOAD.switching_modes:
                     self.current_cmd = self.generated_cmd # Use the command from the test
                     self.pull_cmd = True
 
@@ -325,17 +359,23 @@ class Controller(Master):
 
         ff_ratio = 0.8
 
-        if self.devices.DUT.mode == 'torque' and not self.devices.LOAD.mode == 'torque':
+        # The feedforward terms exist to cancel the torque the *other* machine is
+        # putting through the coupling. Load-only has no DUT contribution to
+        # cancel, so LOAD is commanded plain and DUT is not written at all --
+        # this is the one place that would otherwise actuate a drive the
+        # operator was told stays dormant.
+        if not self._load_only and self.devices.DUT.mode == 'torque' and not self.devices.LOAD.mode == 'torque':
             torque_ff = ff_ratio*self.current_cmd['input_command'] * self.devices.DUT.params['gear_ratio']
             self.devices.LOAD.send_command(self.current_cmd['output_command'], torque_ff)
         else:
             self.devices.LOAD.send_command(self.current_cmd['output_command'])
 
-        if self.devices.LOAD.mode == 'torque' and not self.devices.DUT.mode == 'torque':
-            torque_ff = ff_ratio*self.current_cmd['output_command'] / self.devices.DUT.params['gear_ratio']
-            self.devices.DUT.send_command(self.current_cmd['input_command'], torque_ff)
-        else:
-            self.devices.DUT.send_command(self.current_cmd['input_command'])
+        if not self._load_only:
+            if self.devices.LOAD.mode == 'torque' and not self.devices.DUT.mode == 'torque':
+                torque_ff = ff_ratio*self.current_cmd['output_command'] / self.devices.DUT.params['gear_ratio']
+                self.devices.DUT.send_command(self.current_cmd['input_command'], torque_ff)
+            else:
+                self.devices.DUT.send_command(self.current_cmd['input_command'])
 
         if self.current_cmd['input_command'] != getattr(self, '_last_dut_cmd', None):
             self._last_dut_cmd = self.current_cmd['input_command']
@@ -387,7 +427,7 @@ class Controller(Master):
                 pwr3.set_channel(4, False)
 
             # Status Indication
-            if self.devices.DUT.fault or self.devices.LOAD.fault:
+            if self.devices.LOAD.fault or (not self._load_only and self.devices.DUT.fault):
                 self._write_led('r', 'on')
                 self._write_led('g', 'off')
             elif self._test_active:

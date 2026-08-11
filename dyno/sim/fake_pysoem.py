@@ -198,11 +198,13 @@ class AKDBehavior(Behavior):
 
     def __init__(self, layout_entry):
         super().__init__(layout_entry)
-        from dyno.src.devices import AKD
-        self._RxPDO = AKD.RxPDO
-        self._TxPDO = AKD.TxPDO
-        self.input_size = ctypes.sizeof(AKD.TxPDO)
-        self.output_size = ctypes.sizeof(AKD.RxPDO)
+        from dyno.src.devices import akd_pdo_profile, akd_pdo_structs
+        # Resolve the profile the same way devices.AKD does, so a sim run
+        # exercises the same wire layout as the rig it is standing in for.
+        self._pdo_profile = akd_pdo_profile(layout_entry.get('params') or {})
+        self._RxPDO, self._TxPDO = akd_pdo_structs(self._pdo_profile)
+        self.input_size = ctypes.sizeof(self._TxPDO)
+        self.output_size = ctypes.sizeof(self._RxPDO)
 
         self.drive_name = f"SIM-{layout_entry['name']}"
         # Resolve params exactly like devices.AKD does (SIM-* names are absent
@@ -238,6 +240,14 @@ class AKDBehavior(Behavior):
             return (self.drive_name + '\x00').encode()
         if index == 0x3598:
             return (1000).to_bytes(4, 'little')
+        # Same objects the drive maps into the TxPDO, also readable over the
+        # mailbox — this is what dyno/src/drive_status.py queries in PRE-OP.
+        if index == 0x6041:
+            return self._statusword().to_bytes(2, 'little')
+        if index == 0x6061:
+            return self.op_mode.to_bytes(1, 'little', signed=True)
+        if index == 0x603F:
+            return (0x0000).to_bytes(2, 'little')
         return super().sdo_read(index, subindex, size, ca)
 
     # -- DS402 -------------------------------------------------------------
@@ -301,17 +311,21 @@ class AKDBehavior(Behavior):
             omega_m, theta_m = self._motor_state()
             j_motor = self.plant.J / max(self.gear_ratio ** 2, 1e-9)
             if self.op_mode == 4:  # torque (current) mode
-                i_cmd = rx.current_command / 1000.0 + rx.torque_ff * self.i_cont / 1000.0
+                # getattr throughout: a reduced PDO profile does not map every
+                # command object, and the fake drive has to behave like a real
+                # one that simply never receives it.
+                i_cmd = (getattr(rx, 'current_command', 0) / 1000.0
+                         + getattr(rx, 'torque_ff', 0) * self.i_cont / 1000.0)
                 if self.flip:
                     i_cmd = -i_cmd  # undo the device-side sign flip
                 tau = self._current_to_torque(i_cmd)
             elif self.op_mode == 3:  # velocity mode: stiff first-order servo
-                v_cmd = rx.velocity_command / 1000.0 * 2 * math.pi / 60.0
+                v_cmd = getattr(rx, 'velocity_command', 0) / 1000.0 * 2 * math.pi / 60.0
                 # gain limited by explicit-Euler stability at the 1 ms cycle
                 kv = min(self.tau_limit / 0.5, j_motor * 200.0)
                 tau = kv * (v_cmd - omega_m)
             elif self.op_mode == 7:  # position mode: critically damped PD
-                raw = rx.position_command
+                raw = getattr(rx, 'position_command', 0)
                 if self._pos_cmd_prev_raw is None:
                     # Seed the multi-turn command at the unwrapped value
                     # nearest the current motor position (devices.AKD snaps
@@ -342,20 +356,29 @@ class AKDBehavior(Behavior):
 
     def step(self, dt_s, output_buf):
         tx = self._TxPDO()
+        # Only the status word is in every profile; the rest are populated if
+        # the active map carries them.
         tx.statusword = self._statusword()
-        tx.op_mode = self.op_mode
+        fields = {field for field, _ctype in self._TxPDO._fields_}
+
+        def emit(field, value):
+            if field in fields:
+                setattr(tx, field, value)
+
         if self.plant is not None:
             omega_m, theta_m = self._motor_state()
         else:
             omega_m, theta_m = 0.0, 0.0
-        tx.actual_position = wrap_i32(theta_m / (2 * math.pi) * 2**32 + 1000)
-        tx.actual_velocity = int(omega_m * 60.0 / (2 * math.pi) * 1000.0
-                                 + random.gauss(0, 3))
         current = self._torque_to_current(self.tau_motor)
         if self.flip:
             current = -current
-        tx.actual_current = int(current * 1000.0 + random.gauss(0, 15))
-        tx.i2t_counter = 0
+
+        emit('op_mode', self.op_mode)
+        emit('actual_position', wrap_i32(theta_m / (2 * math.pi) * 2**32 + 1000))
+        emit('actual_velocity', int(omega_m * 60.0 / (2 * math.pi) * 1000.0
+                                    + random.gauss(0, 3)))
+        emit('actual_current', int(current * 1000.0 + random.gauss(0, 15)))
+        emit('i2t_counter', 0)
         return bytes(tx)
 
 

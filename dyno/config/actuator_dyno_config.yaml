@@ -63,7 +63,7 @@ expected_slave_layout: # This section captures parameters required to initialize
     name: DUT
     params:
       gear_ratio: 1
-      esi_file_name: dyno-debug-esi-extra-filters.xml
+      esi_file_name: config/esi/dyno-debug-esi-extra-filters.xml
       motor_limits:
         torque: 30
         continuous_torque: 4 # Nm, continuous rating; grid_search cools down after points above this

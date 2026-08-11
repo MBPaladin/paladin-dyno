@@ -1,0 +1,182 @@
+# In-house dyno (new build) - BRINGUP CONFIG
+#
+# Bus as scanned by ./dyno/bus_scan.sh: 5 slaves.
+#   0 EK1100   coupler
+#   1 EL3208   RTD  (8 ch)
+#   2 ELM3004  ADC  (4 ch)
+#   3 AKD      DUT
+#   4 AKD      LOAD
+#
+# Relative to actuator_production this rig has NO EL2502 (pwm), NO EL5042
+# (encoder), NO EL2004/EL2004_12v power modules, and one ELM3004 instead of
+# three.
+
+# DUT is enumerated, read and logged, but never enabled or commanded.
+# Remove this (or set false) only once the DUT drive is commissioned AND its
+# motor and coupling are fitted - start_test enables both drives without it.
+load_only: true
+
+# --- 1. SENSOR CONFIGURATION ---
+sensors:
+  # Output torque cell
+  load_torque:
+    port: RESERVED_ADC
+    fs_v: 5
+    fs_pos: 500
+    offset: 0
+    supply: NA
+
+  # Input torque cell
+  input_torque:
+    port: ADC1
+    fs_v: 10
+    fs_pos: 20
+    offset: 0
+    supply: NA
+
+  load_stator_temp:
+    port: RESERVED_RTD
+    sensor_type: PT100
+
+# --- 2. PHYSICAL PANEL WIRING HARNESS ---
+# Only ports backed by a module actually on this chain. Power routes are all
+# gone with the EL2004s; master.py skips the supply step when the port carries
+# no matching power_<supply> key, so omitting them is the supported way to say
+# "unpowered".
+panel_ports:
+  RESERVED_ADC:
+    signal_module: adc_1
+    signal_channel: ch1
+  ADC1:
+    signal_module: adc_1
+    signal_channel: ch2
+  ADC2:
+    signal_module: adc_1
+    signal_channel: ch3
+  ADC3:
+    signal_module: adc_1
+    signal_channel: ch4
+  RTD1:
+    signal_module: rtd_module
+    signal_channel: ch1
+  RTD2:
+    signal_module: rtd_module
+    signal_channel: ch2
+  RTD3:
+    signal_module: rtd_module
+    signal_channel: ch3
+  RTD4:
+    signal_module: rtd_module
+    signal_channel: ch4
+  RESERVED_RTD:
+    signal_module: rtd_module
+    signal_channel: ch8
+
+# --- 3. PHYSICAL HARDWARE BUS ---
+# Order is positional and must match the scan exactly. `coupler`, `rtd_module`
+# and `adc_1` are not free-form labels: panel_ports, log_keys and safeties above
+# resolve against them by name. LOAD and DUT are likewise fixed - the control
+# loop reaches for devices.LOAD / devices.DUT directly.
+#
+# On HARDWARE these params are the base layer only: AKD.__init__ reads the
+# drive's own name from SDO 0x2031 (the name set in WorkBench) and, if it
+# matches an absorbers.yaml key, that entry OVERRIDES what is written here.
+# Name the load drive RA400-0x and the conservative limits below are silently
+# replaced by 450 Nm / 13 rad/s. In SIM the fake drives report SIM-<name>, which
+# deliberately matches nothing, so these values are what actually apply.
+expected_slave_layout:
+  - { model: EK1100, name: coupler }
+  - { model: EL3208, name: rtd_module }
+  - { model: ELM3004, name: adc_1 }
+  - model: AKD
+    name: DUT
+    params:
+      flip_torque_sign: False
+      gear_ratio: 1 # Output should always be set to 1
+      motor_params:
+        # TODO: verify against the motor actually fitted. Carried over from the
+        # RA400 entry - wrong kt means commanded torque != delivered torque.
+        kt: 25.5
+        k_tanh: 0.018
+      motor_limits:
+        # TODO: deliberately derated for first spin. RA400 ratings are
+        # torque 450 / velocity 13; raise these only once the machine is
+        # identified and the mounting is trusted.
+        torque: 25
+        continuous_torque: 10
+        velocity: 50
+        acceleration: 20 # Rad/s^2
+        rotatum: 100 # Nm/s
+      drive_params:
+        i_cont: 8
+  - model: AKD
+    name: LOAD
+    params:
+      # Not commanded while load_only is set, but the params are still
+      # validated at bring-up (devices.py:610 requires all nine), and sim
+      # resolves entirely from here. TODO on commissioning.
+      flip_torque_sign: True
+      gear_ratio: 1
+      motor_params:
+        kt: 5.3
+        k_tanh: 0.025
+      motor_limits:
+        torque: 10
+        continuous_torque: 4
+        velocity: 50
+        acceleration: 20 # Rad/s^2
+        rotatum: 400 # Nm/s
+      drive_params:
+        i_cont: 8
+
+# Measured values over these limits stop the test.
+#
+# IMPORTANT: actuator_production gets its stator over-temp protection from
+# _aux_func_A3_Dyno, which dyno_controller.py:71 appends ONLY when
+# mode == 'actuator_production'. In this mode that function does not run, so
+# there is no fan control, no stack light, and no NaN check on the RTD. The
+# load_stator_temp entry below is the only thermal protection here.
+#
+# Note also that _safety_trigger compares abs(value) > limit, and abs(nan) is
+# never > limit - so a failed/disconnected RTD reads NaN and silently disables
+# this check rather than tripping it.
+safeties:
+  output_torque: { source: devices.adc_1.load_torque, limit: 50 } # Nm, derated for bringup
+  output_velocity: { source: devices.LOAD.velocity, limit: 60 } # rad/s, derated for bringup
+  input_velocity: { source: devices.DUT.velocity, limit: 100 } # rad/s, catches a back-driven DUT
+  load_stator_temp: { source: devices.rtd_module.load_stator_temp, limit: 100 } # C
+
+gui_params: # defines length and resolution of the plots
+  window_length_s: 30
+  displayed_samples: 2048
+
+# Attributes to log / visualise, as [readable name, attribute path on the
+# controller]. Sensors declared above are appended automatically by
+# augment_log_keys, so input_torque / load_torque / load_stator_temp are logged
+# without appearing here.
+#
+# load_position_2 (devices.encoder.position) is intentionally absent: the EL5042
+# is not on this chain.
+log_keys:
+  - [time, time]
+  - [dut_mode, devices.DUT.servo_drive_mode]
+  - [dut_torque_command, devices.DUT.torque_command]
+  - [dut_velocity_command, devices.DUT.velocity_command]
+  - [dut_position_command, devices.DUT.position_command]
+  - [dut_output_position, devices.DUT.position]
+  - [dut_velocity, devices.DUT.velocity]
+  - [dut_current, devices.DUT.current]
+  - [load_mode, devices.LOAD.servo_drive_mode]
+  - [load_torque_command, devices.LOAD.torque_command]
+  - [load_velocity_command, devices.LOAD.velocity_command]
+  - [load_position_command, devices.LOAD.position_command]
+  - [load_position, devices.LOAD.position]
+  - [load_velocity, devices.LOAD.velocity]
+  - [load_current, devices.LOAD.current]
+  # Raw DS402 status words. Decode with ./dyno/drive_status.sh's bit table, or
+  # read them straight: bit3 = fault, bit6 = switch on disabled, bits 0-2 =
+  # ready/switched on/enabled. 0 in bits 0-3 and 6 is the 'undefined' state.
+  - [load_statusword, devices.LOAD.statusword]
+  - [dut_statusword, devices.DUT.statusword]
+  - [cycle_time_us, cycle_dt_us] # measured PDO loop interval
+  - [wkc_error, wkc_error] # expected - actual working counter; 0 = healthy
