@@ -217,8 +217,17 @@ class Master:
         # Written every bring-up; the Logger attaches this file to each test's
         # HDF5 log so post-processing can reconstruct the exact configuration
         # (post absorber-merge, including provenance of every value).
+        #
+        # The session id ties this file to THIS bring-up. There is exactly one
+        # copy on disk and it is overwritten every time, so without the id a
+        # Logger started against a stale file (a crashed bring-up, a run with
+        # no fresh one) would attribute a log to the wrong configuration and
+        # say nothing. The controller ships the same id out on every telemetry
+        # sample so the Logger can check the two agree -- see _control_state.
+        self.session_id = f'{os.getpid()}@{time.strftime("%Y-%m-%d %H:%M:%S")}'
         resolved = {'mode': getattr(self, 'mode', None),
                     'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+                    'session_id': self.session_id,
                     'devices': {}}
         for device_name, device in vars(self.devices).items():
             entry = {'class': type(device).__name__}

@@ -266,6 +266,16 @@ class Window(QWidget):
         else:
             print('Control process shut down cleanly')
 
+        # Both readers are gone now, but this process still has to exit. Every
+        # telemetry sample was forwarded to the Logger, so logging_queue owns a
+        # feeder thread with a backlog of samples and a pipe nothing will drain
+        # again; at interpreter exit multiprocessing joins that thread, it
+        # blocks writing to the full pipe, and the GUI hangs after printing a
+        # clean shutdown (Controller.__init__ drops its telemetry queue for the
+        # same reason). The samples are worthless at this point - drop them.
+        self.logging_queue.cancel_join_thread()
+        self.control_command_queue.cancel_join_thread()
+
     def __build_ui(self):
         self.main_layout = QHBoxLayout(self)
         self.controls_widget = QWidget()
@@ -360,6 +370,25 @@ class Window(QWidget):
         self.stop_button.setStyleSheet('background-color: red; color: white;')
         self.controls_layout.addWidget(self.stop_button)
         self.stop_button.clicked.connect(self.__stop_test)
+
+        # Tare, with its result underneath: the bias alone does not say whether
+        # it is reasonable (0.5 Nm is noise on a 500 Nm cell and 2.5% on a 20 Nm
+        # one), so the readout leads with percent of full scale and colours on
+        # it. Right-click clears, for undoing a tare taken against a loaded cell.
+        self.tare_button = QPushButton('Tare Torque')
+        self.tare_button.setToolTip(
+            'Average the torque cells at rest and apply the result as a session '
+            'zero.\nThe rig must be idle and no test running.\n'
+            'Right-click to clear the applied tare.')
+        self.tare_button.clicked.connect(self.__tare)
+        self.tare_button.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tare_button.customContextMenuRequested.connect(self.__clear_tare)
+        self.controls_layout.addWidget(self.tare_button)
+
+        self.tare_label = QLabel('No tare applied')
+        self.tare_label.setWordWrap(True)
+        self.tare_label.setStyleSheet('font-size: 11px; color: gray;')
+        self.controls_layout.addWidget(self.tare_label)
 
         self.__build_safeties_panel()
 
@@ -461,6 +490,78 @@ class Window(QWidget):
 
     def __stop_test(self):
         self.control_command_queue.put_nowait(['stop_test', 0])
+
+    def __tare(self):
+        self.control_command_queue.put_nowait(['tare', 0])
+
+    def __clear_tare(self):
+        self.control_command_queue.put_nowait(['clear_tare', 0])
+
+    def __refresh_tare(self, state):
+        """Render the controller's tare state under the button.
+
+        Leads with percent of full scale because the bias in Nm cannot be judged
+        on its own, carries the spread because a mean over a noisy window is not
+        a zero, and shows the age because a tare that was fine an hour ago has
+        had an hour to drift."""
+        if state.get('tare_active'):
+            self.tare_label.setText('Taring… keep the rig still')
+            self.tare_label.setStyleSheet('font-size: 11px; color: #b58900;')
+            return
+
+        tare = state.get('tare')
+        if not tare:
+            # A refusal ("a test is running", "the rig is moving") is the most
+            # useful thing to show here -- it says what to fix.
+            message = state.get('tare_message') or 'No tare applied'
+            self.tare_label.setText(message)
+            self.tare_label.setStyleSheet(
+                'font-size: 11px; color: %s;'
+                % ('#cb4b16' if 'refused' in message.lower()
+                   or 'aborted' in message.lower() else 'gray'))
+            return
+
+        warn = float((self.dyno_params.get('tare') or {}).get('warn_frac_fs', 0.02))
+        rows, worst, judgeable = [], 0.0, True
+        for sensor in sorted(tare):
+            record = tare[sensor] or {}
+            bias = record.get('bias')
+            frac = record.get('frac_fs')
+            # Without a full scale there is nothing to judge the bias against,
+            # and colouring it green would claim an all-clear we cannot support.
+            if frac is None:
+                judgeable = False
+            worst = max(worst, frac or 0.0)
+            parts = [f'{bias:+.4g}' if isinstance(bias, (int, float)) else str(bias)]
+            parts.append(f'{100 * frac:.2f}% FS' if frac is not None else 'FS ?')
+            if record.get('stddev') is not None:
+                parts.append(f"sd {record['stddev']:.3g}")
+            age = self.__tare_age(record.get('at'))
+            if age:
+                parts.append(age)
+            rows.append(f'{sensor}: ' + '  '.join(parts))
+
+        # Half the warn threshold is the amber band: still fine, but drifting
+        # toward the point where it is worth asking why.
+        colour = ('#cb4b16' if worst > warn
+                  else 'gray' if not judgeable
+                  else '#859900' if worst <= 0.5 * warn else '#b58900')
+        self.tare_label.setText('\n'.join(rows))
+        self.tare_label.setStyleSheet(f'font-size: 11px; color: {colour};')
+
+    @staticmethod
+    def __tare_age(stamp):
+        """'4m ago' for a tare timestamp, or '' if it cannot be read."""
+        if not stamp:
+            return ''
+        try:
+            taken = time.mktime(time.strptime(stamp, '%Y-%m-%d %H:%M:%S'))
+        except (ValueError, TypeError):
+            return ''
+        minutes = int(max(time.time() - taken, 0) // 60)
+        if minutes < 1:
+            return 'just now'
+        return f'{minutes}m ago' if minutes < 60 else f'{minutes // 60}h{minutes % 60:02d}m ago'
 
     def __prompt_experiment_notes(self):
         """Shown when a test stops gracefully (stop button, completion, or a
@@ -697,6 +798,14 @@ class Window(QWidget):
         holds the plan, the GUI has only asked for it.
         """
         self._controller_fault = bool(state.get('fault'))
+
+        # Taring is only legal with the rig idle and no test running, so the
+        # button follows the controller's own precondition rather than letting
+        # the operator queue a command that will just be refused.
+        self.tare_button.setEnabled(not state.get('test_active')
+                                    and not state.get('tare_active'))
+        self.__refresh_tare(state)
+
         armed = state.get('armed')
         if self._requested_arm is not None:
             # TestManager names itself test_file.split('.')[0] — derive the same.
@@ -962,4 +1071,12 @@ if __name__=='__main__':
     sigint_timer.timeout.connect(lambda: None)
     sigint_timer.start(200)
 
-    sys.exit(a.exec())
+    exit_code = a.exec()
+
+    # The event loop is gone, so the handler above would turn a Ctrl-C into a
+    # quit() on a dead application - silently swallowing it. Hand SIGINT back to
+    # the interpreter so the terminal stays escapable if anything stalls during
+    # interpreter teardown.
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+
+    sys.exit(exit_code)

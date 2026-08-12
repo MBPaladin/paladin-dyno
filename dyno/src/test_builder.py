@@ -153,8 +153,13 @@ def gridpoint_preview_rows(segment, limits=None):
     sec_mode = segment['secondary']['control_mode']
 
     tr = settings['transition_rate']
-    rates = {'velocity': tr * (limits['acceleration'] if limits else 1.0),
-             'torque': tr * (limits['rotatum'] if limits else 1.0)}
+    # Each axis ramps at a fraction of the rating of the motor driving it;
+    # gridpoint_torque_motor above established the modes are the velocity/torque
+    # pair, so each mode maps to exactly one motor.
+    mode_limits = ({prim_mode: limits[primary['motor']], sec_mode: limits[sec_motor]}
+                   if limits else None)
+    rates = {'velocity': tr * (mode_limits['velocity']['acceleration'] if limits else 1.0),
+             'torque': tr * (mode_limits['torque']['rotatum'] if limits else 1.0)}
     axes = {prim_mode: settings[primary['motor'] + '_motor']['command_list'],
             sec_mode: settings[sec_motor + '_motor']['command_list']}
     outer_mode, inner_mode = settings['loop_order']
@@ -388,6 +393,37 @@ _FORBIDDEN_MODE_PAIRS = ({'position', 'position'}, {'velocity', 'velocity'},
                          {'position', 'velocity'})
 
 
+def reaction_torque_issue(output_torque_peak, limits):
+    """Message if the load motor's torque overtorques the DUT through the
+    shaft, else None.
+
+    The two motors share a shaft, so torque the load applies is reacted at the
+    DUT divided by the DUT's gear ratio -- the same conversion the feed-forward
+    in dyno_controller.step uses. Per-motor ceilings cannot express this: a
+    command well inside LOAD's own rating still overtorques a derated DUT on a
+    direct-drive (1:1) rig.
+
+    Only this direction is checked. The reverse -- DUT torque the load motor
+    cannot hold -- is not an overtorque of the load motor; the shaft simply
+    accelerates, which the velocity and acceleration limits govern.
+
+    Skipped when `limits['coupled']` is False: a load_only rig has no motor or
+    coupling on the DUT side (see load_only in <mode>_dyno_config.yaml), so
+    there is no path for the reaction. Absent key means coupled, which is the
+    safe default -- clearing load_only re-arms this check automatically.
+    """
+    if not limits.get('coupled', True):
+        return None
+    peak = abs(output_torque_peak)
+    ratio = abs(limits['input'].get('gear_ratio') or 1)
+    dut = limits['input']['torque']
+    reacted = peak / ratio
+    if reacted <= dut:
+        return None
+    return (f'peak {peak:g} Nm reacts {reacted:g} Nm at the DUT '
+            f'(limit {dut:g}) through gear_ratio {ratio:g}')
+
+
 def validate_segment(segment, limits=None):
     """Return a list of human-readable issues (empty = clean). Mirrors the
     TestTrace asserts so problems surface while editing, not at load time."""
@@ -407,7 +443,10 @@ def validate_segment(segment, limits=None):
         issues.append('Time is not strictly increasing (check rates > 0)')
 
     for idx, col in ((1, cols[1]), (2, cols[2])):
-        mode = col.rsplit('_', 1)[-1]
+        # cols are '<motor>_motor_<mode>'; each is held to its own motor's
+        # ratings, so `limits` is indexed by motor first.
+        motor, mode = col.split('_', 1)[0], col.rsplit('_', 1)[-1]
+        motor_limits = limits[motor] if limits else None
         values = [r[idx] for r in rows]
         rates = [abs((b - a) / (tb - ta)) if tb > ta else 0.0
                  for (ta, a), (tb, b) in zip(zip(times, values),
@@ -415,19 +454,23 @@ def validate_segment(segment, limits=None):
         peak, peak_rate = max(map(abs, values)), max(rates, default=0.0)
         if mode in ('torque', 'velocity') and values[-1] != 0:
             issues.append(f'{col} must end at 0 (ends at {values[-1]:g})')
-        if limits:
+        if motor_limits:
             if mode == 'torque':
-                if peak > limits['torque']:
-                    issues.append(f'{col}: peak {peak:g} Nm exceeds limit {limits["torque"]:g}')
-                if peak_rate > limits['rotatum']:
-                    issues.append(f'{col}: rotatum {peak_rate:g} Nm/s exceeds limit {limits["rotatum"]:g}')
+                if peak > motor_limits['torque']:
+                    issues.append(f'{col}: peak {peak:g} Nm exceeds limit {motor_limits["torque"]:g}')
+                if motor == 'output':
+                    reaction = reaction_torque_issue(peak, limits)
+                    if reaction:
+                        issues.append(f'{col}: {reaction}')
+                if peak_rate > motor_limits['rotatum']:
+                    issues.append(f'{col}: rotatum {peak_rate:g} Nm/s exceeds limit {motor_limits["rotatum"]:g}')
             elif mode == 'velocity':
-                if peak > limits['velocity']:
-                    issues.append(f'{col}: peak {peak:g} rad/s exceeds limit {limits["velocity"]:g}')
-                if peak_rate > limits['acceleration']:
-                    issues.append(f'{col}: accel {peak_rate:g} rad/s^2 exceeds limit {limits["acceleration"]:g}')
-            elif mode == 'position' and peak_rate > limits['velocity']:
-                issues.append(f'{col}: implied velocity {peak_rate:g} rad/s exceeds limit {limits["velocity"]:g}')
+                if peak > motor_limits['velocity']:
+                    issues.append(f'{col}: peak {peak:g} rad/s exceeds limit {motor_limits["velocity"]:g}')
+                if peak_rate > motor_limits['acceleration']:
+                    issues.append(f'{col}: accel {peak_rate:g} rad/s^2 exceeds limit {motor_limits["acceleration"]:g}')
+            elif mode == 'position' and peak_rate > motor_limits['velocity']:
+                issues.append(f'{col}: implied velocity {peak_rate:g} rad/s exceeds limit {motor_limits["velocity"]:g}')
         if mode == 'position':
             # Corners must be velocity-continuous (within what the accel limit
             # can absorb in CORNER_DT); a raw corner is an accel impulse that
@@ -441,8 +484,8 @@ def validate_segment(segment, limits=None):
                                   'time so the trace starts at rest')
                 if abs(signed[-1]) > 1e-6:
                     issues.append(f'{col} ends while still moving')
-            if limits:
-                step_limit = limits['acceleration'] * CORNER_DT
+            if motor_limits:
+                step_limit = motor_limits['acceleration'] * CORNER_DT
                 max_step = max((abs(b - a) for a, b in zip(signed, signed[1:])),
                                default=0.0)
                 if max_step > step_limit:
@@ -467,10 +510,14 @@ def _validate_gridpoint(segment, limits=None):
             continue
         if limits:
             peak = max(abs(v) for v in chan['command_list'])
-            limit = limits.get(chan['control_mode'])
+            limit = limits[motor].get(chan['control_mode'])
             if limit is not None and peak > limit:
                 issues.append(f"{motor}_motor_{chan['control_mode']}: peak "
                               f'{peak:g} exceeds limit {limit:g}')
+            if motor == 'output' and chan['control_mode'] == 'torque':
+                reaction = reaction_torque_issue(peak, limits)
+                if reaction:
+                    issues.append(f'output_motor_torque: {reaction}')
     if settings['duration_per_point_s'] <= 0:
         issues.append('Hold per gridpoint must be > 0')
     if settings['settle_time_s'] < 0:

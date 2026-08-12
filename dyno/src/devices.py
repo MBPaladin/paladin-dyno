@@ -176,7 +176,37 @@ class EL2004:
         # 5. Write the safely modified byte back to the PySOEM buffer
         self._slave.output = bytes([current_byte])
 
-class ELM3002:
+class ScaledChannels:
+    """Channel publishing shared by the ELM3000-series analog terminals.
+
+    Every channel surfaces as an attribute named after its sensor
+    (self.load_torque and friends). That value carries two corrections, kept
+    deliberately separate:
+
+      offset -- a calibration constant from the rig yaml, part of the recorded
+                configuration, the same on every run.
+      tare   -- a zero captured at runtime for THIS session, from averaging the
+                cell at rest.
+
+    Folding a tare into the offset would destroy the record of which correction
+    came from where and let a session artifact masquerade as calibration, so
+    they stay as two terms.
+
+    `untared` holds the reading before the tare is applied, because that is what
+    a new tare has to average over. Taring against an already-tared reading
+    would only walk the bias toward zero one press at a time instead of
+    measuring it."""
+
+    def _init_channels(self):
+        self.tare = {}      # sensor name -> bias added on top of the config offset
+        self.untared = {}   # sensor name -> reading with offset applied, tare not
+
+    def _publish_channel(self, ch_name, scaled):
+        self.untared[ch_name] = scaled
+        setattr(self, ch_name, scaled + self.tare.get(ch_name, 0.0))
+
+
+class ELM3002(ScaledChannels):
     class TxPDO(ctypes.Structure):
         _pack_ = 1 # Ensures no padding between fields
         _fields_ = [
@@ -197,6 +227,7 @@ class ELM3002:
         self.params = params
         self.input_torque = 0
         self.output_torque = 0
+        self._init_channels()
 
     def setup(self):
         #Set 8000 and 8010 to corresponding measurement ranges: 2 = +- 10v, 3 = +- 5v
@@ -259,9 +290,10 @@ class ELM3002:
                 
                 # Formula for ELM 3000 series scaling
                 scaled_value = (fs_pos * raw_values[i] / 7812500) + offset
-                
-                # This creates or updates the attribute (e.g., self.load_torque)
-                setattr(self, ch_name, scaled_value)
+
+                # Creates or updates the attribute (e.g. self.load_torque),
+                # with any session tare on top -- see ScaledChannels.
+                self._publish_channel(ch_name, scaled_value)
 
 class EL3208:
     class TxPDO(ctypes.Structure):
@@ -396,7 +428,7 @@ class EL3208:
                 # E.g., setattr(self, 'load_stator_temp', 24.5)
                 setattr(self, ch_name, temp)
 
-class ELM3004:
+class ELM3004(ScaledChannels):
     class TxPDO(ctypes.Structure):
         _pack_ = 1 # Ensures no padding between fields
         _fields_ = [
@@ -428,6 +460,7 @@ class ELM3004:
         self.name = name
         # If no params passed, ensure it's a dict so routing doesn't crash
         self.params = params if params is not None else {}
+        self._init_channels()
 
     def setup(self):
         # Clear current TxPDO mapping
@@ -502,9 +535,10 @@ class ELM3004:
                 
                 # Formula for ELM 3000 series scaling
                 scaled_value = (fs_pos * raw_values[i] / 7812500) + offset
-                
-                # This creates or updates the attribute (e.g., self.load_torque)
-                setattr(self, ch_name, scaled_value)
+
+                # Creates or updates the attribute (e.g. self.load_torque),
+                # with any session tare on top -- see ScaledChannels.
+                self._publish_channel(ch_name, scaled_value)
 
 class EL5042:
     class TxPDO(ctypes.Structure):

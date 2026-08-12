@@ -101,7 +101,7 @@ RTC-0200: #New big motor: values need correcting
     acceleration: 20 #Rad/s^2
     rotatum: 400 #Nm/s, 4 x peak torque value
   drive_params:
-    i_cont: 8
+    i_cont: 15
 
 13030X: #New small motor: values need correcting
   type: rotary
@@ -111,7 +111,7 @@ RTC-0200: #New big motor: values need correcting
     kt: 1.0
     k_tanh: 0.01
   motor_limits:
-    torque: 10
+    torque: 100
     velocity: 10
     acceleration: 5 #Rad/s^2
     rotatum: 100 #Nm/s, 4 x peak torque value

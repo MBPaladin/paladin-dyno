@@ -3,6 +3,9 @@ import numpy as np
 import pandas as pd
 import time
 from deployment import dyno_paths
+# test_builder imports nothing from this package, so this stays acyclic. The
+# shared check lives there because the builder must run without numpy/pandas.
+from dyno.src.test_builder import reaction_torque_issue
 
 # iterator that yields loops of behaviors
 def loop_iterator(loop_definition):
@@ -48,16 +51,19 @@ class TestTrace:
         # Apply scaling to the trace, if present
         if self.settings.get('use_relative_command', False):
             print('\nApplying relative scaling')
+            # Relative 1.0 means "this motor's own rating", not the weaker of
+            # the two -- self.limits is keyed by motor first (see
+            # dyno_controller._get_limits).
             if self.input_mode in ['velocity', 'torque']:
-                self.trace[f"input_motor_{self.input_mode}"] *= self.limits[self.input_mode]
-                print('\tScaling input trace by ',self.limits[self.input_mode])
+                self.trace[f"input_motor_{self.input_mode}"] *= self.limits['input'][self.input_mode]
+                print('\tScaling input trace by ',self.limits['input'][self.input_mode])
 
                 if 'scale_override' in self.settings['input_motor'].keys():
                     self.trace[f"input_motor_{self.input_mode}"] *= min(1, abs(self.settings['input_motor']['scale_override']))
 
             if self.output_mode in ['velocity', 'torque']:
-                self.trace[f"output_motor_{self.output_mode}"] *= self.limits[self.output_mode]
-                print('\tScaling output trace by ',self.limits[self.output_mode])
+                self.trace[f"output_motor_{self.output_mode}"] *= self.limits['output'][self.output_mode]
+                print('\tScaling output trace by ',self.limits['output'][self.output_mode])
 
 
                 if 'scale_override' in self.settings['output_motor'].keys():
@@ -90,26 +96,32 @@ class TestTrace:
             'output_motor': (self.trace[f"output_motor_{self.output_mode}"][1:] - np.array(self.trace[f"output_motor_{self.output_mode}"][:-1])) / d_dt
             }
         
-        for motor_key in ['input_motor', 'output_motor']:
+        for motor in ['input', 'output']:
+            motor_key = f'{motor}_motor'
+            # Each motor is held to its own ratings, not the weaker of the pair.
+            limits = self.limits[motor]
             if self.settings[motor_key]['control_mode'] == 'torque':
                 max_abs_test_torque = max(abs(self.trace[f"{motor_key}_torque"][:]))
-                limit_val = self.limits['torque']
+                limit_val = limits['torque']
                 assert max_abs_test_torque <= limit_val, \
-                    (f'Max trace torque of {max_abs_test_torque} exceeds system '
-                     f'limit of {limit_val}')
+                    (f'Max {motor_key} trace torque of {max_abs_test_torque} exceeds '
+                     f'its limit of {limit_val}')
                 assert self.trace[f"{motor_key}_torque"][len(self.trace['time'])-1] == 0, 'Torque trace must end at 0'
-                assert max(abs(rates[motor_key])) <= self.limits['rotatum'], 'Trace rotatum (d_torque/dt) of '+str(max(abs(rates[motor_key])))+' Nm/s exceeds system limits'
+                assert max(abs(rates[motor_key])) <= limits['rotatum'], motor_key+' trace rotatum (d_torque/dt) of '+str(max(abs(rates[motor_key])))+' Nm/s exceeds its limit of '+str(limits['rotatum'])
+                if motor == 'output':
+                    reaction = reaction_torque_issue(max_abs_test_torque, self.limits)
+                    assert reaction is None, 'output_motor trace torque '+str(reaction)
 
-                
+
             if self.settings[motor_key]['control_mode'] == 'velocity':
                 max_abs_test_velocity = max(abs(self.trace[f"{motor_key}_velocity"][:]))
-                limit_val = self.limits['velocity']
+                limit_val = limits['velocity']
                 #assert max_abs_test_velocity <= limit_val, f'Max trace velocity of {max_abs_test_velocity} exceeds system limit of {limit_val}'
-                assert max(abs(rates[motor_key])) <= self.limits['acceleration'], 'Trace acceleration of '+str(max(abs(rates[motor_key])) )+' exceeds system limits'
+                assert max(abs(rates[motor_key])) <= limits['acceleration'], motor_key+' trace acceleration of '+str(max(abs(rates[motor_key])) )+' exceeds its limit of '+str(limits['acceleration'])
                 assert self.trace[f"{motor_key}_velocity"][len(self.trace['time'])-1] == 0, 'Velocity trace must end at 0'
 
             if self.settings[motor_key]['control_mode'] == 'position':
-                assert max(abs(rates[motor_key]))  <= self.limits['velocity'], 'Trace velocity of '+str(max(abs(rates[motor_key])))+' exceeds system limits'
+                assert max(abs(rates[motor_key]))  <= limits['velocity'], motor_key+' trace velocity of '+str(max(abs(rates[motor_key])))+' exceeds its limit of '+str(limits['velocity'])
 
                 # Corner check: a slope change between adjacent keyframes is a
                 # velocity step the position loop absorbs in ~one cycle -- an
@@ -122,7 +134,7 @@ class TestTrace:
                 corner_dt = 0.05  # [s] matches test_builder.CORNER_DT
                 slopes = np.asarray(rates[motor_key], dtype=float)
                 corner_steps = np.abs(np.diff(slopes))
-                step_limit = self.limits['acceleration'] * corner_dt
+                step_limit = limits['acceleration'] * corner_dt
                 if corner_steps.size and corner_steps.max() > step_limit:
                     worst = int(np.argmax(corner_steps))
                     print(f"WARNING: {motor_key} position trace has a corner velocity step of "
@@ -208,21 +220,23 @@ class GridSearch:
         # Apply scaling to the trace, if present
         if self.settings.get('use_relative_command', False):
             if self.input_mode in ['velocity', 'torque']:
-                self.settings['input_motor']['command_list'] = [command * self.limits[self.input_mode] for command in self.settings['input_motor']['command_list']]
+                self.settings['input_motor']['command_list'] = [command * self.limits['input'][self.input_mode] for command in self.settings['input_motor']['command_list']]
 
             if self.output_mode in ['velocity', 'torque']:
-                self.settings['output_motor']['command_list'] = [command * self.limits[self.output_mode] for command in self.settings['output_motor']['command_list']]
+                self.settings['output_motor']['command_list'] = [command * self.limits['output'][self.output_mode] for command in self.settings['output_motor']['command_list']]
 
         with open(f"{dyno_paths.dyno_config_directory}/master_config.yaml", 'r') as f:
             master_params = yaml.safe_load(f)
 
+        # Each axis ramps at a fraction of the rating of the motor that drives
+        # it; the asserts below establish that exactly one motor holds each mode.
         self.rate_limits = {}
-        for motor_key in ['input_motor', 'output_motor']:
-            control_mode = self.settings[motor_key]['control_mode']
+        for motor in ['input', 'output']:
+            control_mode = self.settings[f'{motor}_motor']['control_mode']
             if control_mode == 'torque':
-                self.rate_limits['torque'] = self.settings['transition_rate'] * self.limits['rotatum']
+                self.rate_limits['torque'] = self.settings['transition_rate'] * self.limits[motor]['rotatum']
             if control_mode == 'velocity':
-                self.rate_limits['velocity'] = self.settings['transition_rate'] * self.limits['acceleration']
+                self.rate_limits['velocity'] = self.settings['transition_rate'] * self.limits[motor]['acceleration']
 
         self.timestep = master_params['cycle_time_us'] / 1e6 # Convert microseconds to seconds
 
@@ -241,13 +255,18 @@ class GridSearch:
         elif self.output_mode == 'torque':
             self.t_limit = 110
 
-        for motor_key in ['input_motor', 'output_motor']:
+        for motor in ['input', 'output']:
+            motor_key = f'{motor}_motor'
+            peak = max(abs(np.array(self.settings[motor_key]['command_list'])))
             if self.settings[motor_key]['control_mode'] == 'torque':
-                assert max(abs(np.array(self.settings[motor_key]['command_list']))) <= self.limits['torque'], 'Max commanded '+motor_key+' torque exceeds system limits'
+                assert peak <= self.limits[motor]['torque'], 'Max commanded '+motor_key+' torque of '+str(peak)+' exceeds its limit of '+str(self.limits[motor]['torque'])
+                if motor == 'output':
+                    reaction = reaction_torque_issue(peak, self.limits)
+                    assert reaction is None, 'Commanded output_motor torque '+str(reaction)
 
-        
+
             if self.settings[motor_key]['control_mode'] == 'velocity':
-                assert max(abs(np.array(self.settings[motor_key]['command_list']))) <= self.limits['velocity'], 'Max commanded '+motor_key+' velocity exceeds system limits'
+                assert peak <= self.limits[motor]['velocity'], 'Max commanded '+motor_key+' velocity of '+str(peak)+' exceeds its limit of '+str(self.limits[motor]['velocity'])
 
         assert set(self.settings['loop_order']) == set([self.input_mode, self.output_mode]), 'Provided input/output control modes do not match with given loop order keys'
         assert set([self.output_mode, self.input_mode]) == set(['velocity', 'torque']), 'The grid search behavior should only be used with velocity and torque control modes'

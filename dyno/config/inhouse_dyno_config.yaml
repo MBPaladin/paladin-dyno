@@ -14,6 +14,11 @@
 # DUT is enumerated, read and logged, but never enabled or commanded.
 # Remove this (or set false) only once the DUT drive is commissioned AND its
 # motor and coupling are fitted - start_test enables both drives without it.
+#
+# It also relaxes the reaction-torque check: with no coupling fitted, the load
+# motor's torque is not reacted into the DUT, so LOAD may be commanded to its
+# full 200 Nm. Clearing this flag re-arms that check and caps output torque at
+# DUT.torque x DUT.gear_ratio = 25 Nm until the DUT derate below is raised.
 load_only: true
 
 # --- 1. SENSOR CONFIGURATION ---
@@ -121,13 +126,13 @@ expected_slave_layout:
         kt: 5.3
         k_tanh: 0.025
       motor_limits:
-        torque: 10
+        torque: 200
         continuous_torque: 4
         velocity: 50
         acceleration: 20 # Rad/s^2
         rotatum: 400 # Nm/s
       drive_params:
-        i_cont: 8
+        i_cont: 15
 
 # Measured values over these limits stop the test.
 #
@@ -141,10 +146,21 @@ expected_slave_layout:
 # never > limit - so a failed/disconnected RTD reads NaN and silently disables
 # this check rather than tripping it.
 safeties:
-  output_torque: { source: devices.adc_1.load_torque, limit: 50 } # Nm, derated for bringup
+  output_torque: { source: devices.adc_1.load_torque, limit: 200 } # Nm, derated for bringup
   output_velocity: { source: devices.LOAD.velocity, limit: 60 } # rad/s, derated for bringup
   input_velocity: { source: devices.DUT.velocity, limit: 100 } # rad/s, catches a back-driven DUT
   load_stator_temp: { source: devices.rtd_module.load_stator_temp, limit: 100 } # C
+
+# Torque cell tare: the GUI's Tare button averages each listed cell at rest and
+# applies the negated mean as a session zero, on top of (never merged into) the
+# sensors' config `offset`. The bias is recorded in the log's `tare` attribute
+# and in the run's setup report. Note that taring shifts the torque safeties
+# above with it, since they read the same corrected value.
+tare:
+  duration_s: 3.0        # averaging window; long enough to average out thermal/mains wander
+  sensors: [load_torque, input_torque]
+  max_velocity: 0.05     # rad/s, tare is refused/aborted if either machine turns faster
+  warn_frac_fs: 0.02     # bias above 2% of a cell's fs_pos is called out as suspicious
 
 gui_params: # defines length and resolution of the plots
   window_length_s: 30

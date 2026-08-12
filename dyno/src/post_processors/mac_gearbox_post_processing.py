@@ -13,6 +13,7 @@ Run with the anaconda base interpreter:
 """
 
 import os
+import sys
 import glob
 import json
 import shutil
@@ -26,11 +27,36 @@ import matplotlib.pyplot as plt
 
 # --- Paths ------------------------------------------------------------------
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# This module is run as a script (see the header), so only its own directory is
+# on the path -- the repo root has to be added before dyno.src imports resolve.
+REPO_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, '..', '..', '..'))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+
+from dyno.src import setup_summary  # noqa: E402  (needs REPO_ROOT on the path)
+
 GEARBOX_TESTS_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, '..', 'logs', 'brian_tests', 'gearbox_tests'))
 RESULTS_DIR = os.path.join(GEARBOX_TESTS_DIR, 'results')
 
 # --- Tunables ---------------------------------------------------------------
+# --- Machine constants -------------------------------------------------------
+# Values that describe the RIG (rather than the analysis) are recorded in every
+# log's resolved_config attribute. Reading them from the log is what stops this
+# analysis going stale when the hardware changes -- see resolve_gear_ratio.
+#
+# It is deliberately not automatic. `gear_ratio` in the dyno config is
+# documented as "approximate, used for feed forward torque commands / safeties"
+# -- sized for control margin, not analysis -- and gearbox_dyno_config.yaml
+# currently reads 31 where this analysis has always used 26. That is a 19%
+# difference, and it would move every efficiency, stiffness and drag number in
+# the report. So the constant below stays authoritative, and the log's value is
+# read, reported, and checked against it. Flip PREFER_LOG_GEAR_RATIO once the
+# config field is curated to an analysis-grade number.
 GEAR_RATIO = 26                  # input:output reduction ratio
+PREFER_LOG_GEAR_RATIO = False    # True -> the value in the log wins outright
+GEAR_RATIO_TOLERANCE = 0.01      # relative disagreement worth complaining about
+GEAR_RATIO_SOURCE = 'module constant'  # set by resolve_gear_ratio; goes in every summary
 BACKLASH_FILE_STEM = 'backlash2'  # which gearbox backlash file to run
 TARE_TORQUE_CMD_THRESH = 0.005   # |dut_torque_command| below this = "no torque" (tare)
 TARE_MIN_DUR_S = 0.5             # min duration of a sustained zero-torque window
@@ -111,6 +137,73 @@ def _linfit(x, y):
     ss_tot = float(np.sum((y - np.mean(y)) ** 2))
     r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float('nan')
     return float(slope), float(intercept), r2
+
+
+def resolve_gear_ratio(filepaths):
+    """Reconcile the gear ratio this analysis uses against what the logs say the
+    rig actually was, and report the outcome loudly enough that nobody reads a
+    number out of this report without knowing where its ratio came from.
+
+    Sets the module-level GEAR_RATIO / GEAR_RATIO_SOURCE once, at the top of a
+    run, rather than threading a parameter through the fourteen places the ratio
+    is used. Every summary records GEAR_RATIO_SOURCE alongside the value.
+
+    Three things can happen, all of them announced:
+      - no log carries a resolved_config (logs predating it): keep the module
+        constant, say so.
+      - logs agree with the constant: keep it, confirmed against the rig.
+      - logs disagree: complain, print both, and state which one is in use.
+        PREFER_LOG_GEAR_RATIO decides; it defaults to the constant because the
+        config's ratio is documented as approximate (see the constant block)."""
+    global GEAR_RATIO, GEAR_RATIO_SOURCE
+
+    found = {}  # ratio -> [filenames]
+    for path in filepaths:
+        resolved = setup_summary.read_resolved(path)
+        ratio = setup_summary.device_param(resolved, 'DUT', 'gear_ratio')
+        if isinstance(ratio, (int, float)):
+            found.setdefault(float(ratio), []).append(os.path.basename(path))
+
+    print('\n--- gear ratio ---')
+    if not found:
+        GEAR_RATIO_SOURCE = 'module constant (no resolved_config in these logs)'
+        print(f'  Using {GEAR_RATIO}:1 from the module constant -- none of these '
+              'logs carry a resolved_config to check it against.')
+        return GEAR_RATIO
+
+    if len(found) > 1:
+        # Mixed rigs in one results folder: no single ratio is right for all of
+        # them, so refuse to pick one silently.
+        print('  WARNING: these logs do not agree on the rig gear ratio:')
+        for ratio, names in sorted(found.items()):
+            print(f'    {ratio:g}:1 <- {", ".join(names)}')
+        GEAR_RATIO_SOURCE = (f'module constant (logs disagreed: '
+                             f'{", ".join(f"{r:g}" for r in sorted(found))})')
+        print(f'  Using {GEAR_RATIO}:1 from the module constant. Split these '
+              'logs by rig, or reconcile the configs, before trusting the '
+              'combined report.')
+        return GEAR_RATIO
+
+    logged = next(iter(found))
+    if abs(logged - GEAR_RATIO) <= GEAR_RATIO_TOLERANCE * max(abs(GEAR_RATIO), 1):
+        GEAR_RATIO_SOURCE = f'log resolved_config (confirms module constant {GEAR_RATIO})'
+        print(f'  Using {GEAR_RATIO}:1 -- confirmed by the logs\' recorded config.')
+        return GEAR_RATIO
+
+    print(f'  WARNING: the logs say the rig ran at {logged:g}:1, but this '
+          f'analysis is written around {GEAR_RATIO:g}:1.')
+    print('    The config field is documented as approximate (feed forward and '
+          'safeties), so it may not be an analysis-grade number -- but one of '
+          'the two is wrong and it is worth finding out which.')
+    if PREFER_LOG_GEAR_RATIO:
+        GEAR_RATIO = logged
+        GEAR_RATIO_SOURCE = f'log resolved_config (overrode module constant)'
+        print(f'    PREFER_LOG_GEAR_RATIO is set: using {GEAR_RATIO:g}:1 from the log.')
+    else:
+        GEAR_RATIO_SOURCE = (f'module constant (log said {logged:g}, not used; '
+                             'set PREFER_LOG_GEAR_RATIO to switch)')
+        print(f'    Using {GEAR_RATIO:g}:1 from the module constant.')
+    return GEAR_RATIO
 
 
 def reset_results_dir():
@@ -350,6 +443,7 @@ def analyze_backlash(filepath):
         'source_file': os.path.basename(filepath),
         'analysis': 'Gearbox backlash + torsional stiffness via loaded-flank fits; per-sample tared, first sweep + doubled sweep dropped',
         'gear_ratio': GEAR_RATIO,
+        'gear_ratio_source': GEAR_RATIO_SOURCE,
         'n_samples_total': n_samples,
         'n_samples_used': len(used),
         'dropped_samples': sorted(drop),
@@ -619,6 +713,7 @@ def analyze_efficiency(filepaths, input_torque_zero=0.0, auto_zero=False):
     return write_summary(name, {
         'analysis': 'Gearbox efficiency map from pooled velocity x torque sweep; mean & median per-dwell',
         'gear_ratio': GEAR_RATIO,
+        'gear_ratio_source': GEAR_RATIO_SOURCE,
         'n_files': len(filepaths),
         'n_setpoints_total': len(pts),
         'n_unique_cells': len(cells),
@@ -1357,6 +1452,7 @@ def compare_stiction(results):
         'analysis': 'Motor-vs-gearbox stiction; gearbox = inline torque cell at the shaft (direct, '
                     'motor friction already excluded). Motor = free-motor Kt*current.',
         'gear_ratio': GEAR_RATIO,
+        'gear_ratio_source': GEAR_RATIO_SOURCE,
         'motor_stiction_Nm': m,
         'motor_stiction_std_Nm': m_std,
         'gearbox_input_stiction_at_input_Nm': gb_input_at_input,
@@ -1628,6 +1724,11 @@ def find_file(*needles):
 
 def main():
     reset_results_dir()
+
+    # Reconcile rig constants against the logs before any analysis runs, so
+    # every number below is produced with a ratio whose origin is on the record.
+    resolve_gear_ratio(sorted(glob.glob(os.path.join(GEARBOX_TESTS_DIR, '*.hdf5'))))
+
     combined = {}
 
     bl_path = find_file(BACKLASH_FILE_STEM)

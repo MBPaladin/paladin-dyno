@@ -110,6 +110,77 @@ def _flatten(node, prefix, out):
         out[prefix] = node
 
 
+# --- Reading a resolved config back ------------------------------------------
+# Every log carries the configuration it ran under. These are the accessors for
+# getting at it, so analysis can ask the log what the machine was instead of
+# hardcoding constants that silently go stale when the rig changes.
+
+def read_resolved(source):
+    """The resolved config recorded in a log. `source` is an open h5py File or
+    a path to one.
+
+    Returns None when the log has no resolved_config attribute -- logs predate
+    it, and those are still worth analysing -- so every caller must handle the
+    None and say what it fell back to."""
+    if isinstance(source, h5py.File):
+        return _resolved_from_h5(source)
+    try:
+        with h5py.File(source, 'r') as f:
+            return _resolved_from_h5(f)
+    except (OSError, KeyError):
+        return None
+
+
+def _resolved_from_h5(h5file):
+    raw = h5file.attrs.get('resolved_config')
+    if raw is None:
+        return None
+    if isinstance(raw, bytes):
+        raw = raw.decode('utf-8', 'replace')
+    try:
+        return json.loads(raw)
+    except ValueError:
+        return None
+
+
+def iter_sensors(resolved):
+    """Every sensor channel in a resolved config, as
+    (sensor_name, device_name, device_class, channel, channel_params).
+
+    Sensors are not top-level entries: master.py routes each one into its host
+    ADC/RTD module's params under the channel it is wired to, stamping the yaml
+    key on as 'name'. Anything looking up a sensor BY NAME has to walk that
+    structure, so it is written once, here."""
+    for device_name, entry in (resolved or {}).get('devices', {}).items():
+        params = entry.get('params') or {}
+        if not _looks_like_channels(params):
+            continue
+        for channel, channel_params in sorted(params.items()):
+            name = channel_params.get('name') or f'{device_name} {channel}'
+            yield (name, device_name, entry.get('class', '?'), channel,
+                   channel_params)
+
+
+def device_param(resolved, device_name, dotted_key, default=None):
+    """A single device parameter, e.g. device_param(cfg, 'DUT', 'gear_ratio')."""
+    entry = (resolved or {}).get('devices', {}).get(device_name) or {}
+    node = entry.get('params') or {}
+    for part in dotted_key.split('.'):
+        if not isinstance(node, dict) or part not in node:
+            return default
+        node = node[part]
+    return node
+
+
+def sensor_param(resolved, sensor_name, key, default=None):
+    """A single sensor channel parameter, by the sensor's config name, e.g.
+    sensor_param(cfg, 'load_torque', 'fs_pos')."""
+    for name, _device, _klass, _channel, params in iter_sensors(resolved):
+        if name == sensor_name:
+            return params.get(key, default)
+    return default
+
+
 def _fmt(value):
     """Format a value for a reader who is not going to enjoy `True` or
     `1e-05`."""
@@ -146,19 +217,8 @@ def build_rows(resolved):
         klass = entry.get('class', '?')
         params = entry.get('params') or {}
         provenance = entry.get('provenance') or {}
-        if not params:
-            continue
-
-        if _looks_like_channels(params):
-            for channel, channel_params in sorted(params.items()):
-                # master.py stamps the yaml key onto every sensor config as
-                # 'name' before routing it to the module.
-                label = channel_params.get('name') or f'{device_name} {channel}'
-                source = f'{config_file} -> sensors.{label}'
-                for key in sorted(k for k in channel_params if k != 'name'):
-                    units, desc = _info(key)
-                    sensors.append((label, f'{klass} {channel}', key,
-                                    _fmt(channel_params[key]), units, desc, source))
+        # Sensor modules are handled below, by name, via iter_sensors.
+        if not params or _looks_like_channels(params):
             continue
 
         flat = {}
@@ -169,7 +229,71 @@ def build_rows(resolved):
             bucket.append((device_name, klass, key, _fmt(flat[key]), units, desc,
                            _source_label(provenance.get(key, ''), config_file)))
 
+    for label, _device, klass, channel, channel_params in iter_sensors(resolved):
+        source = f'{config_file} -> sensors.{label}'
+        for key in sorted(k for k in channel_params if k != 'name'):
+            units, desc = _info(key)
+            sensors.append((label, f'{klass} {channel}', key,
+                            _fmt(channel_params[key]), units, desc, source))
+
     return drives + sensors + other
+
+
+def _tare_lines(meta):
+    """The session tare, if one was applied.
+
+    Reported right next to the setup because it shifts every torque number in
+    the log, and because anyone comparing two runs needs to know whether the
+    zero moved between them. The spread and sample count come along with the
+    bias: a mean taken over a noisy window is an average of the disturbance,
+    not a zero, and only the numbers next to it show that."""
+    tare = (meta or {}).get('tare') or {}
+    if not tare:
+        return []
+
+    lines = ['', 'Session tare -- applied to every reading in this log:']
+    for sensor in sorted(tare):
+        record = tare[sensor] or {}
+        bias = record.get('bias')
+        bias_text = f'{bias:+.6g}' if isinstance(bias, (int, float)) else str(bias)
+        notes = []
+        if record.get('frac_fs') is not None:
+            notes.append(f"{100 * record['frac_fs']:.2f}% of full scale")
+        if record.get('stddev') is not None:
+            notes.append(f"sd {record['stddev']:.4g}")
+        if record.get('samples'):
+            notes.append(f"n={record['samples']}")
+        if record.get('at'):
+            notes.append(f"at {record['at']}")
+        lines.append(f"    {sensor:<18}{bias_text:>12}   ({', '.join(notes)})")
+    return lines
+
+
+def _stop_reason_lines(meta):
+    """How the run ended, stated at the top.
+
+    An aborted run and a completed one produce the same-looking trace -- the
+    breaching sample is never logged, so an abort ends healthy, just under the
+    limit, mid-command. Anyone reading the data has to be told which one they
+    have before they read anything into where it stops.
+
+    Absence is not success: a log with no stop_reason predates this being
+    recorded, and says so rather than claiming a clean finish."""
+    reason = (meta or {}).get('stop_reason') or {}
+    if not reason:
+        return []
+
+    kind = reason.get('kind')
+    detail = reason.get('detail') or kind or 'unknown'
+    if kind in ('completed', 'operator'):
+        return ['', f'Run ended: {detail}']
+
+    lines = ['', f'*** RUN ABORTED: {detail} ***']
+    at = reason.get('at_s')
+    if isinstance(at, (int, float)):
+        lines.append(f'    Tripped just after t = {at:.4f} s; the sample that '
+                     'breached it is NOT in the data below.')
+    return lines
 
 
 def build_overview(resolved, meta=None, in_hdf5=False):
@@ -192,6 +316,16 @@ def build_overview(resolved, meta=None, in_hdf5=False):
     for label, value in header:
         if value not in (None, ''):
             lines.append(f'{label + ":":<20}{value}')
+
+    # Anything the Logger could not vouch for goes at the top, above the
+    # parameter tables it casts doubt on -- a reader who trusts the numbers
+    # below has to get past this first.
+    warning = meta.get('config_warning')
+    if warning:
+        lines += ['', f'*** WARNING: {warning} ***']
+
+    lines += _stop_reason_lines(meta)
+    lines += _tare_lines(meta)
 
     # Everything present on the bus but carrying no parameters -- worth
     # recording that it was there, not worth four table rows each.

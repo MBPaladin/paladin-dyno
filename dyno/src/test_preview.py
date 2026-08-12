@@ -44,8 +44,19 @@ MAX_CYCLES = 2_000_000
 _TRACE_HOLD_CYCLES = 250
 
 
+# Rig-config slave name for each motor of the command stream.
+MOTOR_SLAVES = {'input': 'DUT', 'output': 'LOAD'}
+
+
 def limits_from_config(mode):
     """Recompute the controller's safety-limit dict from a rig config file.
+
+    Returns per-motor limits, keyed by the command stream's motor names:
+    ``{'input': {torque, velocity, acceleration, rotatum, gear_ratio},
+    'output': {...}}``. A command is checked against the motor it is actually
+    sent to, so a derated DUT no longer caps what the load motor may be
+    commanded to do. `gear_ratio` carries the shaft coupling that
+    `test_builder.reaction_torque_issue` needs.
 
     Mirrors `dyno_controller._get_limits` so preview can validate and apply
     relative scaling without hardware attached. For devices that read their true
@@ -55,19 +66,41 @@ def limits_from_config(mode):
     with open(f"{dyno_paths.dyno_config_directory}/{mode}_dyno_config.yaml") as f:
         cfg = yaml.safe_load(f)
 
-    motor_limits = {}
+    params = {}
     for slave in cfg.get('expected_slave_layout', []):
-        if slave.get('name') in ('DUT', 'LOAD'):
-            motor_limits[slave['name']] = slave.get('params', {}).get('motor_limits', {})
+        if slave.get('name') in MOTOR_SLAVES.values():
+            params[slave['name']] = slave.get('params', {})
 
-    dut = motor_limits.get('DUT', {})
-    load = motor_limits.get('LOAD', {})
-    return {
-        'torque': min(abs(dut['torque']), abs(load['torque'])),
-        'velocity': min(abs(dut['velocity']), abs(load['velocity'])),
-        'acceleration': abs(load['acceleration']),
-        'rotatum': min(abs(load['rotatum']), abs(dut['torque']) * 4),
-    }
+    def resolve(motor):
+        own = params.get(MOTOR_SLAVES[motor], {}).get('motor_limits', {})
+        other = params.get(MOTOR_SLAVES['output' if motor == 'input'
+                                        else 'input'], {}).get('motor_limits', {})
+        for key in ('torque', 'velocity'):
+            if key not in own:
+                raise KeyError(f'{mode}_dyno_config.yaml: '
+                               f'{MOTOR_SLAVES[motor]} motor_limits.{key} is required')
+        # acceleration and rotatum are optional in configs whose DUT reads its
+        # real ratings from the drive over SDO (see AKD.__init__ + absorbers.yaml).
+        # Stand in with the other motor's acceleration and the 4x-peak-torque
+        # convention the absorber entries use, matching what the previous
+        # rig-wide dict derived for those rigs.
+        accel = own.get('acceleration', other.get('acceleration'))
+        if accel is None:
+            raise KeyError(f'{mode}_dyno_config.yaml: no motor_limits.acceleration '
+                           f'on {MOTOR_SLAVES[motor]} or the opposing motor')
+        return {
+            'torque': abs(own['torque']),
+            'velocity': abs(own['velocity']),
+            'acceleration': abs(accel),
+            'rotatum': abs(own.get('rotatum', own['torque'] * 4)),
+            'gear_ratio': abs(params.get(MOTOR_SLAVES[motor], {}).get('gear_ratio', 1)),
+        }
+
+    limits = {motor: resolve(motor) for motor in MOTOR_SLAVES}
+    # load_only means the DUT side has no motor or coupling fitted, so the load
+    # motor's torque is not reacted anywhere. See reaction_torque_issue.
+    limits['coupled'] = not cfg.get('load_only', False)
+    return limits
 
 
 def continuous_torque_from_config(mode):
