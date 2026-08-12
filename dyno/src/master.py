@@ -261,13 +261,71 @@ class Master:
             self.shutdown = True
 
         # --- 5. Shutdown ---
+        # Order matters here. The drives have to be walked to Switch on Disabled
+        # while process data is still cycling, then the chain goes to INIT, and
+        # only then does the socket close. Doing it the other way round leaves
+        # each AKD holding the last controlword it ever saw, which overrides a
+        # service-channel enable and is what makes Workbench refuse to enable
+        # the axis after a run.
+        self._release_drives()
+
         self.in_op = False
-        self._master.state = pysoem.INIT_STATE
-        self._master.write_state()
         self._pd_thread_stop_event.set()
         self._ch_thread_stop_event.set()
         control_thread.join()
+
+        # Confirm INIT rather than assuming it: write_state() is a single
+        # broadcast datagram with nobody checking the result, and a chain left
+        # above INIT keeps CoE - and with it the DS402 state machine - alive.
+        self._master.state = pysoem.INIT_STATE
+        self._master.write_state()
+        if self._master.state_check(pysoem.INIT_STATE, timeout=500_000) != pysoem.INIT_STATE:
+            print('WARNING: chain did not reach INIT. CoE may still be live, '
+                  'which can block Workbench from enabling the axis. Run '
+                  './dyno/utilities/release_drives.sh to clear it.')
         self._master.close()
+
+    def _release_drives(self, timeout_s=2.0):
+        '''Walk every DS402 drive to Switch on Disabled before PDOs stop.
+
+        Must run while the cyclic thread is still exchanging process data: the
+        controlword only reaches the drive in the PDO frame, so once that thread
+        stops, whatever the drive last saw is latched there until it is power
+        cycled. Duck-typed on `released` so only drives with a DS402 handover
+        state participate - the AXON and RB430 have their own shutdown handling.
+        '''
+        drives = [(name, device) for name, device in vars(self.devices).items()
+                  if hasattr(device, 'released')]
+        if not drives:
+            return
+
+        for _name, device in drives:
+            device.shutdown = True
+
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if all(device.released for _name, device in drives):
+                break
+            time.sleep(0.01)
+
+        stuck = ', '.join(name for name, device in drives if not device.released)
+        if stuck:
+            print(f'WARNING: {stuck} did not reach Switch on Disabled within '
+                  f'{timeout_s}s. Workbench may refuse to enable the axis; run '
+                  f'./dyno/utilities/release_drives.sh to clear it.')
+            return
+
+        # Faulted drives are released (controlword parked at 0x0000, power stage
+        # off) but not reset - see AKD.released. Say which, so a fault that was
+        # expected reads as expected and one that was not gets looked at.
+        faulted = ', '.join(name for name, device in drives
+                            if device.state == 'fault')
+        if faulted:
+            print(f'Drives released. {faulted} left in Fault (disabled, '
+                  f'controlword 0x0000); clear the fault in Workbench, or run '
+                  f'./dyno/utilities/release_drives.sh --clear-faults.')
+        else:
+            print('All drives released to Switch on Disabled')
 
     @staticmethod
     def _check_slave(slave, pos):

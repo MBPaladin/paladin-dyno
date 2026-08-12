@@ -4,4 +4,4 @@ set -e
 # resolves and `dyno.src.*` imports work.
 cd "$(dirname "$0")/../.."
 exec env PYTHONPATH="$PWD" PYTHONUNBUFFERED=1 \
-  .venv/bin/python dyno/src/bus_scan.py "$@"
+  .venv/bin/python dyno/src/release_drives.py "$@"

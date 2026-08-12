@@ -672,6 +672,15 @@ def akd_pdo_profile(params=None):
     return profile
 
 
+# Per-cycle trace of the DS402 handshake during a mode change. This runs inside
+# the 1 kHz process-data loop, so it is off unless asked for: a print per cycle
+# is ~30 lines per mode change of console noise and a blocking stdout write in
+# the middle of a real-time cycle. The state transitions themselves are still
+# announced unconditionally (once each, in update_modes), which is what an
+# operator actually reads; this is for debugging a switch that never completes.
+AKD_TRACE_MODE_SWITCH = bool(os.environ.get('DYNO_TRACE_MODE_SWITCH'))
+
+
 class AKD:
     def __init__(self, slave, name, params):
         self._slave = slave
@@ -740,6 +749,10 @@ class AKD:
 
         self.state = None
         self.sw_enable = False
+        # Set by the controller and by Master._release_drives on the way out.
+        # Unlike sw_enable, which parks the drive at Ready to Switch On, this
+        # carries it all the way to Switch on Disabled - see update_modes.
+        self.shutdown = False
 
         self.position_unwrapper = Unwrapper(fs_counts=2**32)
 
@@ -792,6 +805,29 @@ class AKD:
                   f"not map {field} - this command is discarded and the drive "
                   f"will not follow it.")
 
+    @property
+    def released(self):
+        '''True once the drive is parked where Workbench can take it back.
+
+        Switch on Disabled is the handover state: anywhere else the drive keeps
+        statusword bit 9 ('remote') set and overrides a service-channel enable
+        from its latched controlword, which is what leaves the axis refusing to
+        enable in Workbench after a run.
+
+        Fault counts as released too. Fault -> Switch on Disabled is DS402
+        transition 15, which only happens on a fault reset, and a drive that is
+        expected to fault (a DUT under test) would otherwise hold up every
+        shutdown until the timeout. Clearing it here would also throw away the
+        one piece of evidence the operator came for. What matters for the
+        handover is the *controlword* the drive latches, and update_modes parks
+        that at 0x0000 in fault once shutdown is set - so the axis is left
+        disabled, with only the fault itself for Workbench to reset. Hence the
+        shutdown qualifier: a drive sitting in Fault mid-run is not released,
+        it is still holding whatever controlword it last saw.
+        '''
+        return (self.state == 'sw_on_disable'
+                or (self.state == 'fault' and self.shutdown))
+
     #This method cycles the servo drive through the operating and control modes
     def update_modes(self):
         sw = self._tx_pdo.statusword
@@ -837,8 +873,9 @@ class AKD:
             self.state = 'undefined'
 
         if self.switching_modes:
-            print(self.name, self.state, self.target_mode, self.mode,
-                  f'sw=0x{sw:04X}')
+            if AKD_TRACE_MODE_SWITCH:
+                print(self.name, self.state, self.target_mode, self.mode,
+                      f'sw=0x{sw:04X}')
             if self.state == 'ready_to_sw_on': # only write _rx_pdo.control_mode when the drive is in the specific state. adjust the internal tracking of the operating mode
                 if self.target_mode == 'position':
                     self._rx_pdo.control_mode = 7
@@ -866,18 +903,34 @@ class AKD:
                 self.velocity_command = math.nan
                 self.position_command = math.nan
 
-        # Always try to maintain atleast "ready to switch on" state
-        if self.state in ['not_ready', 'sw_on_disable', 'undefined']:
+        # Always try to maintain atleast "ready to switch on" state - except on
+        # the way out, where Switch on Disabled is the destination and this
+        # would walk the drive straight back off it.
+        if self.state in ['not_ready', 'sw_on_disable', 'undefined'] and not self.shutdown:
             self._rx_pdo.controlword = 0x0006
 
         # State machine transitions to de-enable the drive when switching modes
-        if self.switching_modes or not self.sw_enable:
+        if self.switching_modes or not self.sw_enable or self.shutdown:
             if self.state == 'enabled':
                 self._rx_pdo.controlword = 0x0007
             elif self.state == 'sw_on':
                 self._rx_pdo.controlword = 0x0006
             elif self.state == 'ready_to_sw_on':
-                self._rx_pdo.controlword = 0x0006 # Maintain ready to switch on state
+                # Shutting down: carry on to Switch on Disabled. Reached by
+                # walking enabled -> 0x0007 -> 0x0006 -> 0x0000 rather than
+                # slamming 0x0000 from enabled, which would drop the power
+                # stage outright and let a loaded machine coast.
+                self._rx_pdo.controlword = 0x0000 if self.shutdown else 0x0006
+            elif self.state == 'fault' and self.shutdown:
+                # No branch above matches Fault, so without this the drive
+                # latches whatever controlword it last saw - and for a drive
+                # that faulted before it was ever enabled that is the 0x00FF
+                # from __init__: fault reset PLUS Enable Operation. Leaving
+                # that latched is the worst possible handover value. Bit 7 is
+                # stuck high, so Workbench's fault reset has no rising edge to
+                # act on, and if the fault does clear the drive is holding a
+                # standing enable request. 0x0000 (Disable Voltage) instead.
+                self._rx_pdo.controlword = 0x0000
 
         # State machine transitions to enable the servo drive
         elif self.sw_enable:
@@ -889,7 +942,7 @@ class AKD:
                 self._rx_pdo.controlword = 0x001F # Maintain enable command
 
         # Shutdown if unreccognizable state recieved
-        if self.state == 'undefined':
+        if self.state == 'undefined' and not self.shutdown:
             self._rx_pdo.controlword = 0x0006
 
         self.fault = self.STATE_BITS['fault']

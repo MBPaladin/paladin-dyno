@@ -92,25 +92,19 @@ class TestTrace:
         
         for motor_key in ['input_motor', 'output_motor']:
             if self.settings[motor_key]['control_mode'] == 'torque':
-                test_torque = self.trace[f"{motor_key}_torque"][:]
-                abs_test_torque = abs(test_torque)
-                max_abs_test_torque = max(abs_test_torque)
-                print(f"TORQUE: {max_abs_test_torque}")
+                max_abs_test_torque = max(abs(self.trace[f"{motor_key}_torque"][:]))
                 limit_val = self.limits['torque']
-                print(f"LIMIT: {limit_val}")
-                assert max(abs(self.trace[f"{motor_key}_torque"][:])) <= self.limits['torque'], 'Max trace torque exceeds system limits'
+                assert max_abs_test_torque <= limit_val, \
+                    (f'Max trace torque of {max_abs_test_torque} exceeds system '
+                     f'limit of {limit_val}')
                 assert self.trace[f"{motor_key}_torque"][len(self.trace['time'])-1] == 0, 'Torque trace must end at 0'
                 assert max(abs(rates[motor_key])) <= self.limits['rotatum'], 'Trace rotatum (d_torque/dt) of '+str(max(abs(rates[motor_key])))+' Nm/s exceeds system limits'
 
                 
             if self.settings[motor_key]['control_mode'] == 'velocity':
-                velocity = self.trace[f"{motor_key}_velocity"][:]
-                abs_test_velocity = abs(velocity)
-                max_abs_test_velocity = max(abs_test_velocity)
-                print(f"VELOCITY: {max_abs_test_velocity}")
+                max_abs_test_velocity = max(abs(self.trace[f"{motor_key}_velocity"][:]))
                 limit_val = self.limits['velocity']
-                print(f"LIMIT: {limit_val}")
-                #assert max(abs(self.trace[f"{motor_key}_velocity"][:])) <= self.limits['velocity'], 'Max trace velocity exceeds system limits'
+                #assert max_abs_test_velocity <= limit_val, f'Max trace velocity of {max_abs_test_velocity} exceeds system limit of {limit_val}'
                 assert max(abs(rates[motor_key])) <= self.limits['acceleration'], 'Trace acceleration of '+str(max(abs(rates[motor_key])) )+' exceeds system limits'
                 assert self.trace[f"{motor_key}_velocity"][len(self.trace['time'])-1] == 0, 'Velocity trace must end at 0'
 

@@ -93,6 +93,15 @@ class Controller(Master):
 
         self.run()
 
+        # The drives are released and the bus is closed, but this process still
+        # has to exit. By now the GUI is blocked in close_processes and nothing
+        # is draining telemetry, so the samples buffered in the queue's feeder
+        # thread have no reader: at exit that thread blocks writing to a full
+        # pipe and holds the process open until the parent gives up and kills
+        # it. The samples are worthless at this point - drop them.
+        if self._telemetry_queue is not None:
+            self._telemetry_queue.cancel_join_thread()
+
     def _stop_test(self):
         if not self.test_definition == None:
             self.test_definition.reset()
