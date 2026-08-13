@@ -28,6 +28,7 @@ Invariants matching TestTrace validation: every trace starts at (0,0,0),
 time strictly increases, and torque/velocity channels end at 0.
 """
 import hashlib
+import math
 import os
 import re
 
@@ -95,6 +96,58 @@ PATTERNS = {
 # Fallbacks mirroring the GridSearch hardcodes, used when the rig config has no
 # `motor_limits.continuous_torque` for the motor commanded in torque mode.
 GRID_CONT_TORQUE_FALLBACK = {'input': 4.0, 'output': 110.0}
+
+
+# --- level list generation --------------------------------------------------
+# Level lists are always stored literally (a plain list of floats); the
+# start/stop/n generator below is a convenience that writes into that list, not
+# a second representation of it. The UI keeps the generator's inputs alongside
+# the recipe under `levels_gen` purely so the boxes can be restored on reopen.
+
+LEVEL_DECIMALS = 2      # 0.01 rad / Nm / (rad/s) is finer than any test needs
+MAX_LEVEL_DECIMALS = 6  # widened only to keep a tight sweep's points distinct
+
+
+def _round_levels(values):
+    """Round to LEVEL_DECIMALS, widening only as far as needed to keep distinct
+    inputs distinct -- a log sweep through small magnitudes would otherwise
+    collapse several points onto the same value."""
+    distinct = len(set(values))
+    for decimals in range(LEVEL_DECIMALS, MAX_LEVEL_DECIMALS + 1):
+        rounded = [round(v, decimals) for v in values]
+        if len(set(rounded)) == distinct:
+            break
+    return [0.0 if r == 0 else r for r in rounded]  # normalize -0.0
+
+
+def generate_levels(start, stop, n, spacing='linear', mirror=False):
+    """`n` levels from `start` to `stop`, rounded to LEVEL_DECIMALS.
+
+    `spacing` is 'linear' or 'log' (log needs both endpoints non-zero and of
+    the same sign). `mirror` appends the descending sweep back to `start`
+    without repeating the turnaround point, so hysteresis shows up in one run.
+    """
+    n = int(n)
+    if n < 1:
+        raise ValueError('Number of levels must be at least 1')
+    if n == 1:
+        levels = _round_levels([float(start)])
+    elif spacing == 'linear':
+        levels = _round_levels([start + (stop - start) * i / (n - 1)
+                                for i in range(n)])
+    elif spacing == 'log':
+        if start == 0 or stop == 0 or start * stop < 0:
+            raise ValueError('Log spacing needs start and stop non-zero '
+                             'and of the same sign')
+        sign = math.copysign(1.0, start)
+        lo, hi = math.log(abs(start)), math.log(abs(stop))
+        levels = _round_levels([sign * math.exp(lo + (hi - lo) * i / (n - 1))
+                                for i in range(n)])
+    else:
+        raise ValueError(f'Unknown level spacing: {spacing}')
+    if mirror and len(levels) > 1:
+        levels = levels + levels[-2::-1]
+    return levels
 
 
 def is_gridpoint(segment):

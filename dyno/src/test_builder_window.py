@@ -21,10 +21,11 @@ import os
 import numpy as np
 import pyqtgraph as pg
 from PySide6.QtCore import Qt, QThread, Signal
-from PySide6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox,
-                               QFileDialog, QFormLayout, QGroupBox,
-                               QHBoxLayout, QLabel, QLineEdit, QListWidget,
-                               QPushButton, QSpinBox, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QAbstractSpinBox, QCheckBox, QComboBox,
+                               QDoubleSpinBox, QFileDialog, QFormLayout,
+                               QGroupBox, QHBoxLayout, QLabel, QLineEdit,
+                               QListWidget, QPushButton, QSpinBox,
+                               QVBoxLayout, QWidget)
 
 from deployment import dyno_paths
 from dyno.src import test_builder, test_preview
@@ -63,6 +64,123 @@ _OUTPUT_PEN = pg.mkPen('#d62728', width=2)
 def _parse_levels(text):
     values = [v for v in (s.strip() for s in text.split(',')) if v]
     return [float(v) for v in values] or [0.0]
+
+
+class LevelsField(QWidget):
+    """A comma-separated level list with an inline start/stop/n generator.
+
+    The text is always the source of truth: Fill only writes into it, and
+    typing in it afterwards drops the stored generator spec -- so a saved
+    recipe can never advertise a generator that doesn't describe its levels.
+    The spec is kept alongside the recipe only to restore the boxes on reopen
+    (bump n, hit Fill again); nothing downstream reads it.
+    """
+    changed = Signal()
+    failed = Signal(str)
+
+    def __init__(self, label, tooltip=''):
+        super().__init__()
+        self._spec = None
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(2)
+
+        top = QHBoxLayout()
+        top.setContentsMargins(0, 0, 0, 0)
+        top.addWidget(QLabel(label))
+        self.edit = QLineEdit()
+        self.edit.setToolTip(tooltip)
+        top.addWidget(self.edit, stretch=1)
+        outer.addLayout(top)
+
+        gen = QHBoxLayout()
+        gen.setContentsMargins(0, 0, 0, 0)
+        gen.setSpacing(3)
+        self.start = self._gen_spin(0.0)
+        self.stop = self._gen_spin(10.0)
+        self.count = QSpinBox()
+        self.count.setRange(1, 1000)
+        self.count.setValue(5)
+        self.count.setFixedWidth(46)
+        self.count.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        self.spacing = QComboBox()
+        self.spacing.addItem('lin', 'linear')
+        self.spacing.addItem('log', 'log')
+        self.spacing.setFixedWidth(54)
+        self.mirror = QCheckBox()
+        self.mirror.setToolTip('Also sweep back down (…, 75, 50, 25, 0) '
+                               'without repeating the turnaround, so '
+                               'hysteresis shows up within one run.')
+        self.fill = QPushButton('Fill')
+        self.fill.setFixedWidth(38)
+        self.fill.setToolTip('Overwrite the list above with the generated '
+                             f'levels, rounded to '
+                             f'{test_builder.LEVEL_DECIMALS} decimals. '
+                             'Hand-edit them afterwards if you like.')
+        for widget in (self.start, QLabel('→'), self.stop, QLabel('n'),
+                       self.count, self.spacing, QLabel('↩'), self.mirror,
+                       self.fill):
+            gen.addWidget(widget)
+        gen.addStretch(1)
+        outer.addLayout(gen)
+
+        self.fill.clicked.connect(self._fill)
+        self.edit.textEdited.connect(self._on_manual_edit)
+        self.edit.editingFinished.connect(self.changed)
+
+    @staticmethod
+    def _gen_spin(value):
+        box = QDoubleSpinBox()
+        box.setRange(-1e9, 1e9)
+        box.setDecimals(test_builder.LEVEL_DECIMALS)
+        box.setValue(value)
+        box.setFixedWidth(68)
+        box.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        return box
+
+    def _fill(self):
+        try:
+            levels = test_builder.generate_levels(
+                self.start.value(), self.stop.value(), self.count.value(),
+                self.spacing.currentData(), self.mirror.isChecked())
+        except ValueError as e:
+            self.failed.emit(str(e))
+            return
+        self.edit.setText(', '.join(f'{v:g}' for v in levels))
+        self._spec = {'start': self.start.value(), 'stop': self.stop.value(),
+                      'n': self.count.value(),
+                      'spacing': self.spacing.currentData(),
+                      'mirror': self.mirror.isChecked()}
+        self.changed.emit()
+
+    def _on_manual_edit(self, _text):
+        self._spec = None  # the boxes no longer describe the list
+
+    # --- form <-> model ----------------------------------------------------
+
+    def text(self):
+        return self.edit.text()
+
+    def spec(self):
+        return dict(self._spec) if self._spec else None
+
+    def set_values(self, values, spec=None):
+        values = [float(v) for v in values]
+        self.edit.setText(', '.join(f'{v:g}' for v in values))
+        self._spec = dict(spec) if spec else None
+        if spec:
+            self.start.setValue(float(spec.get('start', 0.0)))
+            self.stop.setValue(float(spec.get('stop', 0.0)))
+            self.count.setValue(int(spec.get('n', 1)))
+            index = self.spacing.findData(spec.get('spacing', 'linear'))
+            self.spacing.setCurrentIndex(max(0, index))
+            self.mirror.setChecked(bool(spec.get('mirror')))
+        elif len(values) > 1:
+            # Hand-written list: seed the boxes from it so Fill is immediately
+            # useful for re-sampling the same span at a different resolution.
+            self.start.setValue(values[0])
+            self.stop.setValue(max(values, key=abs))
+            self.count.setValue(len(values))
 
 
 class TestBuilderWindow(QWidget):
@@ -153,44 +271,87 @@ class TestBuilderWindow(QWidget):
         # Middle: segment editor --------------------------------------------
         editor = QVBoxLayout()
 
-        roles = self.roles_box = QGroupBox('Motors')
-        roles_form = QFormLayout(roles)
-        self.primary_motor = QComboBox()
-        self.primary_motor.addItems(test_builder.MOTORS)
-        roles_form.addRow('Pattern motor', self.primary_motor)
-        self.primary_mode = QComboBox()
-        self.primary_mode.addItems(test_builder.MODES)
-        roles_form.addRow('Pattern control mode', self.primary_mode)
-        self.primary_accel = self._spin(0.001, 1e6,
-                                        test_builder.DEFAULT_POSITION_ACCEL)
-        self.primary_accel.setToolTip('Acceleration used to blend the corners '
-                                      'of position traces (both motors). '
-                                      'Ignored unless a motor is in position '
-                                      'mode.')
-        roles_form.addRow('Position blend accel [units/s²]', self.primary_accel)
-        self.secondary_mode = QComboBox()
-        self.secondary_mode.addItems(test_builder.MODES)
-        roles_form.addRow('Other motor control mode', self.secondary_mode)
-        self.levels_edit = QLineEdit()
-        self.levels_edit.setToolTip('Comma-separated setpoints for the other '
-                                    'motor; the pattern runs once per level. '
-                                    'Use a single 0 to hold it at zero.')
-        roles_form.addRow('Other motor levels', self.levels_edit)
-        self.sec_rate = self._spin(0.001, 1e6, 1.0)
-        roles_form.addRow('Level ramp rate [units/s]', self.sec_rate)
-        self.sec_settle = self._spin(0.0, 1e6, 1.0)
-        roles_form.addRow('Settle at level [s]', self.sec_settle)
-        editor.addWidget(roles)
-
-        pattern_box = self.pattern_box = QGroupBox('Pattern')
-        self.pattern_layout = QFormLayout(pattern_box)
-        self.pattern_combo = QComboBox()
-        self.pattern_combo.addItems(list(test_builder.PATTERNS))
-        self.pattern_layout.addRow('Type', self.pattern_combo)
+        # Segment-level: repeats wrap the whole segment (both channels) in a
+        # loop behavior, so they belong to neither drive.
+        self.seg_box = QGroupBox('Segment')
+        seg_form = QFormLayout(self.seg_box)
         self.repeats_spin = QSpinBox()
         self.repeats_spin.setRange(1, 100000)
-        self.pattern_layout.addRow('Repeat segment', self.repeats_spin)
-        editor.addWidget(pattern_box)
+        self.repeats_spin.setToolTip('Run this whole segment (pattern and its '
+                                     'level sweep) this many times back to '
+                                     'back.')
+        seg_form.addRow('Repeat segment', self.repeats_spin)
+        editor.addWidget(self.seg_box)
+
+        # Primary drive: the motor running the pattern, and the pattern itself.
+        self.primary_box = QGroupBox('Primary drive')
+        self.pattern_layout = QFormLayout(self.primary_box)
+        self.primary_motor = QComboBox()
+        self.primary_motor.addItems(test_builder.MOTORS)
+        self.pattern_layout.addRow('Motor', self.primary_motor)
+        self.primary_mode = QComboBox()
+        self.primary_mode.addItems(test_builder.MODES)
+        self.pattern_layout.addRow('Control mode', self.primary_mode)
+        self.pattern_combo = QComboBox()
+        self.pattern_combo.addItems(list(test_builder.PATTERNS))
+        self.pattern_layout.addRow('Pattern', self.pattern_combo)
+        editor.addWidget(self.primary_box)
+
+        # Secondary drive: the other motor's level sweep and how it moves
+        # between levels.
+        self.secondary_box = QGroupBox('Secondary drive')
+        sec_form = QFormLayout(self.secondary_box)
+        self.secondary_mode = QComboBox()
+        self.secondary_mode.addItems(test_builder.MODES)
+        sec_form.addRow('Control mode', self.secondary_mode)
+        self.levels_field = LevelsField(
+            'Levels', 'Setpoints for the other motor; the pattern runs once '
+                      'per level, in the order listed. Use a single 0 to hold '
+                      'it at zero.')
+        sec_form.addRow(self.levels_field)
+        self.sec_rate = self._spin(0.001, 1e6, 1.0)
+        self.sec_rate.setToolTip(
+            'How fast this motor walks from one level to the next (and back '
+            'to 0 at the end) with the pattern motor held at 0. Too fast '
+            'trips the rotatum limit in torque mode or the acceleration '
+            'limit in velocity mode.')
+        sec_form.addRow('Ramp rate [units/s]', self.sec_rate)
+        self.sec_settle = self._spin(0.0, 1e6, 1.0)
+        self.sec_settle.setToolTip(
+            'Dead hold at each new level before the pattern starts, so the '
+            'rig reaches steady state at that load before anything is '
+            'measured. Also gives the first position corner room to blend — '
+            "0 here is what triggers 'starts moving at t=0'.")
+        sec_form.addRow('Settle at level [s]', self.sec_settle)
+        editor.addWidget(self.secondary_box)
+
+        # Position shaping: only ever does anything when a channel is in
+        # position mode, so it stays folded away and greys itself out
+        # otherwise (see _apply_field_states).
+        self.shaping_toggle = QPushButton()
+        self.shaping_toggle.setCheckable(True)
+        self.shaping_toggle.setStyleSheet('text-align: left; border: none;')
+        editor.addWidget(self.shaping_toggle)
+        self.shaping_panel = QWidget()
+        shaping_form = QFormLayout(self.shaping_panel)
+        shaping_form.setContentsMargins(12, 0, 0, 0)
+        self.primary_accel = self._spin(0.001, 1e6,
+                                        test_builder.DEFAULT_POSITION_ACCEL)
+        self.primary_accel.setToolTip(
+            'A piecewise-linear position command steps the commanded velocity '
+            'at every keyframe corner, which the drive chases with an '
+            'inertial torque spike. Each corner is replaced by a '
+            'constant-accel blend lasting |Δv| / accel, so a lower value '
+            'means a longer, gentler blend. Applies to whichever channels are '
+            'in position mode (both motors share this value). If a blend '
+            "can't fit between two corners it is clamped, and validation "
+            'flags the leftover step.')
+        shaping_form.addRow('Blend accel [units/s²]', self.primary_accel)
+        self.shaping_panel.setVisible(False)
+        editor.addWidget(self.shaping_panel)
+        self.shaping_toggle.toggled.connect(self._toggle_shaping)
+        self._refresh_shaping_toggle(True)
+
         editor.addStretch(1)
 
         self.validation_label = QLabel('')
@@ -207,7 +368,7 @@ class TestBuilderWindow(QWidget):
 
         editor_wrap = QWidget()
         editor_wrap.setLayout(editor)
-        editor_wrap.setFixedWidth(360)
+        editor_wrap.setFixedWidth(430)
         body.addWidget(editor_wrap)
 
         # Right: live preview ------------------------------------------------
@@ -238,7 +399,8 @@ class TestBuilderWindow(QWidget):
         self.pattern_combo.currentTextChanged.connect(self._on_pattern_changed)
         for widget in (self.primary_motor, self.primary_mode, self.secondary_mode):
             widget.currentTextChanged.connect(self._commit_form)
-        self.levels_edit.editingFinished.connect(self._commit_form)
+        self.levels_field.changed.connect(self._commit_form)
+        self.levels_field.failed.connect(self.status.setText)
         self.primary_accel.valueChanged.connect(self._commit_form)
         self.sec_rate.valueChanged.connect(self._commit_form)
         self.sec_settle.valueChanged.connect(self._commit_form)
@@ -251,6 +413,15 @@ class TestBuilderWindow(QWidget):
         box.setDecimals(4)
         box.setValue(value)
         return box
+
+    def _toggle_shaping(self, checked):
+        self.shaping_panel.setVisible(checked)
+        self._refresh_shaping_toggle(self.shaping_toggle.isEnabled())
+
+    def _refresh_shaping_toggle(self, active):
+        arrow = '▾' if self.shaping_toggle.isChecked() else '▸'
+        hint = '' if active else '   (no position channel)'
+        self.shaping_toggle.setText(f'{arrow} Position shaping{hint}')
 
     # --- segment list management -------------------------------------------
 
@@ -285,6 +456,9 @@ class TestBuilderWindow(QWidget):
                     'secondary': dict(seg['secondary']),
                     'params': dict(seg['params']),
                     'id': self._next_seg_id()}
+            if 'levels_gen' in seg:
+                copy['levels_gen'] = {k: dict(v)
+                                      for k, v in seg['levels_gen'].items()}
             self.segments.insert(self.seg_list.currentRow() + 1, copy)
             self._refresh_list(self.seg_list.currentRow() + 1)
 
@@ -318,21 +492,27 @@ class TestBuilderWindow(QWidget):
         self.primary_accel.setValue(
             seg['primary'].get('accel', test_builder.DEFAULT_POSITION_ACCEL))
         self.secondary_mode.setCurrentText(seg['secondary']['control_mode'])
-        self.levels_edit.setText(', '.join(f'{v:g}' for v in seg['secondary']['levels']))
+        self.levels_field.set_values(seg['secondary']['levels'],
+                                     self._gen_spec(seg, 'secondary'))
         self.sec_rate.setValue(seg['secondary'].get('rate', 1.0))
         self.sec_settle.setValue(seg['secondary'].get('settle_s', 0.0))
         self.repeats_spin.setValue(int(seg.get('repeats', 1)))
         self.pattern_combo.setCurrentText(seg['pattern'])
         self._rebuild_param_widgets(seg)
-        self._apply_gridpoint_state(seg)
+        self._apply_field_states(seg)
         self._loading = False
         self._update_preview()
 
+    @staticmethod
+    def _gen_spec(segment, key):
+        """The stored generator inputs for one level list, or None. Absent for
+        every recipe saved before the generator existed, and for any list that
+        was typed by hand."""
+        return (segment.get('levels_gen') or {}).get(key)
+
     def _rebuild_param_widgets(self, seg):
         for widget in self._param_widgets.values():
-            label = self.pattern_layout.labelForField(widget)
-            self.pattern_layout.removeRow(widget)
-            del label
+            self.pattern_layout.removeRow(widget)  # deletes the label too
         self._param_widgets = {}
         for key, (label, default, typ) in test_builder.PATTERNS[seg['pattern']].items():
             value = seg['params'].get(key, default)
@@ -346,8 +526,15 @@ class TestBuilderWindow(QWidget):
                 widget.setValue(int(value))
                 widget.valueChanged.connect(self._commit_form)
             elif typ is list:
-                widget = QLineEdit(', '.join(f'{float(v):g}' for v in value))
-                widget.editingFinished.connect(self._commit_form)
+                # Same generator as the secondary levels; spans the form row
+                # because it carries its own label.
+                widget = LevelsField(label)
+                widget.set_values(value, self._gen_spec(seg, key))
+                widget.changed.connect(self._commit_form)
+                widget.failed.connect(self.status.setText)
+                self.pattern_layout.addRow(widget)
+                self._param_widgets[key] = widget
+                continue
             else:
                 widget = self._spin(-1e9, 1e9, float(value))
                 widget.valueChanged.connect(self._commit_form)
@@ -361,14 +548,23 @@ class TestBuilderWindow(QWidget):
         return value if value is not None else \
             test_builder.GRID_CONT_TORQUE_FALLBACK[motor]
 
-    def _apply_gridpoint_state(self, seg):
-        """Grey out the fields a gridpoint segment doesn't use (position blend
-        accel, level ramp/settle -- grid_search has its own settle/transition
-        settings -- and repeats, which grid segments don't support)."""
+    def _apply_field_states(self, seg):
+        """Enable only the fields the current segment actually uses.
+
+        A gridpoint segment drives none of the trace-shaping knobs: grid_search
+        has its own settle/transition settings, and grid segments don't support
+        repeats. Position shaping only does anything when a channel is in
+        position mode, so the drawer folds away and greys out otherwise."""
         grid = test_builder.is_gridpoint(seg)
-        for widget in (self.primary_accel, self.sec_rate, self.sec_settle,
-                       self.repeats_spin):
+        for widget in (self.sec_rate, self.sec_settle, self.repeats_spin):
             widget.setEnabled(not grid)
+        shaping = not grid and 'position' in (self.primary_mode.currentText(),
+                                              self.secondary_mode.currentText())
+        if not shaping and self.shaping_toggle.isChecked():
+            self.shaping_toggle.setChecked(False)  # fold, don't leave it grey
+        self.shaping_toggle.setEnabled(shaping)
+        self.primary_accel.setEnabled(shaping)
+        self._refresh_shaping_toggle(shaping)
 
     def _on_pattern_changed(self, pattern):
         seg = self._current_segment()
@@ -376,6 +572,13 @@ class TestBuilderWindow(QWidget):
             return
         seg['pattern'] = pattern
         seg['params'] = {k: v[1] for k, v in test_builder.PATTERNS[pattern].items()}
+        # Params reset to defaults, so any generator spec describing the old
+        # pattern's level list is now a lie. The secondary's spec is unaffected.
+        sec_spec = self._gen_spec(seg, 'secondary')
+        if sec_spec:
+            seg['levels_gen'] = {'secondary': sec_spec}
+        else:
+            seg.pop('levels_gen', None)
         if pattern == 'gridpoint':
             # Grid searches only run velocity x torque; snap the modes to that
             # pair and seed the continuous-torque rating from the rig config.
@@ -390,7 +593,7 @@ class TestBuilderWindow(QWidget):
                             else ('output' if self.primary_motor.currentText() == 'input'
                                   else 'input'))
             seg['params']['continuous_torque'] = self._cont_torque_default(torque_motor)
-        self._apply_gridpoint_state(seg)
+        self._apply_field_states(seg)
         self._rebuild_param_widgets(seg)
         item = self.seg_list.currentItem()
         if item:
@@ -414,8 +617,11 @@ class TestBuilderWindow(QWidget):
         seg['primary'] = {'motor': self.primary_motor.currentText(),
                           'control_mode': self.primary_mode.currentText(),
                           'accel': self.primary_accel.value()}
+        # Generator inputs for every level list on the form, keyed the same way
+        # _gen_spec reads them; only Fill-backed lists contribute an entry.
+        gen = {'secondary': self.levels_field.spec()}
         try:
-            levels = _parse_levels(self.levels_edit.text())
+            levels = _parse_levels(self.levels_field.text())
         except ValueError:
             self.validation_label.setText('Levels must be comma-separated numbers')
             return
@@ -439,9 +645,18 @@ class TestBuilderWindow(QWidget):
                     self.validation_label.setText(
                         f'{key} must be comma-separated numbers')
                     return
+                gen[key] = widget.spec()
             else:
                 params[key] = widget.value()
         seg['params'] = params
+        # Stay byte-identical to a pre-generator recipe when nothing on the
+        # form was generated, so old tests don't re-hash on open.
+        gen = {k: v for k, v in gen.items() if v}
+        if gen:
+            seg['levels_gen'] = gen
+        else:
+            seg.pop('levels_gen', None)
+        self._apply_field_states(seg)
         self._update_preview()
 
     # --- preview & validation ----------------------------------------------
@@ -611,7 +826,9 @@ class TestBuilderWindow(QWidget):
     def _set_view_only(self, view_only, label=None):
         self._view_only = view_only
         for widget in (self.name_edit, self.save_button, self.seg_list,
-                       self.seg_buttons_wrap, self.roles_box, self.pattern_box):
+                       self.seg_buttons_wrap, self.seg_box, self.primary_box,
+                       self.secondary_box, self.shaping_toggle,
+                       self.shaping_panel):
             widget.setEnabled(not view_only)
         self.validation_label.setStyleSheet(
             'color: gray;' if view_only else 'color: #d62728;')
