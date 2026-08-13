@@ -93,10 +93,10 @@ RTC-0200: #New big motor: values need correcting
   flip_torque_sign: True
   gear_ratio: 1 #Output should always be set to 1
   motor_params:
-    kt: 7.5
-    k_tanh: 0.01
+    kt: 7.79
+    k_tanh: 0.0164
   motor_limits:
-    torque: 100
+    torque: 220
     velocity: 50
     acceleration: 20 #Rad/s^2
     rotatum: 400 #Nm/s, 4 x peak torque value

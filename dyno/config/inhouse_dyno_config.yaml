@@ -123,11 +123,11 @@ expected_slave_layout:
       flip_torque_sign: True
       gear_ratio: 1
       motor_params:
-        kt: 5.3
-        k_tanh: 0.025
+        kt: 7.79
+        k_tanh: 0.0164
       motor_limits:
-        torque: 200
-        continuous_torque: 4
+        torque: 220
+        continuous_torque: 100
         velocity: 50
         acceleration: 20 # Rad/s^2
         rotatum: 400 # Nm/s
@@ -146,7 +146,7 @@ expected_slave_layout:
 # never > limit - so a failed/disconnected RTD reads NaN and silently disables
 # this check rather than tripping it.
 safeties:
-  output_torque: { source: devices.adc_1.load_torque, limit: 200 } # Nm, derated for bringup
+  output_torque: { source: devices.adc_1.load_torque, limit: 220 } # Nm, derated for bringup
   output_velocity: { source: devices.LOAD.velocity, limit: 60 } # rad/s, derated for bringup
   input_velocity: { source: devices.DUT.velocity, limit: 100 } # rad/s, catches a back-driven DUT
   load_stator_temp: { source: devices.rtd_module.load_stator_temp, limit: 100 } # C
