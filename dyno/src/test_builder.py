@@ -49,6 +49,15 @@ POSITION_BLEND_SAMPLES = 10     # subdivisions per parabolic corner blend
 CORNER_DT = 0.05                # [s] window used to judge corner velocity steps
 END_HOLD_S = 0.5                # [s] trailing hold so the final corner can blend
 
+# The blend only touches interior corners, so the first keyframe keeps whatever
+# discontinuity it starts with: a segment whose first secondary level is
+# non-zero (a -pi..pi position sweep, say) steps the commanded velocity at t=0
+# with nothing in front of it to blend into. Settle time can't fix that -- it is
+# applied *after* the ramp onto each level. A lead-in hold at zero can: it makes
+# that first ramp an interior corner, and gives every log a short at-rest
+# baseline to tare against. Per-segment, overridable, in `lead_in_s`.
+START_HOLD_S = 1.0              # [s] default lead-in hold at zero
+
 GENERATED_TEST_DIR = 'ui_generated_tests'   # under the tests directory
 GENERATED_TRACE_DIR = 'ui_generated'        # under tests/traces/
 
@@ -257,6 +266,7 @@ def default_segment(seg_id='SEG1'):
     return {
         'id': seg_id,
         'repeats': 1,
+        'lead_in_s': START_HOLD_S,
         'primary': {'motor': 'input', 'control_mode': 'position',
                     'accel': DEFAULT_POSITION_ACCEL},
         'secondary': {'control_mode': 'torque', 'levels': [0.0],
@@ -349,6 +359,10 @@ def compile_segment(segment):
     rows = [(0.0, 0.0, 0.0)]
     t = 0.0
     sec = 0.0
+    lead_in_s = max(float(segment.get('lead_in_s', START_HOLD_S)), 0.0)
+    if lead_in_s > 0:
+        t = lead_in_s
+        rows.append((t, 0.0, 0.0))
     for level in levels:
         if level != sec:
             t += abs(level - sec) / sec_rate
@@ -533,8 +547,9 @@ def validate_segment(segment, limits=None):
                                                   zip(times[1:], values[1:]))]
             if signed:
                 if abs(signed[0]) > 1e-6:
-                    issues.append(f'{col} starts moving at t=0; add settle '
-                                  'time so the trace starts at rest')
+                    issues.append(f'{col} starts moving at t=0; increase the '
+                                  "segment's lead-in hold so the trace starts "
+                                  'at rest')
                 if abs(signed[-1]) > 1e-6:
                     issues.append(f'{col} ends while still moving')
             if motor_limits:

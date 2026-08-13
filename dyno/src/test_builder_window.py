@@ -281,6 +281,15 @@ class TestBuilderWindow(QWidget):
                                      'level sweep) this many times back to '
                                      'back.')
         seg_form.addRow('Repeat segment', self.repeats_spin)
+        self.lead_in_spin = self._spin(0.0, 1e6, test_builder.START_HOLD_S)
+        self.lead_in_spin.setToolTip(
+            'Hold everything at zero for this long before the segment starts. '
+            'Gives the first ramp somewhere to blend from — without it a '
+            'sweep whose first level is non-zero steps the commanded velocity '
+            'at t=0 — and leaves an at-rest baseline at the head of the log. '
+            'Settle time cannot do this: it is applied after the ramp onto '
+            'each level, not before the first one.')
+        seg_form.addRow('Lead-in hold [s]', self.lead_in_spin)
         editor.addWidget(self.seg_box)
 
         # Primary drive: the motor running the pattern, and the pattern itself.
@@ -405,6 +414,7 @@ class TestBuilderWindow(QWidget):
         self.sec_rate.valueChanged.connect(self._commit_form)
         self.sec_settle.valueChanged.connect(self._commit_form)
         self.repeats_spin.valueChanged.connect(self._commit_form)
+        self.lead_in_spin.valueChanged.connect(self._commit_form)
 
     @staticmethod
     def _spin(lo, hi, value):
@@ -497,6 +507,8 @@ class TestBuilderWindow(QWidget):
         self.sec_rate.setValue(seg['secondary'].get('rate', 1.0))
         self.sec_settle.setValue(seg['secondary'].get('settle_s', 0.0))
         self.repeats_spin.setValue(int(seg.get('repeats', 1)))
+        self.lead_in_spin.setValue(
+            float(seg.get('lead_in_s', test_builder.START_HOLD_S)))
         self.pattern_combo.setCurrentText(seg['pattern'])
         self._rebuild_param_widgets(seg)
         self._apply_field_states(seg)
@@ -556,7 +568,8 @@ class TestBuilderWindow(QWidget):
         repeats. Position shaping only does anything when a channel is in
         position mode, so the drawer folds away and greys out otherwise."""
         grid = test_builder.is_gridpoint(seg)
-        for widget in (self.sec_rate, self.sec_settle, self.repeats_spin):
+        for widget in (self.sec_rate, self.sec_settle, self.repeats_spin,
+                       self.lead_in_spin):
             widget.setEnabled(not grid)
         shaping = not grid and 'position' in (self.primary_mode.currentText(),
                                               self.secondary_mode.currentText())
@@ -631,6 +644,7 @@ class TestBuilderWindow(QWidget):
                             'settle_s': self.sec_settle.value()}
         seg['repeats'] = (1 if test_builder.is_gridpoint(seg)
                           else self.repeats_spin.value())
+        seg['lead_in_s'] = self.lead_in_spin.value()
         params = {}
         for key, widget in self._param_widgets.items():
             typ = test_builder.PATTERNS[seg['pattern']][key][2]
