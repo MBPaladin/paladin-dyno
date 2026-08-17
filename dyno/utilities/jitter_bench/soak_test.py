@@ -47,14 +47,14 @@ Each seg#####.npz holds, for the cycles in that segment:
 Usage (on the dyno host; use the venv python, which setup.sh grants
 cap_net_raw + cap_sys_nice so no sudo is needed):
   DYNO_ROOT=/path/to/paladin-dyno \
-    .venv/bin/python dyno/jitter_bench/soak_test.py --hours 24
+    .venv/bin/python dyno/utilities/jitter_bench/soak_test.py --hours 24
 
   # unattended: survives the SSH session dropping, Ctrl-C / SIGTERM flush cleanly
-  nohup .venv/bin/python dyno/jitter_bench/soak_test.py --hours 24 \
+  nohup .venv/bin/python dyno/utilities/jitter_bench/soak_test.py --hours 24 \
        > soak.out 2>&1 &
 
   # post-run analysis streams the segments (never loads 24 h into RAM):
-  python3 dyno/jitter_bench/soak_test.py --analyze jitter_bench/soak_1737000000
+  python3 dyno/utilities/jitter_bench/soak_test.py --analyze jitter_bench/soak_1737000000
 
 Options:
   --hours 24            run length in hours (float; e.g. 0.05 for a 3-min smoke test)
