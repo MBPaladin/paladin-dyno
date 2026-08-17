@@ -1,9 +1,17 @@
-import pysoem
+import os
+
+if os.environ.get('DYNO_SIM'):
+    from dyno.sim import fake_pysoem as pysoem
+    print('#### SIMULATION MODE: fake EtherCAT bus, no hardware ####')
+else:
+    import pysoem
 import time
 import threading
 import yaml
-from dyno.src.timing import nano_sleep
-import os
+import gc
+import json
+from dyno.src.timing import hybrid_sleep_until, set_cyclic_thread_priority
+from dyno.src.config_utils import augment_log_keys
 from dyno.src.devices import DEVICE_CLASSES, EL2004
 import types
 from operator import attrgetter
@@ -21,6 +29,8 @@ class Master:
         self._pd_thread_stop_event = threading.Event()
         self._ch_thread_stop_event = threading.Event()
         self._actual_wkc = 0
+        self.wkc_error = 0 # per-cycle missing working counter (expected - actual); 0 when healthy
+        self.cycle_dt_us = 0.0 # measured interval between PDO sends, logged per-sample
         self._master = pysoem.Master()
         self._master.in_op = False
         self._master.do_check_state = False
@@ -49,59 +59,81 @@ class Master:
         cycle_time_sec = self.process_data_cycle_time_us / 1_000_000.0
         print(f'Process data thread cycle time: {cycle_time_sec*1000:.2f} ms')
 
+        # Kernel wake-up slop and preemption of this thread are the dominant
+        # sources of cycle jitter, ahead of anything on the EtherCAT bus itself.
+        if set_cyclic_thread_priority():
+            print('Process data thread running with SCHED_FIFO priority')
+        else:
+            print('WARNING: could not set SCHED_FIFO (need root or CAP_SYS_NICE), '
+                  'cycle jitter will be worse under load')
+        gc_was_enabled = gc.isenabled()
+        gc.disable() # GC pauses land directly in the cycle-time tail
+
         wkc_error_count = 0
         max_wkc_errors_before_warning = 10 # Only print warning after 10 consecutive errors
 
         target_dc_modulo = 500000
         master_time_offset = None
         jitter_arr = np.zeros(1000)
-        cycle_start_time = time.perf_counter_ns()
-        while not self._pd_thread_stop_event.is_set():
+        monotonic_ns = time.clock_gettime_ns # same clock as hybrid_sleep_until
+        cycle_start_time = monotonic_ns(time.CLOCK_MONOTONIC)
+        last_dc_time = cycle_start_time
+        try:
+            while not self._pd_thread_stop_event.is_set():
 
-            pdo_send_time = time.perf_counter_ns()
-            self._master.send_processdata()
-            self._actual_wkc = self._master.receive_processdata(timeout=int(cycle_time_sec * 1_000_000 * 0.9)) # Timeout in microseconds, 90% of cycle
+                pdo_send_time = monotonic_ns(time.CLOCK_MONOTONIC)
+                self._master.send_processdata()
+                self._actual_wkc = self._master.receive_processdata(timeout=int(cycle_time_sec * 1_000_000 * 0.9)) # Timeout in microseconds, 90% of cycle
+                # Deficit form so the log reads 0 when healthy and rises on dropped/late frames.
+                self.wkc_error = self._master.expected_wkc - self._actual_wkc
 
-            dc_modulo = self._master.dc_time % 1000000 # determine where in the ethercat cycle we've sent data
-            if master_time_offset == None:
-                master_time_offset = self._master.dc_time - pdo_send_time
+                dc_modulo = self._master.dc_time % 1000000 # determine where in the ethercat cycle we've sent data
+                if master_time_offset == None:
+                    master_time_offset = self._master.dc_time - pdo_send_time
 
-            if self.data_counter > 500:
-                jitter_arr[self.data_counter % 1000] = pdo_send_time - last_dc_time
+                # Measured cycle interval; exposed for per-sample telemetry and
+                # set before self.step() so the logged value matches this cycle.
+                self.cycle_dt_us = (pdo_send_time - last_dc_time) / 1000.0
 
-            last_dc_time = pdo_send_time
+                if self.data_counter > 500:
+                    jitter_arr[self.data_counter % 1000] = pdo_send_time - last_dc_time
 
-            start_time_shift = int( ((self._master.dc_time - pdo_send_time) - master_time_offset)/30) + int((dc_modulo - target_dc_modulo)/30)
-            master_time_offset += start_time_shift
+                last_dc_time = pdo_send_time
 
-            if self.in_op:
-                # Process inbound PDO data
-                for device_name in vars(self.devices).keys():
-                    device_instance = getattr(self.devices, device_name)
-                    if hasattr(device_instance, 'process_txpdo'):
-                        device_instance.process_txpdo()
+                start_time_shift = int( ((self._master.dc_time - pdo_send_time) - master_time_offset)/30) + int((dc_modulo - target_dc_modulo)/30)
+                master_time_offset += start_time_shift
 
-                self.step()
+                if self.in_op:
+                    # Process inbound PDO data
+                    for device_name in vars(self.devices).keys():
+                        device_instance = getattr(self.devices, device_name)
+                        if hasattr(device_instance, 'process_txpdo'):
+                            device_instance.process_txpdo()
 
-                # Process outbound PDO data
-                for device_name in vars(self.devices).keys():
-                    device_instance = getattr(self.devices, device_name)
-                    if hasattr(device_instance, 'write_rxpdo'):
-                        device_instance.write_rxpdo()
+                    self.step()
 
-            if self._actual_wkc < self._master.expected_wkc:
-                wkc_error_count += 1
-                if wkc_error_count >= max_wkc_errors_before_warning and not self.shutdown:
-                    print(f'WARNING: Incorrect WKC. Expected: {self._master.expected_wkc}, Actual: {self._actual_wkc}')
-                    wkc_error_count = 0 # Reset counter after printing warning
-            else:
-                wkc_error_count = 0 # Reset if WKC is correct
+                    # Process outbound PDO data
+                    for device_name in vars(self.devices).keys():
+                        device_instance = getattr(self.devices, device_name)
+                        if hasattr(device_instance, 'write_rxpdo'):
+                            device_instance.write_rxpdo()
 
-            cycle_start_time += self.process_data_cycle_time_us * 1000 - start_time_shift
+                if self._actual_wkc < self._master.expected_wkc:
+                    wkc_error_count += 1
+                    if wkc_error_count >= max_wkc_errors_before_warning and not self.shutdown:
+                        print(f'WARNING: Incorrect WKC. Expected: {self._master.expected_wkc}, Actual: {self._actual_wkc}')
+                        wkc_error_count = 0 # Reset counter after printing warning
+                else:
+                    wkc_error_count = 0 # Reset if WKC is correct
 
-            sleep_duration = cycle_start_time - time.perf_counter_ns()
-            if sleep_duration > 0:
-                nano_sleep(int(sleep_duration))
+                cycle_start_time += self.process_data_cycle_time_us * 1000 - start_time_shift
+
+                # Absolute deadline: a late cycle doesn't shift the schedule,
+                # and the final ~150us is spun away to absorb wake-up slop.
+                hybrid_sleep_until(cycle_start_time)
+        finally:
+            if gc_was_enabled:
+                gc.enable()
 
     # PDO update loop, taken from basic example. For each ethercat device, if the wrapping class has an 'update' method, that update method is run
     def run(self):
@@ -172,26 +204,7 @@ class Master:
 
         # --- 3.5 Auto-Add Sensors to Log Keys ---
         print('Adding sensors to log keys')
-        if 'sensors' in self.dyno_params:
-            for sensor_name, config in self.dyno_params['sensors'].items():
-                
-                # Determine the module name (either from port or direct signal_module)
-                if 'port' in config:
-                    port_map = self.dyno_params.get('panel_ports', {}).get(config['port'])
-                    module_name = port_map['signal_module']
-                else:
-                    module_name = config.get('signal_module')
-
-                # Construct the dot-notation path for attrgetter
-                # Format: devices.<module_name>.<sensor_name>
-                log_path = f"devices.{module_name}.{sensor_name}"
-                
-                # Check if this sensor is already in log_keys to avoid duplicates
-                existing_keys = [k[0] for k in self.dyno_params.get('log_keys', [])]
-                
-                if sensor_name not in existing_keys:
-                    self.dyno_params['log_keys'].append([sensor_name, log_path])
-                    print(f"\tAuto-logged sensor: {sensor_name} -> {log_path}")
+        augment_log_keys(self.dyno_params, verbose=True)
 
         # Now compile the telemetry list (this remains the same)
         self._telemetry_compiled = [attrgetter(attr[1]) for attr in self.dyno_params.get('log_keys', [])]
@@ -199,6 +212,33 @@ class Master:
         print('\nCompiled telemetry check: item count = ',len(self._telemetry_compiled))
         for item in self._telemetry_compiled:
             print('\t',item)
+
+        # --- 3.6 Persist resolved device parameters ---
+        # Written every bring-up; the Logger attaches this file to each test's
+        # HDF5 log so post-processing can reconstruct the exact configuration
+        # (post absorber-merge, including provenance of every value).
+        #
+        # The session id ties this file to THIS bring-up. There is exactly one
+        # copy on disk and it is overwritten every time, so without the id a
+        # Logger started against a stale file (a crashed bring-up, a run with
+        # no fresh one) would attribute a log to the wrong configuration and
+        # say nothing. The controller ships the same id out on every telemetry
+        # sample so the Logger can check the two agree -- see _control_state.
+        self.session_id = f'{os.getpid()}@{time.strftime("%Y-%m-%d %H:%M:%S")}'
+        resolved = {'mode': getattr(self, 'mode', None),
+                    'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+                    'session_id': self.session_id,
+                    'devices': {}}
+        for device_name, device in vars(self.devices).items():
+            entry = {'class': type(device).__name__}
+            if isinstance(getattr(device, 'params', None), dict):
+                entry['params'] = device.params
+            if hasattr(device, 'params_provenance'):
+                entry['provenance'] = device.params_provenance
+            resolved['devices'][device_name] = entry
+        os.makedirs(dyno_paths.dyno_logs_directory, exist_ok=True)
+        with open(f'{dyno_paths.dyno_logs_directory}/resolved_config.json', 'w') as f:
+            json.dump(resolved, f, indent=2, default=str)
 
         # --- 4. Transition to OP ---
         self._master.config_map()
@@ -230,13 +270,71 @@ class Master:
             self.shutdown = True
 
         # --- 5. Shutdown ---
+        # Order matters here. The drives have to be walked to Switch on Disabled
+        # while process data is still cycling, then the chain goes to INIT, and
+        # only then does the socket close. Doing it the other way round leaves
+        # each AKD holding the last controlword it ever saw, which overrides a
+        # service-channel enable and is what makes Workbench refuse to enable
+        # the axis after a run.
+        self._release_drives()
+
         self.in_op = False
-        self._master.state = pysoem.INIT_STATE
-        self._master.write_state()
         self._pd_thread_stop_event.set()
         self._ch_thread_stop_event.set()
         control_thread.join()
+
+        # Confirm INIT rather than assuming it: write_state() is a single
+        # broadcast datagram with nobody checking the result, and a chain left
+        # above INIT keeps CoE - and with it the DS402 state machine - alive.
+        self._master.state = pysoem.INIT_STATE
+        self._master.write_state()
+        if self._master.state_check(pysoem.INIT_STATE, timeout=500_000) != pysoem.INIT_STATE:
+            print('WARNING: chain did not reach INIT. CoE may still be live, '
+                  'which can block Workbench from enabling the axis. Run '
+                  './dyno/utilities/release_drives.sh to clear it.')
         self._master.close()
+
+    def _release_drives(self, timeout_s=2.0):
+        '''Walk every DS402 drive to Switch on Disabled before PDOs stop.
+
+        Must run while the cyclic thread is still exchanging process data: the
+        controlword only reaches the drive in the PDO frame, so once that thread
+        stops, whatever the drive last saw is latched there until it is power
+        cycled. Duck-typed on `released` so only drives with a DS402 handover
+        state participate - the AXON and RB430 have their own shutdown handling.
+        '''
+        drives = [(name, device) for name, device in vars(self.devices).items()
+                  if hasattr(device, 'released')]
+        if not drives:
+            return
+
+        for _name, device in drives:
+            device.shutdown = True
+
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if all(device.released for _name, device in drives):
+                break
+            time.sleep(0.01)
+
+        stuck = ', '.join(name for name, device in drives if not device.released)
+        if stuck:
+            print(f'WARNING: {stuck} did not reach Switch on Disabled within '
+                  f'{timeout_s}s. Workbench may refuse to enable the axis; run '
+                  f'./dyno/utilities/release_drives.sh to clear it.')
+            return
+
+        # Faulted drives are released (controlword parked at 0x0000, power stage
+        # off) but not reset - see AKD.released. Say which, so a fault that was
+        # expected reads as expected and one that was not gets looked at.
+        faulted = ', '.join(name for name, device in drives
+                            if device.state == 'fault')
+        if faulted:
+            print(f'Drives released. {faulted} left in Fault (disabled, '
+                  f'controlword 0x0000); clear the fault in Workbench, or run '
+                  f'./dyno/utilities/release_drives.sh --clear-faults.')
+        else:
+            print('All drives released to Switch on Disabled')
 
     @staticmethod
     def _check_slave(slave, pos):

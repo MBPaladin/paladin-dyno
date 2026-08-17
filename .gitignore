@@ -53,6 +53,13 @@ Thumbs.db
 __pycache__/
 .venv
 *.png
+dyno/logs/resolved_config.json
+dyno/tests/traces/ui_generated/*
+dyno/tests/ui_generated_tests/*
+dyno/logs/*
 
 # Results
 brian_tests/
+dyno/jitter_bench/*.npz
+dyno/jitter_bench/*.png
+dyno/docs

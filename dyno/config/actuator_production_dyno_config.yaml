@@ -124,11 +124,12 @@ expected_slave_layout:
         k_tanh: 0.018
       motor_limits:
         torque: 450
+        continuous_torque: 110 # Nm, continuous rating; grid_search cools down after points above this
         velocity: 13
         acceleration: 12 #Rad/s^2
         rotatum: 1800 #Nm/s, 4 x peak torque value
       drive_params:
-    i_cont: 8
+        i_cont: 8
   - model: AKD
     name: DUT
     params:
@@ -154,6 +155,7 @@ expected_slave_layout:
         k_tanh: 0.025
       motor_limits:
         torque: 100
+        continuous_torque: 4 # Nm, continuous rating; grid_search cools down after points above this
         velocity: 63
         acceleration: 12 #Rad/s^2
         rotatum: 320 #Nm/s, 4 x peak torque value
@@ -161,11 +163,14 @@ expected_slave_layout:
         i_cont: 8
 
 
-safeties: # Measured values over these limits will cause the test to stop
-  output_torque: 200 # Nm on the output torque cell. measured abs(torque) over this limit will stop a test
-  input_torque: 15 # Nm on the input torque cell. measured abs(torque) over this limit will stop a test
-  output_velocity: 31.5 # rad/s on the output. measured abs(velocity) over this limit will stop the test
-  input_velocity: 500 # rad/s
+safeties: # Measured values over these limits will cause the test to stop.
+  # `source` is an attribute path on the controller (same idiom as log_keys).
+  output_torque: { source: devices.adc_1.load_torque, limit: 200 } # Nm on the output torque cell
+  output_velocity: { source: devices.LOAD.velocity, limit: 31.5 } # rad/s on the output
+  input_velocity: { source: devices.DUT.velocity, limit: 500 } # rad/s
+  # input_torque was in the old limits list but was never checked in
+  # actuator_production mode; uncomment to actually enforce it:
+  # input_torque: { source: devices.adc_1.input_torque, limit: 15 }
 
 gui_params: # defines length and resolution of the plots
   window_length_s: 30
@@ -212,3 +217,5 @@ log_keys: # Fixed values that aren't user adjustable
   - [load_velocity, devices.LOAD.velocity]
   - [load_current, devices.LOAD.current]
   - [load_position_2, devices.encoder.position]
+  - [cycle_time_us, cycle_dt_us] # measured PDO loop interval
+  - [wkc_error, wkc_error] # expected - actual working counter; 0 = healthy, >0 = dropped/late frame

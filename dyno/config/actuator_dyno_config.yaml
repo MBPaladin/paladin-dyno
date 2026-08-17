@@ -53,6 +53,7 @@ expected_slave_layout: # This section captures parameters required to initialize
         k_tanh: 0.016
       motor_limits:
         torque: 330
+        continuous_torque: 110 # Nm, continuous rating; grid_search cools down after points above this
         velocity: 12
         acceleration: 12 #Rad/s^2
         rotatum: 1320 #Nm/s, 4 x peak torque value
@@ -62,17 +63,21 @@ expected_slave_layout: # This section captures parameters required to initialize
     name: DUT
     params:
       gear_ratio: 1
-      esi_file_name: dyno-debug-esi-extra-filters.xml
+      esi_file_name: config/esi/dyno-debug-esi-extra-filters.xml
       motor_limits:
         torque: 30
+        continuous_torque: 4 # Nm, continuous rating; grid_search cools down after points above this
         velocity: 6
 
 
-safeties: # Measured values over these limits will cause the test to stop
-  output_torque: 375 # Nm on the output torque cell. measured abs(torque) over this limit will stop a test
-  input_torque: 15 # Nm on the input torque cell. measured abs(torque) over this limit will stop a test
-  output_velocity: 15 # rad/s on the output. measured abs(velocity) over this limit will stop the test
-  input_velocity: 500 # rad/s
+safeties: # Measured values over these limits will cause the test to stop.
+  # `source` is an attribute path on the controller (same idiom as log_keys).
+  # NOTE: only load_torque is a configured sensor in this config; the old
+  # hardcoded checks referenced ADC.output_torque/input_torque which do not
+  # exist here (would have raised AttributeError mid-test).
+  output_torque: { source: devices.ADC.load_torque, limit: 375 } # Nm on the output torque cell
+  output_velocity: { source: devices.LOAD.velocity, limit: 15 } # rad/s on the output
+  input_velocity: { source: devices.DUT.velocity, limit: 500 } # rad/s
 
 gui_params: # defines length and resolution of the plots
   window_length_s: 30
@@ -100,3 +105,5 @@ log_keys:
   - [load_position, devices.LOAD.position]
   - [load_velocity, devices.LOAD.velocity]
   - [load_current, devices.LOAD.current]
+  - [cycle_time_us, cycle_dt_us] # measured PDO loop interval
+  - [wkc_error, wkc_error] # expected - actual working counter; 0 = healthy, >0 = dropped/late frame

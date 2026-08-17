@@ -1,0 +1,83 @@
+# Scope layout for the in-house rig. Every data_key here must exist in the
+# resolved log_keys for inhouse_dyno_config.yaml (declared keys plus the
+# sensors augment_log_keys appends), or the trace has nothing to pull.
+#
+# Differences from actuator_production_plot_config.yaml:
+#   - dut_effort dropped: it is in that rig's commented-out log_keys block, not
+#     its active one, so the trace was already dead there.
+#   - ranges derated to match the bringup motor_limits (torque 25, velocity 5).
+Output Torque:
+  title: Torque
+  unit: Nm
+  range: # defines range of each scope
+    - -30
+    - 30
+  data_keys: # defines which log entries to pull for the scope
+    - input_torque
+    - load_torque
+    - dut_torque_command
+    - load_torque_command
+  legends: # defines legends for the above keys
+    - Measured Input Torque
+    - Measured Output Torque
+    - DUT Torque Command
+    - LOAD Torque Command
+  pens: # sets colors for each trace
+    - y
+    - g
+    - c
+    - c
+Output Velocity:
+  title: Velocity
+  unit: Rad/s
+  range:
+    - -6
+    - 6
+  data_keys:
+    - dut_velocity
+    - load_velocity
+    - dut_velocity_command
+    - load_velocity_command
+  legends:
+    - DUT Velocity
+    - Load Velocity
+    - DUT Velocity Command
+    - LOAD Velocity Command
+  pens:
+    - r
+    - g
+    - c
+    - c
+Output Position:
+  title: Position
+  unit: Rad
+  range:
+    - -0.1
+    - 6.4
+  data_keys:
+    - dut_output_position
+    - load_position
+    - dut_position_command
+    - load_position_command
+  legends:
+    - DUT Position
+    - Load Position
+    - DUT Position Command
+    - LOAD Position Command
+  pens:
+    - r
+    - g
+    - c
+    - c
+Load Temperature:
+  title: Temperature
+  unit: C
+  range:
+    - 0
+    - 120
+  data_keys:
+    - load_stator_temp
+  legends:
+    - Load Winding Temp
+  pens:
+    - r

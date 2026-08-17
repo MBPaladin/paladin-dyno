@@ -87,3 +87,37 @@ RA400-04:
     rotatum: 1800 #Nm/s, 4 x peak torque value
   drive_params:
     i_cont: 8
+
+RTC-0200: #New big motor: values need correcting
+  type: rotary
+  flip_torque_sign: True
+  gear_ratio: 1 #Output should always be set to 1
+  motor_params:
+    kt: 7.79
+    k_tanh: 0.0164
+  motor_limits:
+    torque: 220
+    velocity: 50
+    acceleration: 20 #Rad/s^2
+    rotatum: 400 #Nm/s, 4 x peak torque value
+  drive_params:
+    i_cont: 15
+
+13030X: #New small motor: values need correcting
+  type: rotary
+  flip_torque_sign: False
+  gear_ratio: 1 #Output should always be set to 1
+  motor_params:
+    kt: 1.0
+    k_tanh: 0.01
+  motor_limits:
+    torque: 100
+    velocity: 10
+    acceleration: 5 #Rad/s^2
+    rotatum: 100 #Nm/s, 4 x peak torque value
+  drive_params:
+    i_cont: 1
+
+# NOTE: the simulation sandbox's fake AKD drives report names SIM-<name>
+# (e.g. SIM-DUT) which deliberately do NOT appear here, so sim drives resolve
+# entirely from the dyno config's layout params for whichever rig config runs.

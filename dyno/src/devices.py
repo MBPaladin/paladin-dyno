@@ -1,12 +1,14 @@
 import ctypes
 import math
 import numpy as np
+import os
 import struct
 import xmltodict
 import yaml
 import queue
 import threading
 from deployment import dyno_paths
+from dyno.src.config_utils import deep_merge, validate_required_params, print_params_provenance
 
 # Hard coded device ID's to double check during bringup
 BECKHOFF_VENDOR_ID = 2
@@ -174,7 +176,37 @@ class EL2004:
         # 5. Write the safely modified byte back to the PySOEM buffer
         self._slave.output = bytes([current_byte])
 
-class ELM3002:
+class ScaledChannels:
+    """Channel publishing shared by the ELM3000-series analog terminals.
+
+    Every channel surfaces as an attribute named after its sensor
+    (self.load_torque and friends). That value carries two corrections, kept
+    deliberately separate:
+
+      offset -- a calibration constant from the rig yaml, part of the recorded
+                configuration, the same on every run.
+      tare   -- a zero captured at runtime for THIS session, from averaging the
+                cell at rest.
+
+    Folding a tare into the offset would destroy the record of which correction
+    came from where and let a session artifact masquerade as calibration, so
+    they stay as two terms.
+
+    `untared` holds the reading before the tare is applied, because that is what
+    a new tare has to average over. Taring against an already-tared reading
+    would only walk the bias toward zero one press at a time instead of
+    measuring it."""
+
+    def _init_channels(self):
+        self.tare = {}      # sensor name -> bias added on top of the config offset
+        self.untared = {}   # sensor name -> reading with offset applied, tare not
+
+    def _publish_channel(self, ch_name, scaled):
+        self.untared[ch_name] = scaled
+        setattr(self, ch_name, scaled + self.tare.get(ch_name, 0.0))
+
+
+class ELM3002(ScaledChannels):
     class TxPDO(ctypes.Structure):
         _pack_ = 1 # Ensures no padding between fields
         _fields_ = [
@@ -195,6 +227,7 @@ class ELM3002:
         self.params = params
         self.input_torque = 0
         self.output_torque = 0
+        self._init_channels()
 
     def setup(self):
         #Set 8000 and 8010 to corresponding measurement ranges: 2 = +- 10v, 3 = +- 5v
@@ -257,9 +290,10 @@ class ELM3002:
                 
                 # Formula for ELM 3000 series scaling
                 scaled_value = (fs_pos * raw_values[i] / 7812500) + offset
-                
-                # This creates or updates the attribute (e.g., self.load_torque)
-                setattr(self, ch_name, scaled_value)
+
+                # Creates or updates the attribute (e.g. self.load_torque),
+                # with any session tare on top -- see ScaledChannels.
+                self._publish_channel(ch_name, scaled_value)
 
 class EL3208:
     class TxPDO(ctypes.Structure):
@@ -394,7 +428,7 @@ class EL3208:
                 # E.g., setattr(self, 'load_stator_temp', 24.5)
                 setattr(self, ch_name, temp)
 
-class ELM3004:
+class ELM3004(ScaledChannels):
     class TxPDO(ctypes.Structure):
         _pack_ = 1 # Ensures no padding between fields
         _fields_ = [
@@ -426,6 +460,7 @@ class ELM3004:
         self.name = name
         # If no params passed, ensure it's a dict so routing doesn't crash
         self.params = params if params is not None else {}
+        self._init_channels()
 
     def setup(self):
         # Clear current TxPDO mapping
@@ -500,9 +535,10 @@ class ELM3004:
                 
                 # Formula for ELM 3000 series scaling
                 scaled_value = (fs_pos * raw_values[i] / 7812500) + offset
-                
-                # This creates or updates the attribute (e.g., self.load_torque)
-                setattr(self, ch_name, scaled_value)
+
+                # Creates or updates the attribute (e.g. self.load_torque),
+                # with any session tare on top -- see ScaledChannels.
+                self._publish_channel(ch_name, scaled_value)
 
 class EL5042:
     class TxPDO(ctypes.Structure):
@@ -552,32 +588,134 @@ class EL5042:
         self.positions = [self._ch0_unwrapper(self._tx_pdo.ch1_position), self._ch1_unwrapper(self._tx_pdo.ch2_position)]
         self.position = -1 * self.positions[0] * (2*math.pi) / 2**32
 
+# --- AKD process-data profiles ------------------------------------------------
+#
+# Rev B AKDs (the cheap ones on the in-house rig) return a statusword of all
+# zeros in the PDO while the very same object read over the mailbox reports a
+# live DS402 state - confirmed with ./dyno/drive_status.sh, which saw 0x0218 and
+# 0x0231 on two drives whose process data both said 0x0000. Rev D drives in
+# extended data mode do not do this. The working theory, from the same failure
+# on a previous rig, is that Rev B has a smaller process-data budget than the
+# map below asks for and silently drops a field rather than refusing the
+# mapping (the SDO readback shows the map was accepted).
+#
+# So the map is a table rather than a straight line of sdo_writes: one profile
+# per size point, with the ctypes struct generated from the same rows that
+# generate the mapping objects, so the wire layout and the decode cannot drift.
+# 'extended' is byte-for-byte what this driver has always written - Rev D rigs
+# are unaffected unless something explicitly opts out.
+#
+# Row format: (index, subindex, bit length, struct field, ctypes type).
+# A field of None is wire padding with no attribute behind it. Kollmorgen wants
+# each PDO an even number of bytes, which is what the 8-bit pads are for.
+_CONTROLWORD      = (0x6040, 0x00, 16, 'controlword',      ctypes.c_uint16)
+_TORQUE_FF        = (0x60B2, 0x00, 16, 'torque_ff',        ctypes.c_int16)
+_POSITION_COMMAND = (0x60C1, 0x01, 32, 'position_command', ctypes.c_int32)
+_VELOCITY_COMMAND = (0x60FF, 0x00, 32, 'velocity_command', ctypes.c_int32)
+_CURRENT_COMMAND  = (0x2071, 0x00, 32, 'current_command',  ctypes.c_int32)
+_DIGITAL_OUTPUTS  = (0x60FE, 0x01, 32, 'digital_outputs',  ctypes.c_uint32)
+_CONTROL_MODE     = (0x6060, 0x00,  8, 'control_mode',     ctypes.c_int8)
+_RX_PAD8          = (0x0002, 0x00,  8, None,               ctypes.c_int8)
+
+_STATUSWORD       = (0x6041, 0x00, 16, 'statusword',       ctypes.c_uint16)
+_OP_MODE          = (0x6061, 0x00,  8, 'op_mode',          ctypes.c_int8)
+_TX_PAD8          = (0x2002, 0x01,  8, None,               ctypes.c_int8)
+_ACTUAL_POSITION  = (0x6063, 0x00, 32, 'actual_position',  ctypes.c_int32)
+_ACTUAL_VELOCITY  = (0x606C, 0x00, 32, 'actual_velocity',  ctypes.c_int32)
+_ACTUAL_CURRENT   = (0x2077, 0x00, 32, 'actual_current',   ctypes.c_int32)
+_I2T_COUNTER      = (0x3427, 0x03, 32, 'i2t_counter',      ctypes.c_uint32)
+
+AKD_PDO_PROFILES = {
+    # Everything. 22 B / 8 objects out, 20 B / 7 objects in.
+    'extended': {
+        'rx': {0x1600: [_CONTROLWORD, _TORQUE_FF, _POSITION_COMMAND],
+               0x1601: [_VELOCITY_COMMAND, _CURRENT_COMMAND],
+               0x1602: [_DIGITAL_OUTPUTS, _CONTROL_MODE, _RX_PAD8]},
+        'tx': {0x1A00: [_STATUSWORD, _OP_MODE, _TX_PAD8, _ACTUAL_POSITION],
+               0x1A01: [_ACTUAL_VELOCITY, _ACTUAL_CURRENT],
+               0x1A02: [_I2T_COUNTER]},
+    },
+    # Full motion control, minus the two entries nothing needs: the i2t counter
+    # (read nowhere in this repo) and the digital outputs (only the stack light
+    # on actuator_production, via _write_led). 18 B / 7 out, 16 B / 6 in.
+    'compact': {
+        'rx': {0x1600: [_CONTROLWORD, _TORQUE_FF, _POSITION_COMMAND],
+               0x1601: [_VELOCITY_COMMAND, _CURRENT_COMMAND],
+               0x1602: [_CONTROL_MODE, _RX_PAD8]},
+        'tx': {0x1A00: [_STATUSWORD, _OP_MODE, _TX_PAD8, _ACTUAL_POSITION],
+               0x1A01: [_ACTUAL_VELOCITY, _ACTUAL_CURRENT]},
+    },
+    # Read-only: every feedback object, no motion commands. Holds the inbound
+    # size at 'compact' while shrinking outbound to the state machine, which is
+    # what separates "the drive cannot afford the Rx map" from "...the Tx map".
+    # 4 B / 3 out, 16 B / 6 in.
+    'telemetry': {
+        'rx': {0x1600: [_CONTROLWORD, _CONTROL_MODE, _RX_PAD8]},
+        'tx': {0x1A00: [_STATUSWORD, _OP_MODE, _TX_PAD8, _ACTUAL_POSITION],
+               0x1A01: [_ACTUAL_VELOCITY, _ACTUAL_CURRENT]},
+    },
+    # The floor: state machine out, statusword in. Nothing moves and nothing is
+    # logged but the one number under investigation. If the statusword is still
+    # 0x0000 at 4 B / 2 B then process-data volume is not the mechanism and the
+    # size ladder above is not worth climbing.
+    'minimal': {
+        'rx': {0x1600: [_CONTROLWORD, _CONTROL_MODE, _RX_PAD8]},
+        'tx': {0x1A00: [_STATUSWORD]},
+    },
+}
+
+AKD_PDO_PROFILE_DEFAULT = 'extended'
+
+_AKD_STRUCT_CACHE = {}
+
+
+def akd_pdo_structs(profile):
+    """(RxPDO, TxPDO) ctypes structures for a named profile.
+
+    Cached, because from_buffer_copy is called on these at 1 kHz and the type
+    identity should be stable across the life of a drive.
+    """
+    if profile not in _AKD_STRUCT_CACHE:
+        built = []
+        for direction in ('rx', 'tx'):
+            fields = []
+            for entries in AKD_PDO_PROFILES[profile][direction].values():
+                for _index, _sub, _bits, field, ctype in entries:
+                    fields.append((field or f'_pad{len(fields)}', ctype))
+            built.append(type(f'AKD_{direction.upper()}PDO_{profile}',
+                              (ctypes.Structure,),
+                              {'_pack_': 1, '_fields_': fields}))
+        _AKD_STRUCT_CACHE[profile] = tuple(built)
+    return _AKD_STRUCT_CACHE[profile]
+
+
+def akd_pdo_profile(params=None):
+    """Resolve which PDO profile a drive should use.
+
+    Precedence: DYNO_AKD_PDO_PROFILE (applies to every AKD at once, so a size
+    bisect needs no file edits between runs) > drive_params.pdo_profile from
+    absorbers.yaml or the rig config > 'extended'.
+    """
+    profile = os.environ.get('DYNO_AKD_PDO_PROFILE')
+    if not profile:
+        profile = ((params or {}).get('drive_params') or {}).get(
+            'pdo_profile', AKD_PDO_PROFILE_DEFAULT)
+    if profile not in AKD_PDO_PROFILES:
+        raise ValueError(f'unknown AKD PDO profile {profile!r}; choose one of: '
+                         + ', '.join(AKD_PDO_PROFILES))
+    return profile
+
+
+# Per-cycle trace of the DS402 handshake during a mode change. This runs inside
+# the 1 kHz process-data loop, so it is off unless asked for: a print per cycle
+# is ~30 lines per mode change of console noise and a blocking stdout write in
+# the middle of a real-time cycle. The state transitions themselves are still
+# announced unconditionally (once each, in update_modes), which is what an
+# operator actually reads; this is for debugging a switch that never completes.
+AKD_TRACE_MODE_SWITCH = bool(os.environ.get('DYNO_TRACE_MODE_SWITCH'))
+
+
 class AKD:
-    class RxPDO(ctypes.Structure):
-        _pack_ = 1
-        _fields_ = [
-            ('controlword', ctypes.c_uint16),     # Offset 0  <-- STATE ENGINE AT FRONT
-            ('torque_ff', ctypes.c_int16),        # Offset 2
-            ('position_command', ctypes.c_int32), # Offset 4  (Aligned)
-            ('velocity_command', ctypes.c_int32), # Offset 8  (Aligned)
-            ('current_command', ctypes.c_int32),  # Offset 12 (Aligned)
-            ('digital_outputs', ctypes.c_uint32), # Offset 16 (Aligned)
-            ('control_mode', ctypes.c_int8),      # Offset 20
-            ('padding', ctypes.c_int8),           # Offset 21
-        ]
-
-    class TxPDO(ctypes.Structure):
-        _pack_ = 1
-        _fields_ = [
-            ('statusword', ctypes.c_uint16),       # 0x6041:00 (16 bits)
-            ('op_mode', ctypes.c_int8), # 6061:00 (8 bit)
-            ('padding', ctypes.c_int8),
-            ('actual_position', ctypes.c_int32),    # 0x6064 (32 bits) Momentary actual value in increments, per FB1.Pscale
-            ('actual_velocity', ctypes.c_int32),    # 0x606C:00 (32 bits) Velocity in milli-RPM
-            ('actual_current', ctypes.c_int32),       # 0x2077:00 (32 bits) Measured current in mA
-            ('i2t_counter', ctypes.c_uint32),       # 0x3427:03 (32 bits) I2T foldback
-        ]
-
     def __init__(self, slave, name, params):
         self._slave = slave
         self.name = name
@@ -591,14 +729,45 @@ class AKD:
         drive_name = self._slave.sdo_read(0x2031, 0).decode('utf-8')
         drive_name = drive_name.strip(drive_name[-1])
 
-        if drive_name in [k for k in absorber_params.keys()]:
-            self.params = absorber_params[drive_name]
-            print('Loading Params for: ',drive_name)
+        # Merge absorber entry ONTO the dyno-config layout params: the absorber
+        # overrides only the keys it defines (was: wholesale dict replacement,
+        # which silently discarded every layout value and split flip_torque_sign
+        # off to a different source than everything else).
+        layout_params = params if params is not None else {}
+        if drive_name in absorber_params:
+            print('Loading absorber params for: ', drive_name)
+            self.params, self.params_provenance = deep_merge(
+                layout_params, absorber_params[drive_name],
+                base_src='dyno config', override_src=f'absorbers.yaml:{drive_name}')
         else:
-            print(self.name,' drive params not found in absorber config. Reverting to dyno config params')
+            print(self.name, ' drive params not found in absorber config. Using dyno config params')
+            self.params, self.params_provenance = deep_merge(
+                layout_params, {}, base_src='dyno config')
 
-        self._rx_pdo = self.RxPDO()  # Master -> Slave (Output to drive)
-        self._tx_pdo = self.TxPDO()  # Slave -> Master (Input from drive)
+        validate_required_params(
+            self.params,
+            ['flip_torque_sign', 'gear_ratio',
+             'motor_params.kt', 'motor_params.k_tanh',
+             'motor_limits.torque', 'motor_limits.velocity',
+             'motor_limits.acceleration', 'motor_limits.rotatum',
+             'drive_params.i_cont'],
+            context=f'AKD {self.name} (drive {drive_name!r})')
+        print_params_provenance(f'{self.name} ({drive_name})',
+                                self.params, self.params_provenance)
+
+        # Process-data layout. Both the mapping SDOs and these structs come from
+        # AKD_PDO_PROFILES, so a profile change moves the wire and the decode
+        # together. _rx_fields is what send_command consults before writing:
+        # a reduced profile drops command objects, and dropping a command
+        # silently would look exactly like a drive that ignores it.
+        self.pdo_profile = akd_pdo_profile(self.params)
+        self._pdo_map = AKD_PDO_PROFILES[self.pdo_profile]
+        RxPDO, TxPDO = akd_pdo_structs(self.pdo_profile)
+        self._rx_pdo = RxPDO()  # Master -> Slave (Output to drive)
+        self._tx_pdo = TxPDO()  # Slave -> Master (Input from drive)
+        self._rx_fields = {field for field, _ctype in RxPDO._fields_}
+        self._tx_fields = {field for field, _ctype in TxPDO._fields_}
+        self._unmapped_warned = set()
 
         self.pos_offset = 0
         self.velocity = 0
@@ -614,6 +783,10 @@ class AKD:
 
         self.state = None
         self.sw_enable = False
+        # Set by the controller and by Master._release_drives on the way out.
+        # Unlike sw_enable, which parks the drive at Ready to Switch On, this
+        # carries it all the way to Switch on Disabled - see update_modes.
+        self.shutdown = False
 
         self.position_unwrapper = Unwrapper(fs_counts=2**32)
 
@@ -622,8 +795,10 @@ class AKD:
         self.switching_modes = False
 
         self.position_offset = 0
-        self.flip_torque_sign = params['flip_torque_sign']
-        self.flip_direction_sign = params.get('flip_direction_sign', False)
+        # from the MERGED params like everything else (was: read from the raw
+        # dyno-config argument even when an absorber entry overrode the rest)
+        self.flip_torque_sign = self.params['flip_torque_sign']
+        self.flip_direction_sign = self.params.get('flip_direction_sign', False)
 
         self.torque_limit = self.params['motor_limits']['torque']
         self.velocity_limit = self.params['motor_limits']['velocity']
@@ -635,6 +810,57 @@ class AKD:
 
         self.digital_out_state = 0x00000000
         self.mode_dict = {7:2,3:1,4:0,0:-1} #Converts from KM mode nomenclature to 0 = torque, 1 = velocity, 2 = position
+
+    def _rx_set(self, field, value):
+        '''Write an RxPDO field the active profile maps. Returns whether it did.
+
+        controlword and control_mode are in every profile; everything else can
+        legitimately be absent, so callers that are issuing an *actuation*
+        should go through _rx_command instead and let it complain.
+        '''
+        if field in self._rx_fields:
+            setattr(self._rx_pdo, field, value)
+            return True
+        return False
+
+    def _rx_command(self, field, value):
+        '''Write a command field, or say loudly - once - that it went nowhere.
+
+        Latched because this is called from the 1 kHz loop. A reduced profile
+        that has dropped the command object cannot move the drive, and the
+        operator needs to hear that from the driver rather than infer it from a
+        motor that does not turn.
+        '''
+        if self._rx_set(field, value):
+            return
+        if field not in self._unmapped_warned:
+            self._unmapped_warned.add(field)
+            print(f"WARNING: {self.name} PDO profile '{self.pdo_profile}' does "
+                  f"not map {field} - this command is discarded and the drive "
+                  f"will not follow it.")
+
+    @property
+    def released(self):
+        '''True once the drive is parked where Workbench can take it back.
+
+        Switch on Disabled is the handover state: anywhere else the drive keeps
+        statusword bit 9 ('remote') set and overrides a service-channel enable
+        from its latched controlword, which is what leaves the axis refusing to
+        enable in Workbench after a run.
+
+        Fault counts as released too. Fault -> Switch on Disabled is DS402
+        transition 15, which only happens on a fault reset, and a drive that is
+        expected to fault (a DUT under test) would otherwise hold up every
+        shutdown until the timeout. Clearing it here would also throw away the
+        one piece of evidence the operator came for. What matters for the
+        handover is the *controlword* the drive latches, and update_modes parks
+        that at 0x0000 in fault once shutdown is set - so the axis is left
+        disabled, with only the fault itself for Workbench to reset. Hence the
+        shutdown qualifier: a drive sitting in Fault mid-run is not released,
+        it is still holding whatever controlword it last saw.
+        '''
+        return (self.state == 'sw_on_disable'
+                or (self.state == 'fault' and self.shutdown))
 
     #This method cycles the servo drive through the operating and control modes
     def update_modes(self):
@@ -681,11 +907,13 @@ class AKD:
             self.state = 'undefined'
 
         if self.switching_modes:
-            print(self.state, self.target_mode, self.mode)
+            if AKD_TRACE_MODE_SWITCH:
+                print(self.name, self.state, self.target_mode, self.mode,
+                      f'sw=0x{sw:04X}')
             if self.state == 'ready_to_sw_on': # only write _rx_pdo.control_mode when the drive is in the specific state. adjust the internal tracking of the operating mode
                 if self.target_mode == 'position':
                     self._rx_pdo.control_mode = 7
-                    self.pos_cmd_offset = self._tx_pdo.actual_position
+                    self.pos_cmd_offset = getattr(self._tx_pdo, 'actual_position', 0)
                     self.mode = 'position'
                 elif self.target_mode == 'velocity':
                     self._rx_pdo.control_mode = 3
@@ -709,18 +937,34 @@ class AKD:
                 self.velocity_command = math.nan
                 self.position_command = math.nan
 
-        # Always try to maintain atleast "ready to switch on" state
-        if self.state in ['not_ready', 'sw_on_disable', 'undefined']:
+        # Always try to maintain atleast "ready to switch on" state - except on
+        # the way out, where Switch on Disabled is the destination and this
+        # would walk the drive straight back off it.
+        if self.state in ['not_ready', 'sw_on_disable', 'undefined'] and not self.shutdown:
             self._rx_pdo.controlword = 0x0006
 
         # State machine transitions to de-enable the drive when switching modes
-        if self.switching_modes or not self.sw_enable:
+        if self.switching_modes or not self.sw_enable or self.shutdown:
             if self.state == 'enabled':
                 self._rx_pdo.controlword = 0x0007
             elif self.state == 'sw_on':
                 self._rx_pdo.controlword = 0x0006
             elif self.state == 'ready_to_sw_on':
-                self._rx_pdo.controlword = 0x0006 # Maintain ready to switch on state
+                # Shutting down: carry on to Switch on Disabled. Reached by
+                # walking enabled -> 0x0007 -> 0x0006 -> 0x0000 rather than
+                # slamming 0x0000 from enabled, which would drop the power
+                # stage outright and let a loaded machine coast.
+                self._rx_pdo.controlword = 0x0000 if self.shutdown else 0x0006
+            elif self.state == 'fault' and self.shutdown:
+                # No branch above matches Fault, so without this the drive
+                # latches whatever controlword it last saw - and for a drive
+                # that faulted before it was ever enabled that is the 0x00FF
+                # from __init__: fault reset PLUS Enable Operation. Leaving
+                # that latched is the worst possible handover value. Bit 7 is
+                # stuck high, so Workbench's fault reset has no rising edge to
+                # act on, and if the fault does clear the drive is holding a
+                # standing enable request. 0x0000 (Disable Voltage) instead.
+                self._rx_pdo.controlword = 0x0000
 
         # State machine transitions to enable the servo drive
         elif self.sw_enable:
@@ -732,7 +976,7 @@ class AKD:
                 self._rx_pdo.controlword = 0x001F # Maintain enable command
 
         # Shutdown if unreccognizable state recieved
-        if self.state == 'undefined':
+        if self.state == 'undefined' and not self.shutdown:
             self._rx_pdo.controlword = 0x0006
 
         self.fault = self.STATE_BITS['fault']
@@ -740,10 +984,21 @@ class AKD:
 
     # This method intakes a new target control mode
     def command_operating_mode(self, mode):
+        # update_modes clears switching_modes by comparing servo_drive_mode
+        # against the target, and servo_drive_mode comes from 0x6061. A profile
+        # that does not map it can never confirm the switch, so the drive would
+        # sit in switching_modes forever and the test would stall with no
+        # explanation. Say so instead.
+        if 'op_mode' not in self._tx_fields:
+            print(f"WARNING: {self.name} PDO profile '{self.pdo_profile}' does "
+                  f"not map op_mode, so a switch to {mode} can never be "
+                  f"confirmed by the drive. Refusing the mode change.")
+            return
         print(self.name,' Switching from  ',self.mode,' to ',mode,' mode')
         # Snap position command to actual before de-enabling to zero following error
         if self.mode == 'position':
-            self._rx_pdo.position_command = self._tx_pdo.actual_position
+            self._rx_set('position_command',
+                         getattr(self._tx_pdo, 'actual_position', 0))
         self.target_mode = mode
         self.switching_modes = True # by setting this flag to true, the above switching logic will commence
 
@@ -758,55 +1013,21 @@ class AKD:
 
         # Kollmorgen has some interesting restrictions on PDO mapping. read their ethercat communications manual before adjusting things here.
 
-        # Hex 0x00030000 = (1 << 16) | (1 << 17)
-        mask_val = 0x00030000
-        self._slave.sdo_write(index=0x60FE, subindex=2, data=mask_val.to_bytes(4, 'little'))
+        # Digital output mask. Only meaningful when the profile actually maps
+        # 0x60FE:01 - otherwise it is one more mailbox round trip buying nothing
+        # on a drive we suspect of being short on process-data budget.
+        if 'digital_outputs' in self._rx_fields:
+            # Hex 0x00030000 = (1 << 16) | (1 << 17)
+            mask_val = 0x00030000
+            self._slave.sdo_write(index=0x60FE, subindex=2, data=mask_val.to_bytes(4, 'little'))
 
-
-        # Clear PDO assignments
+        # Clear PDO assignments. Deliberately covers every PDO any profile can
+        # use, not just the active one's: switching profiles between runs must
+        # not leave a PDO from the previous map still assigned.
         for pdo_obj in [0x1C12, 0x1C13, 0x1600, 0x1601, 0x1602, 0x1603, 0x1A00, 0x1A01, 0x1A02, 0x1A03]:
             self._slave.sdo_write(index=pdo_obj, subindex=0, data=0x00.to_bytes(1, 'little'))
 
-        # Build Rx PDOs
-        self._slave.sdo_write(index=0x1600, subindex=1, data=0x60400010.to_bytes(4, 'little')) # Controlword (16-bit)
-        self._slave.sdo_write(index=0x1600, subindex=2, data=0x60B20010.to_bytes(4, 'little')) # Torque FF (16-bit)
-        self._slave.sdo_write(index=0x1600, subindex=3, data=0x60C10120.to_bytes(4, 'little')) # Pos Cmd (32-bit)
-        self._slave.sdo_write(index=0x1600, subindex=0, data=(3).to_bytes(1, 'little'))
-
-        self._slave.sdo_write(index=0x1601, subindex=1, data=0x60FF0020.to_bytes(4, 'little'))
-        self._slave.sdo_write(index=0x1601, subindex=2, data=0x20710020.to_bytes(4, 'little'))
-        self._slave.sdo_write(index=0x1601, subindex=0, data=(2).to_bytes(1, 'little'))
-
-        self._slave.sdo_write(index=0x1602, subindex=1, data=0x60FE0120.to_bytes(4, 'little')) # DigOut (32-bit)
-        self._slave.sdo_write(index=0x1602, subindex=2, data=0x60600008.to_bytes(4, 'little')) # Mode (8-bit)
-        self._slave.sdo_write(index=0x1602, subindex=3, data=0x00020008.to_bytes(4, 'little')) # 8-bit Pad
-        self._slave.sdo_write(index=0x1602, subindex=0, data=(3).to_bytes(1, 'little'))
-        
-        # Build Tx PDOs
-        self._slave.sdo_write(index=0x1A00, subindex=1, data=0x60410010.to_bytes(4, 'little'))
-        self._slave.sdo_write(index=0x1A00, subindex=2, data=0x60610008.to_bytes(4, 'little'))
-        self._slave.sdo_write(index=0x1A00, subindex=3, data=0x20020108.to_bytes(4, 'little'))
-        self._slave.sdo_write(index=0x1A00, subindex=4, data=0x60630020.to_bytes(4, 'little'))
-        self._slave.sdo_write(index=0x1A00, subindex=0, data=0x04.to_bytes(1, 'little')) #set count of mapped PDO's
-
-        self._slave.sdo_write(index=0x1A01, subindex=1, data=0x606C0020.to_bytes(4, 'little'))
-        self._slave.sdo_write(index=0x1A01, subindex=2, data=0x20770020.to_bytes(4, 'little'))
-        self._slave.sdo_write(index=0x1A01, subindex=0, data=0x02.to_bytes(1, 'little')) #set count of mapped PDO's
-        
-        self._slave.sdo_write(index=0x1A02, subindex=1, data=0x34270320.to_bytes(4, 'little'))
-        self._slave.sdo_write(index=0x1A02, subindex=0, data=0x01.to_bytes(1, 'little')) #set count of mapped PDO's
-
-        # Map Rx / Tx PDOs
-        self._slave.sdo_write(index=0x1C12, subindex=1, data=0x1600.to_bytes(2, 'little')) # Link RxPDO 0x1600
-        self._slave.sdo_write(index=0x1C12, subindex=2, data=0x1601.to_bytes(2, 'little')) # Link RxPDO 0x1600
-        self._slave.sdo_write(index=0x1C12, subindex=3, data=0x1602.to_bytes(2, 'little')) # Link RxPDO 0x1600
-
-        self._slave.sdo_write(index=0x1C13, subindex=1, data=0x1A00.to_bytes(2, 'little')) # Link TxPDO 0x1A00
-        self._slave.sdo_write(index=0x1C13, subindex=2, data=0x1A01.to_bytes(2, 'little')) # Link TxPDO 0x1A01
-        self._slave.sdo_write(index=0x1C13, subindex=3, data=0x1A02.to_bytes(2, 'little')) # Link TxPDO 0x1A02
-
-        self._slave.sdo_write(index=0x1C12, subindex=0, data=0x03.to_bytes(1, 'little')) # Set count to 1 (one PDO linked)
-        self._slave.sdo_write(index=0x1C13, subindex=0, data=0x03.to_bytes(1, 'little')) # Set PDO count to 2
+        self._write_pdo_map()
 
         # Set units for servo drive
         self._slave.sdo_write(index=0x3660, subindex=0, data=0x0000.to_bytes(4, 'little'))
@@ -817,12 +1038,47 @@ class AKD:
         self._slave.sdo_write(index=0x60C2, subindex=1, data=val.to_bytes(1, 'little', signed=False))
         self._slave.sdo_write(index=0x60C2, subindex=2, data=power.to_bytes(1, 'little', signed=True))
 
+    def _write_pdo_map(self):
+        '''Write the active profile's mapping objects and SM assignments.
+
+        The SDO order here is the order this driver has always used - every
+        mapping object first, then both assignment lists, then their counts
+        last - so 'extended' reproduces the historical byte sequence exactly
+        and Rev D drives see no change at all.
+        '''
+        rx, tx = self._pdo_map['rx'], self._pdo_map['tx']
+
+        for pdo_map in (rx, tx):
+            for pdo_index, entries in pdo_map.items():
+                for sub, (index, subindex, bits, _f, _c) in enumerate(entries, 1):
+                    value = (index << 16) | (subindex << 8) | bits
+                    self._slave.sdo_write(index=pdo_index, subindex=sub,
+                                          data=value.to_bytes(4, 'little'))
+                self._slave.sdo_write(index=pdo_index, subindex=0,
+                                      data=len(entries).to_bytes(1, 'little'))
+
+        for sm_index, pdo_map in ((0x1C12, rx), (0x1C13, tx)):
+            for slot, pdo_index in enumerate(pdo_map, 1):
+                self._slave.sdo_write(index=sm_index, subindex=slot,
+                                      data=pdo_index.to_bytes(2, 'little'))
+
+        for sm_index, pdo_map in ((0x1C12, rx), (0x1C13, tx)):
+            self._slave.sdo_write(index=sm_index, subindex=0,
+                                  data=len(pdo_map).to_bytes(1, 'little'))
+
     def set_dout(self, pin, state):
         """
         Sets AKD Digital Output.
         :param pin: 1 or 2
         :param state: True (On) or False (Off)
         """
+        if 'digital_outputs' not in self._rx_fields:
+            if 'digital_outputs' not in self._unmapped_warned:
+                self._unmapped_warned.add('digital_outputs')
+                print(f"WARNING: {self.name} PDO profile '{self.pdo_profile}' "
+                      f"does not map digital_outputs - the stack light and any "
+                      f"other drive DO will not change state.")
+            return
         bit = 15 + pin # Pin 1 = Bit 16, Pin 2 = Bit 17
         if state:
             self.digital_out_state |= (1 << bit)
@@ -832,36 +1088,50 @@ class AKD:
     def process_txpdo(self):
         '''Reads the latest input bytes from the slave and populates the TxPDO structure.'''
         if len(self._slave.input) == ctypes.sizeof(self._tx_pdo):
-            self._tx_pdo = self.TxPDO.from_buffer_copy(self._slave.input)
+            self._tx_pdo = type(self._tx_pdo).from_buffer_copy(self._slave.input)
         else:
             print(f'WARNING: AKD input buffer size mismatch! Expected {ctypes.sizeof(self._tx_pdo)}, Got {len(self._slave.input)}')
 
+        # Feedback objects a reduced profile may not map. Read once per cycle
+        # rather than field-by-field so the rest of this method reads the same
+        # whichever profile is active.
+        tx = self._tx_pdo
+        raw_position = getattr(tx, 'actual_position', 0)
+        raw_velocity = getattr(tx, 'actual_velocity', 0)
+        raw_current = getattr(tx, 'actual_current', 0)
+        raw_op_mode = getattr(tx, 'op_mode', 0)
+
         # zero out the drives position
-        if not self._tx_pdo.actual_position == 0 and self.pos_offset == 0:
-            self.pos_offset = self._tx_pdo.actual_position
+        if not raw_position == 0 and self.pos_offset == 0:
+            self.pos_offset = raw_position
 
         # convert +- pi position to [0, 2*pi)
-        self.unwrapped_ticks = self.position_unwrapper(self._tx_pdo.actual_position+2**31)-2**31
+        self.unwrapped_ticks = self.position_unwrapper(raw_position+2**31)-2**31
         if self.flip_direction_sign:
             self.unwrapped_ticks = -self.unwrapped_ticks
         self.position = 2*math.pi*(self.unwrapped_ticks)/2**32 + self.position_offset # units = rev
 
-        self.velocity = self._tx_pdo.actual_velocity / 1000 * (2*math.pi)/60# units = Rad/s
+        self.velocity = raw_velocity / 1000 * (2*math.pi)/60# units = Rad/s
         if self.flip_direction_sign:
             self.velocity = -self.velocity
-        self.current = self._tx_pdo.actual_current / 1000 # units = A_rms
-        self.servo_drive_mode = self.mode_dict[self._tx_pdo.op_mode]
+        self.current = raw_current / 1000 # units = A_rms
+        self.servo_drive_mode = self.mode_dict[raw_op_mode]
+        # Raw DS402 status word, exposed so it can go in log_keys. Without it a
+        # log records the *consequences* of a bad drive state (NaN commands,
+        # frozen position) but never the state itself, which is the one number
+        # that says why.
+        self.statusword = tx.statusword
 
         # Update the command word
         self.update_modes()
 
-        self._rx_pdo.digital_outputs = self.digital_out_state
+        self._rx_set('digital_outputs', self.digital_out_state)
 
         # Zero out RX entries, they'll be filled in later
-        self._rx_pdo.current_command = 0
-        self._rx_pdo.position_command = 0
-        self._rx_pdo.velocity_command = 0
-        self._rx_pdo.torque_ff = 0
+        self._rx_set('current_command', 0)
+        self._rx_set('position_command', 0)
+        self._rx_set('velocity_command', 0)
+        self._rx_set('torque_ff', 0)
 
 
     def write_rxpdo(self):
@@ -873,8 +1143,8 @@ class AKD:
         if self.mode == 'position':
             self.position_command = command
             drive_cmd = -command if self.flip_direction_sign else command
-            self._rx_pdo.position_command = int(drive_cmd*(2**32)/(2*math.pi) + self.pos_cmd_offset)
-            # print(self.name,' position cmd: ', self._rx_pdo.position_command)
+            self._rx_command('position_command',
+                             int(drive_cmd*(2**32)/(2*math.pi) + self.pos_cmd_offset))
 
         elif self.mode == 'velocity':
             # clip command, if needed
@@ -886,7 +1156,8 @@ class AKD:
             self.velocity_command = command
             drive_cmd = -command if self.flip_direction_sign else command
             drive_cmd *= 60/(math.pi*2) # convert from rad/s command to rpm
-            self._rx_pdo.velocity_command = int(drive_cmd*1000) # scale velocity command by 1000 and convert to int
+            # scale velocity command by 1000 and convert to int
+            self._rx_command('velocity_command', int(drive_cmd*1000))
             
 
         elif self.mode == 'torque':
@@ -903,8 +1174,7 @@ class AKD:
 
             if self.flip_torque_sign:
                 current_target = -current_target
-            self._rx_pdo.current_command = int(current_target*1000)
-            # print(self.name,' current cmd: ', self._rx_pdo.current_command,', input cmd ',in_cmd, command)
+            self._rx_command('current_command', int(current_target*1000))
 
         # command torque (current) feed forward, if provided a target
         if not torque_ff == 0:
@@ -913,7 +1183,8 @@ class AKD:
             current_ff = np.arctanh(torque_ff * k_tanh / kt) / k_tanh
             if self.flip_torque_sign:
                 current_ff *= -1
-            self._rx_pdo.torque_ff = int(current_ff/self.params['drive_params']['i_cont']*1000)
+            self._rx_command('torque_ff',
+                             int(current_ff/self.params['drive_params']['i_cont']*1000))
 
 class AXON():
     # Mode-change tunables. The position-target path enters velocity mode first,
@@ -1777,7 +2048,13 @@ DEVICE_CLASSES = {
         },
     'AKD': {
         'id': AKD_PRODUCT_CODE,
-        'class': AKD
+        'class': AKD,
+        # Without this master.py never calls slave.dc_sync(), and the drives sit
+        # in SM sync mode 0 (Free Run) - confirmed by reading 0x1C32:01/0x1C33:01
+        # back off both drives. The rest of the stack already assumes DC is
+        # running: master.py calls config_dc() and the cyclic loop steers on
+        # self._master.dc_time. The AKD was simply never opted in.
+        'has_dc': True
         },
     'AXON': {
         'id': AXON_PRODUCT_CODE,

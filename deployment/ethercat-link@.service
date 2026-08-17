@@ -1,0 +1,30 @@
+[Unit]
+# Bring the EtherCAT NIC's link up at boot, with no IP configuration.
+#
+# The interface is deliberately kept out of NetworkManager's hands (see
+# /etc/NetworkManager/conf.d/99-ethercat-unmanaged.conf) so that no DHCP,
+# IPv6 RA or ARP traffic is ever emitted onto the fieldbus segment. The
+# side effect is that nothing brings the link up either, and SOEM cannot
+# open a down interface - it fails with "could not open interface <if>".
+#
+# This unit does the one thing that is still needed: ip link set up.
+# Do NOT add addressing here; the EtherCAT master speaks raw EtherType
+# 0x88A4 frames and must not have an IP stack on this NIC.
+#
+# Install (templated on the interface name):
+#   sudo cp deployment/ethercat-link@.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now ethercat-link@enp86s0.service
+Description=Bring up EtherCAT interface %i (link only, no IP)
+Documentation=man:ip-link(8)
+BindsTo=sys-subsystem-net-devices-%i.device
+After=sys-subsystem-net-devices-%i.device
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/ip link set dev %i up
+ExecStop=/usr/sbin/ip link set dev %i down
+
+[Install]
+WantedBy=multi-user.target
