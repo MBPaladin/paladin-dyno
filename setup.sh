@@ -139,7 +139,7 @@ verify() {
     fi
 
     if [[ $rc -eq 0 ]]; then
-        say "All checks passed. Next: ./dyno/bus_scan.sh"
+        say "All checks passed. Next: ./dyno/utilities/bus_scan.sh"
     else
         say "Some checks failed - see above."
     fi
