@@ -11,7 +11,7 @@ from datetime import datetime
 _LEVEL_ORDER = {'error': 0, 'warn': 1, 'info': 2}
 _LEVEL_LABEL = {'error': 'ERROR', 'warn': 'WARNING', 'info': 'note'}
 
-_SKIP_METRIC_KEYS = ('pooled', 'branches')
+_SKIP_METRIC_KEYS = ('pooled', 'branches', 'top_orders')
 
 
 def _fmt(v):
@@ -105,6 +105,20 @@ def render(results, log_path, width=78):
                 add(f'  {pos_s:>12}  {b["direction"]:<5} {b["n"]:>8}  '
                     f'{lin["kt_Nm_per_A"]:>11.4f}  {lin["offset_Nm"]:>12.4f}  '
                     f'{lin["r_squared"]:>9.5f}')
+            add('')
+
+        orders = entry.get('metrics', {}).get('top_orders')
+        if orders:
+            add('RIPPLE ORDERS (strongest first)')
+            other = any(o.get('order_of_other_shaft') is not None for o in orders)
+            head = f'  {"order":>10}  {"amplitude (Nm)":>14}'
+            add(head + (f'  {"far shaft":>10}' if other else ''))
+            for o in orders:
+                line = f'  {o["order"]:>10.1f}  {o["amplitude_Nm"]:>14.4f}'
+                if other:
+                    far = o.get('order_of_other_shaft')
+                    line += f'  {far:>9.2f}x' if far is not None else f'  {"-":>10}'
+                add(line)
             add('')
 
         if entry.get('figures'):

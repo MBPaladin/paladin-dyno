@@ -161,17 +161,29 @@ def main(argv=None):
         raw_overrides = dict(kv.split('=', 1) for kv in args.set)
         plan = build_plan(log, only=args.only, segment=args.segment)
 
-        for entry in plan:                       # coerce late: needs the proc
-            for k, v in raw_overrides.items():
-                try:
-                    entry['params'][k] = _coerce(entry['_proc'], k, v)
-                except (KeyError, ValueError) as exc:
+        # Coerce late: casting needs the proc. A --set key only has to be known
+        # to the processors it is aimed at -- a plan routinely mixes processors
+        # with disjoint parameters, so a key that is meaningless to one of them
+        # is normal and must not abort the others. Only a key that no processor
+        # in the plan recognizes is a typo worth stopping for.
+        for k, v in raw_overrides.items():
+            takers = [e for e in plan if k in e['_proc'].params]
+            if not takers:
+                print(f'\nerror: no processor in this plan has a parameter '
+                      f'{k!r}', file=sys.stderr)
+                for entry in plan:
                     proc = entry['_proc']
-                    print(f'\nerror: {exc}', file=sys.stderr)
                     print(f'\n{proc.name} accepts:', file=sys.stderr)
                     for pk, (default, _t, help_) in proc.params.items():
                         print(f'  {pk:<22} (default {default})  {help_}',
                               file=sys.stderr)
+                return 2
+            for entry in takers:
+                try:
+                    entry['params'][k] = _coerce(entry['_proc'], k, v)
+                except ValueError as exc:
+                    print(f'\nerror: {entry["_proc"].name} parameter {k!r} '
+                          f'rejected {v!r}: {exc}', file=sys.stderr)
                     return 2
 
         if args.list:
