@@ -714,6 +714,13 @@ def akd_pdo_profile(params=None):
 # operator actually reads; this is for debugging a switch that never completes.
 AKD_TRACE_MODE_SWITCH = bool(os.environ.get('DYNO_TRACE_MODE_SWITCH'))
 
+# How long an operator-requested fault reset holds controlword bit 7, in cycles
+# of the 1 kHz process-data loop. Bit 7 is edge triggered, so it has to be held
+# long enough for the drive to sample it across a few of its own cycles and then
+# released - a single-cycle blip can land inside a frame the drive drops, and a
+# bit left standing gives the NEXT reset no rising edge to act on.
+AKD_FAULT_RESET_CYCLES = 20
+
 
 class AKD:
     def __init__(self, slave, name, params):
@@ -808,6 +815,10 @@ class AKD:
         self.fault = True
         self.enabled = False
 
+        # Cycles remaining on an operator-requested fault reset pulse. See
+        # request_fault_reset and the tail of update_modes.
+        self._fault_reset_cycles = 0
+
         self.digital_out_state = 0x00000000
         self.mode_dict = {7:2,3:1,4:0,0:-1} #Converts from KM mode nomenclature to 0 = torque, 1 = velocity, 2 = position
 
@@ -838,6 +849,24 @@ class AKD:
             print(f"WARNING: {self.name} PDO profile '{self.pdo_profile}' does "
                   f"not map {field} - this command is discarded and the drive "
                   f"will not follow it.")
+
+    def request_fault_reset(self):
+        '''Ask for a DS402 fault reset (controlword bit 7) on the next cycles.
+
+        Returns whether there was a fault to reset, so a caller can tell the
+        operator "nothing to clear" instead of implying it did something.
+
+        This only asks. A reset drops the latch; it does not remove the cause,
+        so a drive whose fault is still present re-faults immediately and the
+        operator has to go and fix the underlying condition. Refused during
+        shutdown: the handover deliberately leaves a fault standing (see
+        `released`), and re-arming a drive on the way out is the last thing
+        anyone wants.
+        '''
+        if not self.fault or self.shutdown:
+            return False
+        self._fault_reset_cycles = AKD_FAULT_RESET_CYCLES
+        return True
 
     @property
     def released(self):
@@ -978,6 +1007,22 @@ class AKD:
         # Shutdown if unreccognizable state recieved
         if self.state == 'undefined' and not self.shutdown:
             self._rx_pdo.controlword = 0x0006
+
+        # Operator-requested fault reset, last so it overrides the branches
+        # above for as long as it is held. None of them match Fault while the
+        # drive is running, so without this the controlword just stays latched
+        # at whatever it was when the drive faulted.
+        #
+        # 0x0080 is bit 7 alone, with the enable bits clear: a drive whose fault
+        # clears lands in Switch on Disabled and is walked back to Ready to
+        # Switch On by the branch above on a later cycle, rather than
+        # re-enabling itself the instant the fault goes away. The pulse is
+        # dropped as soon as the fault bit clears so bit 7 returns low, leaving
+        # a rising edge available for the next reset.
+        if self._fault_reset_cycles > 0:
+            self._fault_reset_cycles -= 1
+            if self.STATE_BITS['fault'] and not self.shutdown:
+                self._rx_pdo.controlword = 0x0080
 
         self.fault = self.STATE_BITS['fault']
         self.enabled = self.state == 'enabled'

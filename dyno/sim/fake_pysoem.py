@@ -47,6 +47,32 @@ def wrap_i32(value):
     return ((int(value) + 2**31) % 2**32) - 2**31
 
 
+def _fault_injection(drive_name):
+    """Scheduled fault for one drive, from DYNO_SIM_FAULT.
+
+    Format: comma-separated `NAME@SECONDS[:sticky]`, e.g. 'LOAD@3,DUT@3:sticky'
+    -- fault LOAD three seconds into the run, clearable by a DS402 reset, and
+    fault DUT at the same time with a cause that never goes away, so a reset
+    drops the latch and the drive puts it straight back.
+
+    Sticky is the case worth simulating: a reset that appears to work and a
+    reset that only cleared the latch look identical from the button, and the
+    second one is the one that will surprise an operator.
+
+    Returns (seconds, sticky) or None.
+    """
+    for spec in (os.environ.get('DYNO_SIM_FAULT') or '').split(','):
+        spec = spec.strip()
+        if not spec:
+            continue
+        target, _, when = spec.partition('@')
+        if target != drive_name:
+            continue
+        when, _, flag = when.partition(':')
+        return float(when or 0.0), flag.strip().lower() == 'sticky'
+    return None
+
+
 # --------------------------------------------------------------------------
 # Device behavior models
 # --------------------------------------------------------------------------
@@ -234,6 +260,10 @@ class AKDBehavior(Behavior):
         self._pos_cmd_prev_raw = None
         self._pos_cmd_counts = 0.0
 
+        # Test-only scheduled fault; see _fault_injection and step().
+        self._fault_injection = _fault_injection(layout_entry['name'])
+        self._elapsed_s = 0.0
+
     # -- SDO ---------------------------------------------------------------
     def sdo_read(self, index, subindex, size=None, ca=False):
         if index == 0x2031:
@@ -355,6 +385,18 @@ class AKDBehavior(Behavior):
                 is_input_side=self.is_input_side)
 
     def step(self, dt_s, output_buf):
+        # Scheduled fault, applied before the status word is packed. A sticky
+        # one re-latches every cycle, so the fault bit never actually clears on
+        # the wire even though pre_step honoured the reset -- which is what a
+        # real drive does when the condition behind the fault is still there.
+        self._elapsed_s += dt_s
+        if self._fault_injection is not None:
+            at_s, sticky = self._fault_injection
+            if self._elapsed_s >= at_s:
+                self.fault = True
+                if not sticky:
+                    self._fault_injection = None
+
         tx = self._TxPDO()
         # Only the status word is in every profile; the rest are populated if
         # the active map carries them.

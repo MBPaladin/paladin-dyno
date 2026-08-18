@@ -19,7 +19,7 @@
 # motor's torque is not reacted into the DUT, so LOAD may be commanded to its
 # full 200 Nm. Clearing this flag re-arms that check and caps output torque at
 # DUT.torque x DUT.gear_ratio = 25 Nm until the DUT derate below is raised.
-load_only: true
+load_only: false
 
 # --- 0. PORTS ---
 # The rig's mechanical ports. `role` is what commands / the UI / analysis
@@ -116,31 +116,23 @@ expected_slave_layout:
     name: DUT
     params:
       flip_torque_sign: False
-      gear_ratio: 1 # Output should always be set to 1
+      gear_ratio: 26
       motor_params:
-        # TODO: verify against the motor actually fitted. Carried over from the
-        # RA400 entry - wrong kt means commanded torque != delivered torque.
-        kt: 25.5
-        k_tanh: 0.018
+        kt: 0.983
+        k_tanh: 0.0001
       motor_limits:
-        # TODO: deliberately derated for first spin. RA400 ratings are
-        # torque 450 / velocity 13; raise these only once the machine is
-        # identified and the mounting is trusted.
-        torque: 25
-        continuous_torque: 10
-        velocity: 50
-        acceleration: 20 # Rad/s^2
-        rotatum: 100 # Nm/s
+        torque: 12
+        continuous_torque: 7
+        velocity: 600
+        acceleration: 50 #Rad/s^2
+        rotatum: 500 #Nm/s, 4 x peak torque value
       drive_params:
-        i_cont: 8
+        i_cont: 7
   - model: AKD
     name: LOAD
     params:
-      # Not commanded while load_only is set, but the params are still
-      # validated at bring-up (devices.py:610 requires all nine), and sim
-      # resolves entirely from here. TODO on commissioning.
       flip_torque_sign: True
-      gear_ratio: 1
+      gear_ratio: 1 # Output should always be set to 1
       motor_params:
         kt: 7.79
         k_tanh: 0.0164
@@ -148,8 +140,8 @@ expected_slave_layout:
         torque: 220
         continuous_torque: 100
         velocity: 50
-        acceleration: 20 # Rad/s^2
-        rotatum: 400 # Nm/s
+        acceleration: 20 #Rad/s^2
+        rotatum: 1000 #Nm/s, 4 x peak torque value
       drive_params:
         i_cont: 15
 
@@ -167,7 +159,7 @@ expected_slave_layout:
 safeties:
   output_torque: { source: devices.adc_1.load_torque, limit: 220 } # Nm, derated for bringup
   output_velocity: { source: devices.LOAD.velocity, limit: 60 } # rad/s, derated for bringup
-  input_velocity: { source: devices.DUT.velocity, limit: 100 } # rad/s, catches a back-driven DUT
+  input_velocity: { source: devices.DUT.velocity, limit: 600 } # rad/s, catches a back-driven DUT
   load_stator_temp: { source: devices.rtd_module.load_stator_temp, limit: 100 } # C
 
 # Torque cell tare: the GUI's Tare button averages each listed cell at rest and

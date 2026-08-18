@@ -256,7 +256,8 @@ def expand_test(test_file, mode, limits=None, max_cycles=MAX_CYCLES):
     """Expand ``test_file`` into a command timeline.
 
     Returns a dict with ``t`` (seconds), ``input_<mode>`` / ``output_<mode>``
-    signal arrays (NaN where inactive), ``n_cycles`` and ``truncated``.
+    signal arrays (NaN where inactive), ``n_cycles``, ``truncated``, and
+    ``segments`` (one entry per behavior the rig will run, in run order).
 
     Loading/validation is delegated to ``TestManager``; if the plan violates a
     safety limit the underlying ``AssertionError`` propagates -- that is the same
@@ -277,6 +278,7 @@ def expand_test(test_file, mode, limits=None, max_cycles=MAX_CYCLES):
 
         body_cache = {}
         seg_in, seg_out, seg_im, seg_om = [], [], [], []
+        segments = []
         total = 0
         truncated = False
         for bdef in test_manager.behavior_iterator(tm.test_config):
@@ -293,6 +295,19 @@ def expand_test(test_file, mode, limits=None, max_cycles=MAX_CYCLES):
             seg_out.append(body[1])
             seg_im.append(body[2])
             seg_om.append(body[3])
+            # Per-segment boundaries, in the same order and count the rig will
+            # run them (both walk behavior_iterator), so the GUI can index into
+            # this with the controller's live segment number. `duration_s` is an
+            # UPPER bound wherever a behavior ends on live feedback: offline
+            # there is no sensor_reader, so ramp_break runs every ramp to the
+            # ceiling and the preamble never aborts on drift.
+            segments.append({
+                'id': bid,
+                'type': bdef['type'],
+                'n_cycles': n,
+                't_start': total * dt,
+                'duration_s': n * dt,
+            })
             total += n
             if truncated:
                 break
@@ -302,6 +317,7 @@ def expand_test(test_file, mode, limits=None, max_cycles=MAX_CYCLES):
         result = _route_signals(empty, empty, np.array([], dtype=object),
                                 np.array([], dtype=object), empty)
         result['truncated'] = truncated
+        result['segments'] = segments
         return result
 
     in_cmd = np.concatenate(seg_in)
@@ -312,6 +328,7 @@ def expand_test(test_file, mode, limits=None, max_cycles=MAX_CYCLES):
 
     result = _route_signals(in_cmd, out_cmd, in_mode, out_mode, t)
     result['truncated'] = truncated
+    result['segments'] = segments
     return result
 
 

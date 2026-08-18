@@ -9,6 +9,28 @@ from deployment import dyno_paths
 # shared check lives there because the builder must run without numpy/pandas.
 from dyno.src.test_builder import design_multisine, reaction_torque_issue
 
+# PROGRESS CONTRACT. Every behavior class carries two plain ints that the
+# controller reads (on its own thread, inside step()) and republishes for the
+# GUI's progress readout:
+#
+#   repeats  how many repeats this behavior will run, fixed at __init__
+#   repeat   which one is running now, 1-based, 0 before the first
+#
+# A "repeat" is one logged span -- the same unit the <id>-RUN<r>-SETPOINT<n>
+# log flags already number -- so the readout and the log agree on what a repeat
+# is. TestTrace has no spans and is therefore a single repeat.
+#
+# `repeats` is knowable in advance even where DURATION is not: ramp_break
+# releases on a live breakaway, so nobody can say how long its ramps take, but
+# the number of ramps is fixed by hold_levels x cycles x directions. That gap is
+# the whole reason this exists -- for the adaptive behaviors it is the only
+# honest progress signal available.
+#
+# `repeat` is incremented BEFORE the work, so 4/8 means "the 4th is running",
+# not "4 are finished". A behavior that aborts early (preamble drift) simply
+# stops short of `repeats`, which is the truth about what ran.
+
+
 # iterator that yields loops of behaviors
 def loop_iterator(loop_definition):
     for i in range(loop_definition['settings']['loop_count']):
@@ -42,6 +64,10 @@ class TestTrace:
         self._load_trace() # We want to do all loading of files in the __init__ as that happens before the test definition is placed inside of the control thread
         self.log_id_base = self.parameters['id']+'-RUN' # self.run gets appended to this string to capture how many times a behavior has run within a log
         self.run = 0
+        # A trace is one uninterrupted replay -- no spans to count (see the
+        # progress contract at the top of this module).
+        self.repeats = 1
+        self.repeat = 0
 
     def _load_trace(self):
         f_name = self.settings['trace_file']
@@ -168,6 +194,7 @@ class TestTrace:
     def commands(self):
         # Yield the initial command to set op modes. This command should be yielded before the timer is started, as mode changes may take some time to process
 
+        self.repeat = 1
         yield {
             'input_mode': self.input_mode,
             'output_mode': self.output_mode,
@@ -246,7 +273,13 @@ class GridSearch:
             self.settings[key]['control_mode']: self.settings[key]['command_list']
             for key in ['input_motor', 'output_motor']
         }
-        
+
+        # One repeat per grid point: grid_iterator is a full cross product, so
+        # the count is the product of the two axis lengths.
+        self.repeats = (len(self.settings['input_motor']['command_list'])
+                        * len(self.settings['output_motor']['command_list']))
+        self.repeat = 0
+
         # Continuous-torque rating used by the cooldown logic below. Builder
         # generated tests bake the resolved rating into settings; hand-written
         # yamls without it fall back to the historical hardcodes.
@@ -338,8 +371,9 @@ class GridSearch:
         # --- Initialize state for this specific run of the generator ---
         self._state = {'velocity': 0.0, 'torque': 0.0}
         self._point_ct = 0
+        self.repeat = 0
         self._transition_complete_time = None
-        
+
         # yield initial command before timers are started
         yield {
             'input_mode': self.input_mode,
@@ -357,6 +391,7 @@ class GridSearch:
         for raw_setpoint in self._setpoint_generator:
             log_flag = self.log_id_base + str(self.run)+'-SETPOINT'+str(self._point_ct)
             self._point_ct += 1
+            self.repeat = self._point_ct
 
             self._active_setpoint = {
                 self.settings['loop_order'][0]: raw_setpoint[0],
@@ -483,6 +518,12 @@ class Multisine:
             self.snr_db = {'gentle': 20.0, 'normal': 30.0, 'hard': 40.0}[
                 self.settings.get('level', 'normal')]
 
+        # The quiet hold is span 0 in every mode, then one excitation block per
+        # target -- the same spans the SETPOINT flags number. A drift abort ends
+        # the behavior below `repeats`, which is what actually happened.
+        self.repeats = 1 + len(self.targets)
+        self.repeat = 0
+
     # -- waveform synthesis --------------------------------------------------
 
     def _unit_period(self, weights):
@@ -590,6 +631,7 @@ class Multisine:
         n_settle = min(n_quiet // 3, int(round(0.5 / self.dt)))
         sums, sumsqs, counts = {}, {}, 0
         flag = f'{flag_base}-SETPOINT{setpoint}'
+        self.repeat = setpoint + 1
         for i in range(n_quiet):
             yield self._cmd(None, 0.0, flag, sample)
             sample += 1
@@ -636,6 +678,7 @@ class Multisine:
             N = len(period)
             flag = f'{flag_base}-SETPOINT{setpoint}'
             setpoint += 1
+            self.repeat = setpoint
             reading = self._read()
             pos0 = (reading or {}).get('position', {}).get(side)
             aborted = False
@@ -793,6 +836,15 @@ class RampBreak:
 
         self._peak = 0.0        # command value the last ramp ended on
 
+        # One repeat per ramp attempt. Fixed here even though the DURATION of
+        # each attempt is not: a ramp releases whenever the shaft breaks free,
+        # anywhere between the arm floor and the amplitude ceiling. This count
+        # is the only part of a ramp_break's progress that can be stated up
+        # front, which is exactly why the readout leads with it.
+        self.repeats = (len(self.hold_levels) * self.cycles
+                        * (2 if self.bipolar else 1))
+        self.repeat = 0
+
     # -- command helpers -----------------------------------------------------
 
     def _cmd(self, ramp_value, hold_value, flag=None, breakaway=None):
@@ -896,6 +948,7 @@ class RampBreak:
 
         flag_base = self.log_id_base + str(self.run)
         span = 0
+        self.repeat = 0
         hold_value = 0.0
         directions = (1.0, -1.0) if self.bipolar else (1.0,)
 
@@ -912,6 +965,7 @@ class RampBreak:
                 for sign in directions:
                     flag = flag_base + '-SETPOINT' + str(span)
                     span += 1
+                    self.repeat = span
                     yield from self._ramp_to_break(sign, hold_value, flag)
                     yield from self._release(hold_value, flag)
                     if self.rest_s > 0:
@@ -950,7 +1004,39 @@ class TestManager:
             self.test_config = yaml.safe_load(f)
 
         self._load_yaml(test_file)
+
+        # Segment progress. The count needs no expansion -- behavior_iterator
+        # unrolls loops over plain config dicts, so walking it is free, and the
+        # preview walks the identical sequence (see test_preview.expand_test),
+        # which is what makes segment i of N mean the same thing in both places.
+        self.segment_count = sum(1 for _ in behavior_iterator(self.test_config))
+        self._clear_segment()
+
         print('Test loaded.')
+
+    def _clear_segment(self):
+        self.segment_index = 0      # 1-based once running
+        self.segment_id = None
+        self.segment_type = None
+        self.current_behavior = None
+
+    def progress(self):
+        """Where the run is, for the GUI's readout (telemetry slot -1).
+
+        Read by the controller on the control thread, between next_command()
+        calls, so these are plain attribute reads with no synchronization.
+        `repeat`/`repeats` come from the running behavior -- see the progress
+        contract at the top of this module.
+        """
+        behavior = self.current_behavior
+        return {
+            'segment': self.segment_index,
+            'segments': self.segment_count,
+            'segment_id': self.segment_id,
+            'segment_type': self.segment_type,
+            'repeat': getattr(behavior, 'repeat', 0),
+            'repeats': getattr(behavior, 'repeats', 0),
+        }
 
     def _load_yaml(self, file):
         with open(f"{dyno_paths.dyno_test_directory}/{file}", "r") as f:
@@ -983,6 +1069,7 @@ class TestManager:
     def reset(self):
         self._test_start_real_time = time.time() # Capture new start time for the run
         self._test_complete = False              # Test is no longer complete
+        self._clear_segment()                    # Nothing is running yet
 
         # Re-create the top-level behavior generator
         self._behavior_gen = behavior_iterator(self.test_config)
@@ -997,6 +1084,19 @@ class TestManager:
         for behavior_definition in self._behavior_gen:
             behavior_id = behavior_definition['id']
             behavior_instance = self.behaviors[behavior_id]
+
+            # Published before the first command of the segment is yielded, so
+            # the readout never lags the rig by a behavior.
+            self.segment_index += 1
+            self.segment_id = behavior_id
+            self.segment_type = behavior_definition['type']
+            self.current_behavior = behavior_instance
+            # commands() is a generator: its body -- including the repeat reset
+            # -- does not run until the first command is pulled. Behaviors are
+            # shared across loop passes, so without this the readout would show
+            # the PREVIOUS pass's final repeat for a cycle ("8/8" at the start
+            # of a fresh segment).
+            behavior_instance.repeat = 0
 
             print(f"\n--- Starting Behavior: '{behavior_id}' ({behavior_definition['type']}) ---")
             

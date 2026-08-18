@@ -175,6 +175,20 @@ class Window(QWidget):
         self._arm_threads = []  # QThreads must outlive their run()
         self._syncing_select = False
 
+        # Progress readout. The plan half comes from the arm-time expansion
+        # (per-segment durations, which are upper bounds — see
+        # test_preview.expand_test); the live half comes from the controller in
+        # telemetry slot -1. Wall clocks are stamped here rather than taken from
+        # the controller because what the operator is timing is the run they
+        # watched start, which is the log-flag transition this window sees.
+        self._plan_segments = []
+        self._plan_duration = 0.0
+        self._plan_truncated = False
+        self._run_started = None
+        self._segment_started = None
+        self._segment_seen = None
+        self._progress = None
+
         # initialize ui
         self.__build_ui()
 
@@ -357,6 +371,16 @@ class Window(QWidget):
         self.status_light = StatusLight()
         self.controls_layout.addWidget(self.status_light)
 
+        # Progress lives in its own label rather than the status light's
+        # caption: the caption is guarded against redundant restyling by
+        # comparing text (StatusLight.set_state), and a ticking clock in it
+        # would defeat that guard on every update.
+        self.progress_label = QLabel()
+        self.progress_label.setWordWrap(True)
+        self.progress_label.setStyleSheet('font-size: 11px; color: gray;')
+        self.progress_label.setVisible(False)
+        self.controls_layout.addWidget(self.progress_label)
+
         title_label = QLabel('Test Controls', alignment=Qt.AlignmentFlag.AlignCenter)
         title_label.setStyleSheet('font-size: 16px;')
         self.controls_layout.addWidget(title_label)
@@ -370,6 +394,26 @@ class Window(QWidget):
         self.stop_button.setStyleSheet('background-color: red; color: white;')
         self.controls_layout.addWidget(self.stop_button)
         self.stop_button.clicked.connect(self.__stop_test)
+
+        # Fault reset, with its outcome underneath. The status light says a
+        # drive is faulted but not which one, and clearing it otherwise means
+        # leaving the rig for Workbench or release_drives.sh. Only ever a
+        # request: the reset drops the DS402 latch, it does not remove the
+        # cause, so the label below is where the operator learns whether the
+        # fault actually went away.
+        self.clear_faults_button = QPushButton('Clear Drive Faults')
+        self.clear_faults_button.setToolTip(
+            'Send a DS402 fault reset to every faulted drive on the bus.\n'
+            'No test may be running. This clears the latch, not the cause — a '
+            'drive whose\nfault condition is still present will simply fault '
+            'again.')
+        self.clear_faults_button.clicked.connect(self.__clear_faults)
+        self.controls_layout.addWidget(self.clear_faults_button)
+
+        self.clear_faults_label = QLabel('No drive faults')
+        self.clear_faults_label.setWordWrap(True)
+        self.clear_faults_label.setStyleSheet('font-size: 11px; color: gray;')
+        self.controls_layout.addWidget(self.clear_faults_label)
 
         # Tare, with its result underneath: the bias alone does not say whether
         # it is reasonable (0.5 Nm is noise on a 500 Nm cell and 2.5% on a 20 Nm
@@ -496,6 +540,34 @@ class Window(QWidget):
 
     def __clear_tare(self):
         self.control_command_queue.put_nowait(['clear_tare', 0])
+
+    def __clear_faults(self):
+        self.control_command_queue.put_nowait(['clear_faults', 0])
+
+    def __refresh_fault_clear(self, state):
+        """Render which drives are faulted, and the outcome of the last reset.
+
+        Naming the drives is the part the status light cannot do, and it is what
+        decides where the operator walks: a faulted DUT after a run is usually
+        the test doing its job, a faulted LOAD is not."""
+        faulted = state.get('faulted_drives') or []
+        message = state.get('fault_clear_message')
+
+        if state.get('fault_clear_active'):
+            self.clear_faults_label.setText(message or 'Clearing faults…')
+            colour = '#b58900'
+        elif faulted:
+            # The live fault leads: a 'cleared' message from a minute ago must
+            # not sit above drives that are faulted right now.
+            text = 'In fault: ' + ', '.join(faulted)
+            if message:
+                text += f'\n{message}'
+            self.clear_faults_label.setText(text)
+            colour = '#cb4b16'
+        else:
+            self.clear_faults_label.setText(message or 'No drive faults')
+            colour = '#859900' if message and 'cleared' in message.lower() else 'gray'
+        self.clear_faults_label.setStyleSheet(f'font-size: 11px; color: {colour};')
 
     def __refresh_tare(self, state):
         """Render the controller's tare state under the button.
@@ -747,6 +819,10 @@ class Window(QWidget):
         # after the test yaml.
         self.logging_queue.put_nowait({'test_name': test_file})
         duration = result['t'][-1] if result['n_cycles'] else 0.0
+        # Kept for the progress readout during the run.
+        self._plan_segments = result.get('segments') or []
+        self._plan_duration = duration
+        self._plan_truncated = result['truncated']
         # `truncated` is a preview cap (MAX_CYCLES), not a problem with the
         # plan — the rig runs the whole thing, so say so and arm it anyway.
         note = ' — preview capped, full test is longer' if result['truncated'] else ''
@@ -788,6 +864,9 @@ class Window(QWidget):
         self._armed_caption = ''
         self._armed_stale = False
         self._arm_error = None
+        self._plan_segments = []
+        self._plan_duration = 0.0
+        self._plan_truncated = False
         self.control_command_queue.put_nowait(['clear_test', 0])
         self.logging_queue.put_nowait({'test_name': None})
 
@@ -798,6 +877,7 @@ class Window(QWidget):
         holds the plan, the GUI has only asked for it.
         """
         self._controller_fault = bool(state.get('fault'))
+        self._progress = state.get('progress')
 
         # Taring is only legal with the rig idle and no test running, so the
         # button follows the controller's own precondition rather than letting
@@ -805,6 +885,15 @@ class Window(QWidget):
         self.tare_button.setEnabled(not state.get('test_active')
                                     and not state.get('tare_active'))
         self.__refresh_tare(state)
+
+        # Same reasoning as the tare button: the controller refuses a reset with
+        # a test running, and a reset with nothing faulted is a no-op, so the
+        # button offers itself only when it would do something.
+        self.clear_faults_button.setEnabled(
+            bool(state.get('faulted_drives'))
+            and not state.get('test_active')
+            and not state.get('fault_clear_active'))
+        self.__refresh_fault_clear(state)
 
         armed = state.get('armed')
         if self._requested_arm is not None:
@@ -850,6 +939,93 @@ class Window(QWidget):
             self.__set_status('armed', self._armed_caption)
         else:
             self.__set_status('idle', 'No test armed')
+
+    @staticmethod
+    def __fmt_duration(seconds):
+        """'45s' / '6m12s' / '1h04m'. Whole seconds, so a label refreshed on
+        every 30 ms tick only actually changes once a second."""
+        seconds = int(max(seconds, 0))
+        if seconds < 60:
+            return f'{seconds}s'
+        if seconds < 3600:
+            return f'{seconds // 60}m{seconds % 60:02d}s'
+        return f'{seconds // 3600}h{(seconds % 3600) // 60:02d}m'
+
+    def __refresh_progress(self):
+        """Where the run is: segment, repeat within it, and the clock.
+
+        Every duration here is an UPPER bound, and is written with a `≤` for
+        that reason. Three things make the expansion's timing a ceiling rather
+        than a prediction: a ramp_break releases as soon as the shaft breaks
+        free but expands as running every ramp to the amplitude ceiling, a
+        preamble can abort a block on drift, and neither is knowable offline.
+        Only the COUNTS (segment i/N, repeat j/m) are exact — which is why they
+        lead, and why there is no progress bar or percentage here. Mode-switch
+        stalls push the other way (the controller holds a command while a drive
+        changes mode), so an overrun is possible and is labelled as one rather
+        than clamped to a comfortable-looking zero.
+        """
+        if not self._log_active or self._run_started is None:
+            self.progress_label.setVisible(False)
+            self._segment_started = None
+            self._segment_seen = None
+            return
+
+        progress = self._progress or {}
+        index = progress.get('segment') or 0
+        count = progress.get('segments') or 0
+
+        # Stamp when the segment changed, for the in-segment estimate. The
+        # controller publishes the number; only this window knows the wall
+        # clock the operator is reading.
+        if index != self._segment_seen:
+            self._segment_seen = index
+            self._segment_started = time.time()
+
+        lines = []
+        if index and count:
+            line = f'Segment {index}/{count}'
+            if progress.get('segment_type'):
+                line += f' — {progress["segment_type"]}'
+            lines.append(line)
+
+        # A single-repeat behavior (a trace) has nothing to say here; showing
+        # '1/1' would only be noise next to the segment line.
+        repeat, repeats = progress.get('repeat') or 0, progress.get('repeats') or 0
+        if repeat and repeats > 1:
+            line = f'Repeat {repeat}/{repeats}'
+            budget = self.__segment_budget(index)
+            if budget is not None and self._segment_started is not None:
+                left = budget - (time.time() - self._segment_started)
+                # Floored at 1 s: a bound that counts down to '≤ 0s' and then
+                # sits there reads as a stall, when all it means is that the
+                # ceiling is about to be reached.
+                line += ('  ·  over estimate' if left <= 0 else
+                         f'  ·  ≤ {self.__fmt_duration(max(left, 1))} left here')
+            lines.append(line)
+
+        elapsed = self.__fmt_duration(time.time() - self._run_started)
+        if self._plan_duration and not self._plan_truncated:
+            lines.append(f'{elapsed} elapsed of ≤ '
+                         f'{self.__fmt_duration(self._plan_duration)}')
+        else:
+            # Truncated expansions have no total worth quoting — the plan runs
+            # past where the preview stopped looking.
+            lines.append(f'{elapsed} elapsed')
+
+        # Always at least the elapsed line: a running test with no progress
+        # block yet (the controller has not published one) still gets a clock,
+        # which is better than a panel that blinks in and out.
+        self.progress_label.setText('\n'.join(lines))
+        self.progress_label.setVisible(True)
+
+    def __segment_budget(self, index):
+        """The expansion's duration for segment `index` (1-based), or None if
+        the plan does not reach it — a truncated expansion stops early, so the
+        tail segments genuinely have no estimate to offer."""
+        if 1 <= index <= len(self._plan_segments):
+            return self._plan_segments[index - 1]['duration_s']
+        return None
 
     def __refresh_test_list(self):
         current = self.test_select.currentText()
@@ -967,6 +1143,9 @@ class Window(QWidget):
                 log_flag = sample[-2].get('log', False)
                 if log_flag and not self._log_active:
                     self._log_active = True
+                    self._run_started = time.time()
+                    self._segment_started = None
+                    self._segment_seen = None
                     self._active_log_dir = logger.log_dir_name()
                     # The armed plan, not the dropdown text — the two differ
                     # whenever a pick failed to load.
@@ -987,6 +1166,7 @@ class Window(QWidget):
         if control_state is not None:
             self.__reconcile_controller(control_state)
         self.__refresh_status()
+        self.__refresh_progress()
 
         if self._notes_prompt_pending:
             self._notes_prompt_pending = False

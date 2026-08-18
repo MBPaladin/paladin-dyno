@@ -112,6 +112,17 @@ class Controller(Master):
         self._tare_result = {}
         self._tare_message = None
 
+        # --- Drive fault reset ---
+        # A reset in flight: {'drives': [names asked], 'deadline': perf_counter}.
+        # None when idle. The outcome is only knowable a few cycles later -- the
+        # drive has to see the controlword and answer in its statusword -- so the
+        # request and the verdict are separate steps, and the verdict is what the
+        # operator actually needs (a fault whose cause is still present clears
+        # and re-latches immediately, which from the button alone is
+        # indistinguishable from a reset that worked).
+        self._fault_clear_state = None
+        self._fault_clear_message = None
+
         self._aux_funcs = []
         if self.mode == 'actuator_production':
             self._aux_funcs.append(self._aux_func_A3_Dyno)
@@ -201,6 +212,12 @@ class Controller(Master):
                            if self._test_load_error
                            and self._test_load_error[0] == current else None),
             'test_active': self._test_active,
+            # Where the run is, for the GUI's progress readout. Only meaningful
+            # while a test is running -- an armed-but-idle plan has not entered
+            # its first segment, and reporting last run's position would read as
+            # progress on this one.
+            'progress': (self.test_definition.progress()
+                         if self._test_active and self.test_definition else None),
             'fault': bool(self.devices.LOAD.fault
                           or (not self._load_only and self.devices.DUT.fault)),
             # Identifies the bring-up that wrote resolved_config.json, so the
@@ -215,6 +232,12 @@ class Controller(Master):
             'tare': self._tare_result or None,
             'tare_active': self._tare_state is not None,
             'tare_message': self._tare_message,
+            # Every faulted DS402 drive on the bus, not just the two the 'fault'
+            # flag above gates tests on -- the fault-reset button acts on all of
+            # them, so it has to be able to say which ones it would act on.
+            'faulted_drives': self._faulted_drives(),
+            'fault_clear_active': self._fault_clear_state is not None,
+            'fault_clear_message': self._fault_clear_message,
         }
 
     def _send_telemetry(self):
@@ -326,6 +349,9 @@ class Controller(Master):
                 elif cmd[0] == 'clear_tare':
                     self._clear_tare()
 
+                elif cmd[0] == 'clear_faults':
+                    self._clear_faults()
+
                 elif cmd[0] == 'clear_test':
                     # Disarm. The GUI sends this whenever it stops vouching for
                     # the armed test (a new pick, a failed load), because it
@@ -409,7 +435,77 @@ class Controller(Master):
                         'detail': f'{name} drive went into DS402 fault state{sw_text}'}
 
         return None
-    
+
+    # --- Drive fault reset --------------------------------------------------
+    # The reset itself is the drives' business (AKD.request_fault_reset pulses
+    # controlword bit 7 from the process-data loop); what lives here is which
+    # drives to ask and how the answer is reported.
+
+    # How long to wait before judging the result. Long enough for the pulse
+    # (AKD_FAULT_RESET_CYCLES ms) plus the drive's own reaction, and long enough
+    # that a fault whose cause is still present has re-latched by the time it is
+    # read -- checking the instant the fault bit drops would report success on a
+    # drive that faults again a millisecond later.
+    _FAULT_CLEAR_SETTLE_S = 0.5
+
+    def _drives(self):
+        """Every DS402 drive on the bus, by name. Duck-typed the same way
+        Master._release_drives is: the AXON and RB430 have no controlword."""
+        return [(name, device) for name, device in vars(self.devices).items()
+                if hasattr(device, 'request_fault_reset')]
+
+    def _faulted_drives(self):
+        return sorted(name for name, device in self._drives() if device.fault)
+
+    def _clear_faults(self):
+        """Pulse a fault reset at every faulted drive, or refuse and say why.
+
+        Refused mid-test on purpose: a drive fault trips a stop (see
+        _safety_trigger), so a reset while _test_active is still set would be
+        clearing the evidence of the thing that is in the middle of stopping the
+        run. Stop first, then clear."""
+        if self._test_active:
+            self._fault_clear_message = 'Fault reset refused: a test is running'
+        elif self.shutdown:
+            self._fault_clear_message = 'Fault reset refused: the rig is shutting down'
+        elif self._fault_clear_state is not None:
+            self._fault_clear_message = 'Fault reset already in progress'
+        else:
+            asked = [name for name, device in self._drives()
+                     if device.request_fault_reset()]
+            if not asked:
+                self._fault_clear_message = 'No drive faults to clear'
+            else:
+                self._fault_clear_state = {
+                    'drives': sorted(asked),
+                    'deadline': time.perf_counter() + self._FAULT_CLEAR_SETTLE_S,
+                }
+                self._fault_clear_message = (
+                    f'Clearing faults on {", ".join(sorted(asked))}...')
+        print(f'Controller: {self._fault_clear_message}')
+
+    def _fault_clear_step(self):
+        """Report on a reset once it has had time to take. Never blocks."""
+        st = self._fault_clear_state
+        if st is None or time.perf_counter() < st['deadline']:
+            return
+
+        self._fault_clear_state = None
+        faulted = set(self._faulted_drives())
+        stuck = [name for name in st['drives'] if name in faulted]
+        if not stuck:
+            self._fault_clear_message = (
+                f'Faults cleared on {", ".join(st["drives"])}')
+        else:
+            # The reset dropped the latch and the drive put it straight back:
+            # whatever caused the fault is still there. The drive's own account
+            # of it is on its front panel and in Workbench, which this process
+            # cannot read over the PDO map.
+            self._fault_clear_message = (
+                f'{", ".join(stuck)} still in fault - the cause is still '
+                f'present. Check the drive front panel / Workbench.')
+        print(f'Controller: {self._fault_clear_message}')
+
     # --- Torque cell tare ---------------------------------------------------
     # Averaging happens here rather than in the GUI because this loop sees every
     # sample at the bus cycle rate; the GUI's view is decimated for plotting and
@@ -614,6 +710,7 @@ class Controller(Master):
         # Before anything is commanded: a tare only ever runs with the rig idle,
         # and _tare_step abandons it the moment that stops being true.
         self._tare_step()
+        self._fault_clear_step()
 
         # Aligning LOAD's position frame to DUT's only means something when the
         # two are mechanically coupled, which load-only assumes they are not.
