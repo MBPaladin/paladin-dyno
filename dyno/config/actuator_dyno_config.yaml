@@ -126,3 +126,6 @@ log_keys:
   # Multisine preamble sample index (NaN outside a preamble). Analysis splits
   # the excitation into exact periods on this, not on timestamps.
   - [preamble_sample, preamble_sample]
+  # ramp_break breakaway marker: the commanded torque the online detector
+  # fired at, on that one sample only (NaN on every other sample).
+  - [breakaway_torque, breakaway_torque]

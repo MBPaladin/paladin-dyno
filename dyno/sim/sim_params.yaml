@@ -3,7 +3,9 @@
 
 inertia_kgm2: 25.0     # reflected inertia at the output shaft
 viscous_nms: 0.3       # viscous friction, Nm per rad/s
-coulomb_nm: 0.3        # coulomb friction magnitude, Nm
+coulomb_nm: 0.3        # coulomb (kinetic) friction magnitude, Nm
+stiction_nm: 0.5       # static friction; the shaft is pinned until torque exceeds this
+stick_band_radps: 0.02 # |omega| under this counts as at rest
 ambient_c: 25.0
 thermal_tau_s: 120.0   # stator temperature first-order time constant, s
 heat_c_per_nm: 0.15    # steady-state stator rise per Nm of load torque

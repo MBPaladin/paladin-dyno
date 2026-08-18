@@ -104,9 +104,27 @@ class LevelsField(QWidget):
         self.count.setFixedWidth(46)
         self.count.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
         self.spacing = QComboBox()
-        self.spacing.addItem('lin', 'linear')
-        self.spacing.addItem('log', 'log')
-        self.spacing.setFixedWidth(54)
+        for label, data, tip in (
+                ('lin', 'linear',
+                 'Evenly spaced from start to stop.'),
+                ('log', 'log',
+                 'Log-spaced from start to stop. Both must be non-zero and '
+                 'the same sign.'),
+                ('±log', 'log_sym',
+                 'Signed log sweep, never touching zero. The two boxes are '
+                 'the SMALLEST and LARGEST magnitude (order ignored) and n is '
+                 'points PER SIDE, so you get 2n levels running '
+                 '-max … -min, +min … +max.'),
+                ('±log⇄', 'log_sym_pairs',
+                 'The same 2n levels, ordered as ± pairs of ascending '
+                 'magnitude (-min, +min, -max, +max). Both directions are '
+                 'visited back to back at each magnitude, so drift cancels '
+                 'out of the direction asymmetry — at the cost of a full '
+                 'command reversal between every pair.')):
+            self.spacing.addItem(label, data)
+            self.spacing.setItemData(self.spacing.count() - 1, tip,
+                                     Qt.ItemDataRole.ToolTipRole)
+        self.spacing.setFixedWidth(72)
         self.mirror = QCheckBox()
         self.mirror.setToolTip('Also sweep back down (…, 75, 50, 25, 0) '
                                'without repeating the turnaround, so '
@@ -117,16 +135,37 @@ class LevelsField(QWidget):
                              f'levels, rounded to '
                              f'{test_builder.LEVEL_DECIMALS} decimals. '
                              'Hand-edit them afterwards if you like.')
-        for widget in (self.start, QLabel('→'), self.stop, QLabel('n'),
-                       self.count, self.spacing, QLabel('↩'), self.mirror,
-                       self.fill):
+        # Kept as attributes because the ± modes redefine what the boxes
+        # either side of them mean; _apply_spacing_labels retitles them.
+        self._range_label = QLabel('→')
+        self._count_label = QLabel('n')
+        for widget in (self.start, self._range_label, self.stop,
+                       self._count_label, self.count, self.spacing,
+                       QLabel('↩'), self.mirror, self.fill):
             gen.addWidget(widget)
         gen.addStretch(1)
         outer.addLayout(gen)
 
         self.fill.clicked.connect(self._fill)
+        self.spacing.currentIndexChanged.connect(self._apply_spacing_labels)
         self.edit.textEdited.connect(self._on_manual_edit)
         self.edit.editingFinished.connect(self.changed)
+        self._apply_spacing_labels()
+
+    def _apply_spacing_labels(self):
+        """Retitle the generator boxes for the selected spacing.
+
+        The ± modes read start/stop as magnitudes and n as points per side.
+        That is a real change of meaning, not a cosmetic one, so it is spelled
+        out on the widgets rather than left to the operator to remember.
+        """
+        symmetric = self.spacing.currentData() in test_builder.SYMMETRIC_SPACINGS
+        self._range_label.setText('↔' if symmetric else '→')
+        self._count_label.setText('n/side' if symmetric else 'n')
+        self.start.setToolTip('Smallest |level|' if symmetric else 'Sweep start')
+        self.stop.setToolTip('Largest |level|' if symmetric else 'Sweep stop')
+        self.count.setToolTip('Levels per side; the list gets 2n of them'
+                              if symmetric else 'Number of levels')
 
     @staticmethod
     def _gen_spin(value):
@@ -181,6 +220,9 @@ class LevelsField(QWidget):
             self.start.setValue(values[0])
             self.stop.setValue(max(values, key=abs))
             self.count.setValue(len(values))
+        # setCurrentIndex only signals on an actual change, so the labels have
+        # to be re-applied by hand after a restore that lands on the same mode.
+        self._apply_spacing_labels()
 
 
 class TestBuilderWindow(QWidget):
@@ -653,8 +695,11 @@ class TestBuilderWindow(QWidget):
         for widget in (self.sec_rate, self.sec_settle, self.repeats_spin,
                        self.lead_in_spin):
             widget.setEnabled(not grid)
-        shaping = not grid and 'position' in (self.primary_mode.currentText(),
-                                              self.secondary_mode.currentText())
+        # Corner blending shapes a trace; a generative behavior ramps its own
+        # transitions at its own rate limits, so there is nothing to shape.
+        shaping = (not test_builder.is_generative(seg)
+                   and 'position' in (self.primary_mode.currentText(),
+                                      self.secondary_mode.currentText()))
         if not shaping and self.shaping_toggle.isChecked():
             self.shaping_toggle.setChecked(False)  # fold, don't leave it grey
         self.shaping_toggle.setEnabled(shaping)
@@ -688,6 +733,12 @@ class TestBuilderWindow(QWidget):
                             else ('output' if self.primary_motor.currentText() == 'input'
                                   else 'input'))
             seg['params']['continuous_torque'] = self._cont_torque_default(torque_motor)
+        elif pattern == 'breakaway':
+            # The ramp is a torque ramp by definition; the hold motor keeps
+            # whatever mode it had.
+            self._loading = True
+            self.primary_mode.setCurrentText('torque')
+            self._loading = False
         self._apply_field_states(seg)
         self._rebuild_param_widgets(seg)
         item = self.seg_list.currentItem()
@@ -837,6 +888,10 @@ class TestBuilderWindow(QWidget):
                     # post-save expansion shows the exact command stream.
                     cols, rows = test_builder.gridpoint_preview_rows(
                         seg, self.limits)
+                elif test_builder.is_breakaway(seg):
+                    # Drawn as the no-breakaway case, so the preview is the
+                    # worst case rather than a guess (see the function).
+                    cols, rows = test_builder.breakaway_preview_rows(seg)
                 else:
                     cols, rows = test_builder.compile_segment(seg)
             except Exception as e:

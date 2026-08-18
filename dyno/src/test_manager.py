@@ -671,13 +671,274 @@ class Multisine:
         self.run += 1
 
 
+class RampBreak:
+    """Event-terminated torque ramp: the stiction / breakaway test
+    (behavior type 'ramp_break').
+
+    One motor ramps torque slowly from zero while the other holds; the moment
+    the shaft is seen to move, the ramp stops and releases back to zero, rests,
+    and the next ramp starts (in the opposite direction, if bipolar). The
+    breakaway torque is the static friction.
+
+    WHY THIS IS A BEHAVIOR AND NOT A TRACE PATTERN. A trace is precomputed and
+    replayed open-loop by TestTrace, so its release point is a wall-clock time
+    fixed before the test ran. Releasing on the *event* needs live feedback in
+    the command loop, which only a generator can do. The plumbing already
+    existed for the multisine preamble: TestManager passes `sensor_reader`
+    straight through, and the controller's snapshot is read inside the
+    generator, on the control thread, one cycle behind the command.
+
+    TRIGGER IS NOT MEASUREMENT. The detector here only decides *when to
+    release*. The breakaway torque itself is still read off the log afterwards
+    from the window just before motion onset (see the stiction analysis), which
+    is why the online detector can afford to be conservative: a trigger a few
+    milliseconds late costs nothing, a trigger on sensor noise costs a whole
+    ramp cycle. The predicate matches the offline one -- |velocity| over
+    threshold after having been below it for `stuck_s` -- which is causal (the
+    stuck window looks backwards only), so it ports to a running counter with
+    no change of meaning.
+
+    NO SENSOR = NO DETECTION, BY DESIGN. With `sensor_reader` None (preview,
+    offline expansion) or a reading that does not carry velocity, every ramp
+    runs to `amplitude` and releases on the ceiling. That is the worst case the
+    hardware could be asked for, which is exactly what the limit checks and the
+    preview plot should be showing. `amplitude` is therefore always a real
+    ceiling, never merely a hint -- on the rig too, a shaft that never breaks
+    free stops the ramp there.
+
+    Everything is SAMPLE-paced (one yield = one control cycle), not wall-clock
+    paced: the commanded torque at the trigger is then an exact function of the
+    sample count, so cycle jitter cannot smear the number the whole test exists
+    to measure.
+
+    Log flags reuse the grid-search span scheme, one span per ramp attempt,
+    covering ramp + release + rest so a span holds one complete breakaway
+    story:  <id>-RUN<r>-SETPOINT<n>. The moves between hold levels are
+    untagged, like GridSearch's ramps.
+    """
+
+    RAMP_DOWN_SAMPLES = 250     # matches TestTrace's stabilizing tail
+
+    def __init__(self, parameters, mode, limits, sensor_reader=None):
+        self.parameters = parameters
+        self.settings = parameters['settings']
+        self.mode = mode
+        self.limits = limits
+        self.sensor_reader = sensor_reader
+        self.log_id_base = parameters['id'] + '-RUN'
+        self.run = 0
+
+        s = self.settings
+        self.ramp_motor = s['ramp_motor']
+        assert self.ramp_motor in ('input', 'output'), \
+            "ramp_break ramp_motor must be 'input' or 'output', got %r" % (self.ramp_motor,)
+        self.hold_motor = 'output' if self.ramp_motor == 'input' else 'input'
+        self.hold_mode = s.get('hold_mode', 'torque')
+        assert self.hold_mode in ('torque', 'velocity', 'position'), \
+            'ramp_break hold_mode %r is not a control mode' % (self.hold_mode,)
+
+        self.hold_levels = [float(v) for v in s.get('hold_levels', [0.0])] or [0.0]
+        self.hold_rate = max(abs(float(s.get('hold_rate', 1.0))), 1e-12)
+        self.hold_settle_s = max(float(s.get('hold_settle_s', 0.0)), 0.0)
+        self.lead_in_s = max(float(s.get('lead_in_s', 0.0)), 0.0)
+
+        self.amplitude = abs(float(s['amplitude']))
+        self.rate = abs(float(s['rate']))
+        assert self.amplitude > 0, 'ramp_break amplitude must be > 0'
+        assert self.rate > 0, 'ramp_break rate must be > 0'
+        self.release_s = max(float(s.get('release_s', 1.0)), 1e-3)
+        self.rest_s = max(float(s.get('rest_s', 0.0)), 0.0)
+        self.bipolar = bool(s.get('bipolar', True))
+        self.cycles = max(1, int(s.get('cycles', 1)))
+
+        detect = s.get('detect') or {}
+        self.v_thresh = abs(float(detect.get('velocity_threshold', 0.5)))
+        self.stuck_s = max(float(detect.get('stuck_s', 0.25)), 0.0)
+        self.debounce = max(1, int(detect.get('debounce_cycles', 5)))
+        self.arm_fraction = min(max(float(detect.get('arm_fraction', 0.05)), 0.0), 1.0)
+        assert self.v_thresh > 0, 'ramp_break velocity_threshold must be > 0'
+
+        with open(dyno_paths.dyno_config_directory + '/master_config.yaml') as f:
+            self.dt = yaml.safe_load(f)['cycle_time_us'] / 1e6
+        self.stuck_samples = int(round(self.stuck_s / self.dt))
+
+        # The same ceilings TestTrace enforces, applied to the plan rather than
+        # to a trace file. The release slew is checked at `amplitude` because
+        # that is the largest value a release can ever start from.
+        ramp_limits = self.limits[self.ramp_motor]
+        assert self.amplitude <= ramp_limits['torque'], \
+            ('ramp_break amplitude %g Nm exceeds the %s motor torque limit %g'
+             % (self.amplitude, self.ramp_motor, ramp_limits['torque']))
+        assert self.rate <= ramp_limits['rotatum'], \
+            ('ramp_break rate %g Nm/s exceeds the %s motor rotatum limit %g'
+             % (self.rate, self.ramp_motor, ramp_limits['rotatum']))
+        assert self.amplitude / self.release_s <= ramp_limits['rotatum'], \
+            ('ramp_break release slew %g Nm/s exceeds the %s motor rotatum '
+             'limit %g; lengthen release_s'
+             % (self.amplitude / self.release_s, self.ramp_motor,
+                ramp_limits['rotatum']))
+        if self.ramp_motor == 'output':
+            reaction = reaction_torque_issue(self.amplitude, self.limits)
+            assert reaction is None, 'ramp_break amplitude: %s' % (reaction,)
+
+        hold_peak = max(abs(v) for v in self.hold_levels)
+        hold_limit = self.limits[self.hold_motor].get(self.hold_mode)
+        if hold_limit is not None:
+            assert hold_peak <= hold_limit, \
+                ('ramp_break hold level %g exceeds the %s motor %s limit %g'
+                 % (hold_peak, self.hold_motor, self.hold_mode, hold_limit))
+        if self.hold_mode == 'torque' and self.hold_motor == 'output':
+            reaction = reaction_torque_issue(hold_peak, self.limits)
+            assert reaction is None, 'ramp_break hold level: %s' % (reaction,)
+
+        self._peak = 0.0        # command value the last ramp ended on
+
+    # -- command helpers -----------------------------------------------------
+
+    def _cmd(self, ramp_value, hold_value, flag=None, breakaway=None):
+        cmd = {self.ramp_motor + '_mode': 'torque',
+               self.ramp_motor + '_command': float(ramp_value),
+               self.hold_motor + '_mode': self.hold_mode,
+               self.hold_motor + '_command': float(hold_value)}
+        if flag is not None:
+            cmd['log_flag'] = flag
+        if breakaway is not None:
+            # Marks the single sample the detector fired on, carrying the
+            # command value it fired at (log key 'breakaway_torque', NaN
+            # everywhere else). Without it a reader cannot tell a release that
+            # was triggered from one that merely hit the ceiling.
+            cmd['breakaway'] = float(breakaway)
+        return cmd
+
+    def _read_speed(self):
+        """|velocity| of the ramping motor, or None when it cannot be read --
+        which the caller must treat as 'no detection possible', never as zero
+        (zero would mean 'definitely stuck' and arm the detector on nothing)."""
+        if self.sensor_reader is None:
+            return None
+        try:
+            reading = self.sensor_reader()
+        except Exception:
+            return None
+        velocity = (reading or {}).get('velocity') or {}
+        value = velocity.get(self.ramp_motor)
+        if value is None:
+            return None
+        return abs(float(value))
+
+    def _dwell(self, ramp_value, hold_value, duration, flag=None):
+        for _ in range(int(round(duration / self.dt))):
+            yield self._cmd(ramp_value, hold_value, flag)
+
+    def _move_hold(self, start, target):
+        """Rate-limited move of the hold motor, ramp motor at zero, untagged."""
+        n = int(round(abs(target - start) / self.hold_rate / self.dt))
+        for i in range(n):
+            yield self._cmd(0.0, start + (target - start) * (i + 1) / n)
+
+    # -- the ramp ------------------------------------------------------------
+
+    def _ramp_to_break(self, sign, hold_value, flag):
+        """Ramp torque until the shaft breaks free, or until `amplitude`.
+
+        Leaves the command value it stopped at in self._peak, for the release.
+        """
+        step = self.rate * self.dt
+        max_samples = int(math.ceil(self.amplitude / step))
+        arm_floor = self.arm_fraction * self.amplitude
+        stuck = 0               # consecutive samples seen below threshold
+        stuck_at_onset = 0      # how long it had been stuck when motion started
+        moving_run = 0          # consecutive samples seen above threshold
+        value = 0.0
+
+        for i in range(1, max_samples + 1):
+            value = sign * min(i * step, self.amplitude)
+            speed = self._read_speed()
+            if speed is not None and speed > self.v_thresh:
+                if moving_run == 0:
+                    stuck_at_onset = stuck
+                moving_run += 1
+                stuck = 0
+            else:
+                # An unreadable sensor lands here too, but it can never trigger
+                # a release: moving_run stays 0, so the ramp runs to the ceiling.
+                moving_run = 0
+                stuck += 1
+            # `stuck` starts at 0 on every ramp rather than carrying over from
+            # the rest period: after a lurch the shaft may still be coasting
+            # when the next ramp begins, and re-earning the stuck window is what
+            # stops that coast from reading as an instant breakaway. It costs
+            # stuck_s of ramp, which at these rates is a few mNm.
+            if (moving_run >= self.debounce
+                    and stuck_at_onset >= self.stuck_samples
+                    and abs(value) >= arm_floor):
+                self._peak = value
+                print('RampBreak: breakaway at %+.4g Nm (%s motor)'
+                      % (value, self.ramp_motor))
+                yield self._cmd(value, hold_value, flag, breakaway=value)
+                return
+            yield self._cmd(value, hold_value, flag)
+
+        self._peak = value
+        print('RampBreak: no breakaway; ramp hit the %+.4g Nm ceiling' % (value,))
+
+    def _release(self, hold_value, flag):
+        n = max(1, int(round(self.release_s / self.dt)))
+        start = self._peak
+        for i in range(1, n + 1):
+            yield self._cmd(start * (1.0 - i / n), hold_value, flag)
+
+    # -- command generation --------------------------------------------------
+
+    def commands(self):
+        # Initial command sets op modes before any timing starts.
+        yield self._cmd(0.0, 0.0)
+
+        flag_base = self.log_id_base + str(self.run)
+        span = 0
+        hold_value = 0.0
+        directions = (1.0, -1.0) if self.bipolar else (1.0,)
+
+        if self.lead_in_s > 0:
+            yield from self._dwell(0.0, 0.0, self.lead_in_s)
+
+        for level in self.hold_levels:
+            if level != hold_value:
+                yield from self._move_hold(hold_value, level)
+                hold_value = level
+            if self.hold_settle_s > 0:
+                yield from self._dwell(0.0, hold_value, self.hold_settle_s)
+            for _ in range(self.cycles):
+                for sign in directions:
+                    flag = flag_base + '-SETPOINT' + str(span)
+                    span += 1
+                    yield from self._ramp_to_break(sign, hold_value, flag)
+                    yield from self._release(hold_value, flag)
+                    if self.rest_s > 0:
+                        yield from self._dwell(0.0, hold_value, self.rest_s, flag)
+
+        if hold_value != 0.0:
+            yield from self._move_hold(hold_value, 0.0)
+        for _ in range(self.RAMP_DOWN_SAMPLES):
+            yield self._cmd(0.0, 0.0)
+        if self.hold_mode == 'position':
+            # The same reset TestTrace does: toggling out of position mode makes
+            # the next entry into it re-zero against the current shaft angle.
+            yield {'input_mode': 'torque', 'output_mode': 'torque',
+                   'input_command': 0.0, 'output_command': 0.0}
+
+        self.run += 1
+
+
 class TestManager:
     def __init__(self, test_file, mode, limits, sensor_reader=None):
         # sensor_reader: optional zero-arg callable returning
-        # {'torque': {sensor_name: Nm}, 'position': {'input': rad, 'output': rad}}
-        # snapshotted from live telemetry. Only the preamble behavior uses it
-        # (noise-floor anchoring + drift supervision); None (as in preview /
-        # offline expansion) degrades to documented fallbacks.
+        # {'torque': {sensor_name: Nm}, 'position': {'input': rad, 'output': rad},
+        #  'velocity': {'input': rad/s, 'output': rad/s}}
+        # snapshotted from live telemetry. Used by the preamble (noise-floor
+        # anchoring + drift supervision) and by ramp_break (breakaway
+        # detection); None (as in preview / offline expansion) degrades to
+        # documented fallbacks -- for ramp_break, ramping to the ceiling.
         self.behaviors = {}
         self.test_config = None
         self.mode = mode
@@ -709,6 +970,9 @@ class TestManager:
             self.behaviors[behavior['id']] = GridSearch(behavior, self.mode, self.limits)
         elif behavior['type'] == 'preamble' and behavior['id'] not in self.behaviors:
             self.behaviors[behavior['id']] = Multisine(
+                behavior, self.mode, self.limits, self.sensor_reader)
+        elif behavior['type'] == 'ramp_break' and behavior['id'] not in self.behaviors:
+            self.behaviors[behavior['id']] = RampBreak(
                 behavior, self.mode, self.limits, self.sensor_reader)
         elif behavior['type'] == 'loop':
             for looped_behavior in behavior['behaviors']:

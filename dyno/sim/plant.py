@@ -2,9 +2,17 @@
 
 One rotational state (the output shaft): drives push torques in (already
 converted to output-frame by their behaviors), the plant integrates
-J*d(omega)/dt = sum(tau) - viscous - coulomb, and sensor behaviors read
-named quantities back out. Constants can be tuned in dyno/sim/sim_params.yaml
+J*d(omega)/dt = sum(tau) - friction, and sensor behaviors read named
+quantities back out. Constants can be tuned in dyno/sim/sim_params.yaml
 (optional) without touching code.
+
+Friction has two regimes. Sliding is the usual viscous + Coulomb pair. At rest
+the shaft STICKS: it is pinned at exactly zero velocity until the applied
+torque exceeds `stiction_nm`, then breaks free against the smaller Coulomb
+term and lurches. A plain tanh-Coulomb model has no such threshold -- the shaft
+creeps under any torque at all -- so it cannot be used to exercise anything
+that measures or detects breakaway (test_manager.RampBreak, the stiction
+analyses). Set `stiction_nm: 0` to get the old creep-everywhere behavior back.
 """
 import math
 import os
@@ -14,7 +22,12 @@ import yaml
 DEFAULTS = {
     'inertia_kgm2': 25.0,      # reflected inertia at the output shaft
     'viscous_nms': 1.5,        # viscous friction, Nm per rad/s
-    'coulomb_nm': 2.0,         # coulomb friction magnitude
+    'coulomb_nm': 2.0,         # coulomb (kinetic) friction magnitude
+    # Static friction. Meaningful only at or above coulomb_nm -- below it the
+    # shaft would break free into a larger resisting torque and immediately
+    # re-stick. 0 disables the stick model entirely.
+    'stiction_nm': 3.0,
+    'stick_band_radps': 0.02,  # |omega| under this counts as at rest
     'ambient_c': 25.0,
     'thermal_tau_s': 120.0,    # stator temp first-order time constant
     'heat_c_per_nm': 0.15,     # steady-state stator rise per Nm of load torque
@@ -38,6 +51,8 @@ class Plant:
         self.J = p['inertia_kgm2']
         self.b = p['viscous_nms']
         self.coulomb = p['coulomb_nm']
+        self.stiction = p['stiction_nm']
+        self.stick_band = p['stick_band_radps']
         self.ambient_c = p['ambient_c']
         self.thermal_tau = p['thermal_tau_s']
         self.heat_c_per_nm = p['heat_c_per_nm']
@@ -60,10 +75,25 @@ class Plant:
 
     def step(self, dt):
         tau_sum = sum(self._drive_torques.values())
-        friction = self.b * self.omega + self.coulomb * math.tanh(self.omega / 0.05)
-        alpha = (tau_sum - friction) / self.J
-        self.omega += alpha * dt
-        self.theta += self.omega * dt
+        at_rest = self.stiction > 0 and abs(self.omega) <= self.stick_band
+        if at_rest and abs(tau_sum) <= self.stiction:
+            # Stuck. Velocity is pinned to zero outright rather than merely
+            # damped hard: a stiff damper still creeps, and creep is exactly
+            # what must not happen here -- the measurement this model exists to
+            # support is the torque at FIRST motion, so any motion below the
+            # breakaway threshold is a false reading, not a small error.
+            self.omega = 0.0
+        else:
+            if at_rest:
+                # Breaking free: past the static threshold only the kinetic
+                # term resists, and that step down from stiction to coulomb is
+                # what makes the shaft lurch instead of easing into motion.
+                friction = math.copysign(self.coulomb, tau_sum)
+            else:
+                friction = (self.b * self.omega
+                            + self.coulomb * math.tanh(self.omega / 0.05))
+            self.omega += (tau_sum - friction) / self.J * dt
+            self.theta += self.omega * dt
 
         # Stator temperature: first-order approach to ambient + load-dependent rise
         target = self.ambient_c + self.heat_c_per_nm * abs(self.tau_dut_out)

@@ -205,6 +205,23 @@ PATTERNS = {
     # gets its own log flag with ramps/settles untagged, so post-processing can
     # group by flag. Axes: pattern-motor levels x other-motor levels, with the
     # pattern/other control modes required to be the velocity/torque pair.
+    # Compiles to a real `ramp_break` behavior (not a trace): the release point
+    # is chosen at run time from live velocity, which nothing precomputed can
+    # express. See test_manager.RampBreak. The pattern motor ramps torque; the
+    # other motor holds each of its levels in turn, exactly as it does for a
+    # trace segment.
+    'breakaway': {
+        'amplitude':          ('Ramp ceiling [Nm]', 5.0, float),
+        'rate':               ('Ramp rate [Nm/s]', 0.1, float),
+        'release_s':          ('Release back to 0 [s]', 1.0, float),
+        'rest_s':             ('Rest after release [s]', 2.0, float),
+        'bipolar':            ('Alternate direction each ramp', True, bool),
+        'cycles':             ('Ramps per direction', 3, int),
+        'velocity_threshold': ('Breakaway speed [rad/s]', 0.5, float),
+        'stuck_s':            ('Require stuck for [s]', 0.25, float),
+        'debounce_cycles':    ('Debounce [control cycles]', 5, int),
+        'arm_fraction':       ('Arm above (fraction of ceiling)', 0.05, float),
+    },
     'gridpoint': {
         'levels':               ('Pattern-motor levels (comma separated)',
                                  [15.0, 30.0, 60.0, 100.0], list),
@@ -243,17 +260,69 @@ def _round_levels(values):
     return [0.0 if r == 0 else r for r in rounded]  # normalize -0.0
 
 
+# The two symmetric modes REINTERPRET the start/stop inputs as magnitudes and
+# `n` as points per side (see generate_levels). They are separate spacing modes
+# rather than a modifier flag precisely because that reinterpretation is not
+# something a checkbox should do silently to two boxes labelled start and stop.
+SYMMETRIC_SPACINGS = ('log_sym', 'log_sym_pairs')
+SPACINGS = ('linear', 'log') + SYMMETRIC_SPACINGS
+
+
+def _log_magnitudes(lo, hi, n):
+    """`n` magnitudes log-spaced from `lo` to `hi`, both > 0."""
+    if n == 1:
+        return [float(lo)]
+    a, b = math.log(lo), math.log(hi)
+    return [math.exp(a + (b - a) * i / (n - 1)) for i in range(n)]
+
+
 def generate_levels(start, stop, n, spacing='linear', mirror=False):
     """`n` levels from `start` to `stop`, rounded to LEVEL_DECIMALS.
 
-    `spacing` is 'linear' or 'log' (log needs both endpoints non-zero and of
-    the same sign). `mirror` appends the descending sweep back to `start`
-    without repeating the turnaround point, so hysteresis shows up in one run.
+    `spacing`:
+      'linear'         `n` points evenly spaced from start to stop.
+      'log'            `n` points log-spaced; needs both endpoints non-zero and
+                       of the same sign.
+      'log_sym'        Signed log sweep. start/stop are MAGNITUDES (their order
+                       is ignored) and `n` is points PER SIDE, so the result has
+                       2n of them: -max ... -min, +min ... +max, monotonically
+                       increasing. Zero is never sampled -- a log sweep cannot
+                       reach it, and for anything measured as a ratio (gearbox
+                       efficiency, friction) a zero-load point carries no signal
+                       to take a ratio of.
+      'log_sym_pairs'  The same 2n magnitudes ordered as +/- pairs of ascending
+                       magnitude (-min, +min, -max, +max, ...). Visiting both
+                       directions back to back at each magnitude means thermal
+                       drift and cell zero-drift move both members of a pair
+                       together and cancel out of the direction asymmetry --
+                       which is the measurement in an efficiency or friction
+                       sweep. It costs a full command reversal between every
+                       pair, so 'log_sym' is the gentler sweep on the hardware.
+
+    `mirror` appends the descending sweep back to the first level without
+    repeating the turnaround point, so hysteresis shows up in one run.
     """
     n = int(n)
     if n < 1:
         raise ValueError('Number of levels must be at least 1')
-    if n == 1:
+    if spacing in SYMMETRIC_SPACINGS:
+        # start/stop are magnitudes here, so a sign on either is meaningless
+        # rather than wrong -- take abs and sort instead of rejecting.
+        if start == 0 or stop == 0:
+            raise ValueError('Symmetric log spacing needs both magnitudes '
+                             'non-zero (these boxes are the smallest and '
+                             'largest |level|, not the sweep endpoints)')
+        lo, hi = sorted((abs(float(start)), abs(float(stop))))
+        if n > 1 and lo == hi:
+            raise ValueError('Symmetric log spacing needs two different '
+                             'magnitudes to sweep between')
+        mags = _log_magnitudes(lo, hi, n)
+        if spacing == 'log_sym':
+            values = [-m for m in reversed(mags)] + list(mags)
+        else:
+            values = [v for m in mags for v in (-m, m)]
+        levels = _round_levels(values)
+    elif n == 1:
         levels = _round_levels([float(start)])
     elif spacing == 'linear':
         levels = _round_levels([start + (stop - start) * i / (n - 1)
@@ -273,8 +342,113 @@ def generate_levels(start, stop, n, spacing='linear', mirror=False):
     return levels
 
 
+# Patterns that compile to a generative behavior instead of a trace csv. Their
+# command stream only exists at run time -- a grid search walks its own
+# setpoints, a breakaway ramp ends on an event nobody can precompute -- so
+# there is no csv to write, compare against, or plot exactly.
+GENERATIVE_PATTERNS = ('gridpoint', 'breakaway')
+
+
+def is_generative(segment):
+    return segment.get('pattern') in GENERATIVE_PATTERNS
+
+
 def is_gridpoint(segment):
     return segment.get('pattern') == 'gridpoint'
+
+
+def is_breakaway(segment):
+    return segment.get('pattern') == 'breakaway'
+
+
+def breakaway_settings(segment):
+    """The `ramp_break` behavior settings a breakaway segment compiles to.
+
+    The pattern motor is the one that ramps (torque mode, enforced by
+    validation). The other motor keeps the meaning it has in every other
+    segment: it holds each of its levels in turn while the ramp cycles run
+    against it, which is how a stiction sweep against preload -- or against
+    output angle -- gets expressed.
+    """
+    primary = segment['primary']
+    secondary = segment['secondary']
+    params = segment.get('params', {})
+    p = lambda key: _param(params, 'breakaway', key)
+    return {
+        'ramp_motor': primary['motor'],
+        'hold_mode': secondary['control_mode'],
+        'hold_levels': [float(v) for v in secondary.get('levels', [0.0])] or [0.0],
+        'hold_rate': abs(float(secondary.get('rate', 1.0))) or 1.0,
+        'hold_settle_s': float(secondary.get('settle_s', 0.0)),
+        'lead_in_s': max(float(segment.get('lead_in_s', START_HOLD_S)), 0.0),
+        'amplitude': abs(float(p('amplitude'))),
+        'rate': abs(float(p('rate'))),
+        'release_s': float(p('release_s')),
+        'rest_s': float(p('rest_s')),
+        'bipolar': bool(p('bipolar')),
+        'cycles': int(p('cycles')),
+        'detect': {
+            'velocity_threshold': abs(float(p('velocity_threshold'))),
+            'stuck_s': float(p('stuck_s')),
+            'debounce_cycles': int(p('debounce_cycles')),
+            'arm_fraction': float(p('arm_fraction')),
+        },
+    }
+
+
+def breakaway_preview_rows(segment):
+    """Approximate keyframes for the live plot, in compile_segment's
+    (cols, rows) form.
+
+    Drawn as the NO-BREAKAWAY case: every ramp runs to the ceiling. That is
+    what the rig does when nothing lets go, it is exactly what the post-save
+    expansion produces (preview has no sensor to detect with), and it is the
+    longest and largest command stream the plan can ask for -- so the preview
+    is an upper bound rather than a guess at where the shaft will let go. A
+    real run is shorter, and its peaks are wherever the friction happened to
+    be."""
+    s = breakaway_settings(segment)
+    primary = segment['primary']
+    sec_motor = 'output' if primary['motor'] == 'input' else 'input'
+    sec_mode = segment['secondary']['control_mode']
+
+    rows = [(0.0, 0.0, 0.0)]
+    t = 0.0
+    sec = 0.0
+    hold_rate = max(s['hold_rate'], 1e-12)
+
+    def emit(primary_value):
+        rows.append((t, primary_value, sec))
+
+    if s['lead_in_s'] > 0:
+        t += s['lead_in_s']
+        emit(0.0)
+    directions = (1.0, -1.0) if s['bipolar'] else (1.0,)
+    for level in s['hold_levels']:
+        if level != sec:
+            t += abs(level - sec) / hold_rate
+            sec = level
+            emit(0.0)
+        if s['hold_settle_s'] > 0:
+            t += s['hold_settle_s']
+            emit(0.0)
+        for _ in range(max(1, s['cycles'])):
+            for sign in directions:
+                t += s['amplitude'] / max(s['rate'], 1e-12)
+                emit(sign * s['amplitude'])
+                t += max(s['release_s'], 1e-3)
+                emit(0.0)
+                if s['rest_s'] > 0:
+                    t += s['rest_s']
+                    emit(0.0)
+    if sec != 0.0:
+        t += abs(sec) / hold_rate
+        sec = 0.0
+        emit(0.0)
+
+    cols = ['time', f"{primary['motor']}_motor_torque",
+            f'{sec_motor}_motor_{sec_mode}']
+    return cols, rows
 
 
 def gridpoint_torque_motor(segment):
@@ -455,9 +629,9 @@ def compile_segment(segment):
     stepping through its levels: ramp to level -> settle -> run pattern ->
     next level, ending with a ramp back to 0.
     """
-    if is_gridpoint(segment):
-        raise ValueError('gridpoint segments compile to a grid_search '
-                         'behavior, not a trace')
+    if is_generative(segment):
+        raise ValueError(f"{segment['pattern']} segments compile to a "
+                         'generative behavior, not a trace')
     pattern = segment['pattern']
     params = segment.get('params', {})
     primary = segment['primary']
@@ -610,6 +784,8 @@ def validate_segment(segment, limits=None):
     TestTrace asserts so problems surface while editing, not at load time."""
     if is_gridpoint(segment):
         return _validate_gridpoint(segment, limits)
+    if is_breakaway(segment):
+        return _validate_breakaway(segment, limits)
     issues = []
     primary = segment['primary']
     secondary = segment['secondary']
@@ -711,6 +887,76 @@ def _validate_gridpoint(segment, limits=None):
     return issues
 
 
+def _validate_breakaway(segment, limits=None):
+    """Mirrors the RampBreak asserts so problems surface while editing."""
+    primary = segment['primary']
+    issues = []
+    if primary['control_mode'] != 'torque':
+        issues.append('breakaway ramps torque: put the pattern motor in '
+                      'torque mode')
+    s = breakaway_settings(segment)
+    detect = s['detect']
+    if s['amplitude'] <= 0:
+        issues.append('Ramp ceiling must be > 0')
+    if s['rate'] <= 0:
+        issues.append('Ramp rate must be > 0')
+    if s['release_s'] <= 0:
+        issues.append('Release time must be > 0')
+    if s['rest_s'] < 0:
+        issues.append('Rest time must be >= 0')
+    if detect['velocity_threshold'] <= 0:
+        issues.append('Breakaway speed must be > 0')
+    if detect['stuck_s'] < 0:
+        issues.append('Stuck time must be >= 0')
+    if detect['debounce_cycles'] < 1:
+        issues.append('Debounce must be at least 1 cycle')
+    if not 0.0 <= detect['arm_fraction'] <= 1.0:
+        issues.append('Arm fraction must be in [0, 1]')
+    if not s['hold_levels']:
+        issues.append('Hold motor has no levels')
+
+    if limits:
+        ramp = limits[primary['motor']]
+        sec_motor = 'output' if primary['motor'] == 'input' else 'input'
+        if s['amplitude'] > ramp['torque']:
+            issues.append(f"ramp ceiling {s['amplitude']:g} Nm exceeds the "
+                          f"{primary['motor']} motor torque limit "
+                          f"{ramp['torque']:g}")
+        if s['rate'] > ramp['rotatum']:
+            issues.append(f"ramp rate {s['rate']:g} Nm/s exceeds the "
+                          f"{primary['motor']} motor rotatum limit "
+                          f"{ramp['rotatum']:g}")
+        if s['release_s'] > 0 and s['amplitude'] / s['release_s'] > ramp['rotatum']:
+            issues.append(
+                f"release slew {s['amplitude'] / s['release_s']:g} Nm/s exceeds "
+                f"the {primary['motor']} motor rotatum limit "
+                f"{ramp['rotatum']:g}; lengthen the release time")
+        # The detector has to fire while the shaft is still slower than
+        # anything the rig will trip on -- a threshold at or above the motor's
+        # own velocity ceiling can only ever be reached by a lurch that has
+        # already aborted the run.
+        if detect['velocity_threshold'] >= ramp['velocity']:
+            issues.append(
+                f"breakaway speed {detect['velocity_threshold']:g} rad/s is at "
+                f"or above the {primary['motor']} motor velocity limit "
+                f"{ramp['velocity']:g}; it cannot fire before the rig's own "
+                'limits do')
+        if primary['motor'] == 'output':
+            reaction = reaction_torque_issue(s['amplitude'], limits)
+            if reaction:
+                issues.append(f'ramp ceiling: {reaction}')
+        hold_peak = max((abs(v) for v in s['hold_levels']), default=0.0)
+        hold_limit = limits[sec_motor].get(s['hold_mode'])
+        if hold_limit is not None and hold_peak > hold_limit:
+            issues.append(f"hold level {hold_peak:g} exceeds the {sec_motor} "
+                          f"motor {s['hold_mode']} limit {hold_limit:g}")
+        if s['hold_mode'] == 'torque' and sec_motor == 'output':
+            reaction = reaction_torque_issue(hold_peak, limits)
+            if reaction:
+                issues.append(f'hold level: {reaction}')
+    return issues
+
+
 def validate_recipe(recipe, limits=None, roles=None):
     issues = []
     if not recipe.get('segments'):
@@ -771,6 +1017,19 @@ def build_yaml_dict(recipe):
             # Repeats are ignored (the UI pins them to 1 for gridpoints).
             behaviors.append({'id': seg['id'], 'type': 'grid_search',
                               'settings': gridpoint_settings(seg)})
+            continue
+        if is_breakaway(seg):
+            # Real ramp_break behavior: releases on live velocity, no trace csv.
+            # Repeats still work -- the loop wrapper below applies to any
+            # behavior, generative or not.
+            behavior = {'id': seg['id'], 'type': 'ramp_break',
+                        'settings': breakaway_settings(seg)}
+            repeats = int(seg.get('repeats', 1))
+            if repeats > 1:
+                behavior = {'id': seg['id'] + '_LOOP', 'type': 'loop',
+                            'settings': {'loop_count': repeats},
+                            'behaviors': [behavior]}
+            behaviors.append(behavior)
             continue
         primary = seg['primary']
         secondary = seg['secondary']
@@ -840,8 +1099,8 @@ def save_test(recipe, tests_dir):
     os.makedirs(trace_dir, exist_ok=True)
 
     for seg in recipe['segments']:
-        if is_gridpoint(seg):
-            continue  # compiles to a grid_search behavior, no trace csv
+        if is_generative(seg):
+            continue  # compiles to a behavior, not a trace csv
         cols, rows = compile_segment(seg)
         csv_path = os.path.join(trace_dir, f"{name}__{seg['id']}.csv")
         with open(csv_path, 'w', newline='') as f:
@@ -877,7 +1136,7 @@ def load_recipe(yaml_path, tests_dir=None):
         name = sanitize_name(recipe.get('name', ''))
         trace_dir = os.path.join(tests_dir, 'traces', GENERATED_TRACE_DIR)
         for seg in recipe.get('segments', []):
-            if is_gridpoint(seg):
+            if is_generative(seg):
                 continue  # no trace csv to compare
             csv_path = os.path.join(trace_dir, f"{name}__{seg['id']}.csv")
             try:
