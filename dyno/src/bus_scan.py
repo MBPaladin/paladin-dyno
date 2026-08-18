@@ -25,7 +25,10 @@ for _model, _spec in DEVICE_CLASSES.items():
     BY_PRODUCT_CODE.setdefault(_spec['id'], []).append(_model)
 
 # Slaves the layout names individually rather than by model, because the
-# control code reaches for them by name (devices.LOAD, devices.DUT).
+# control code reaches for them by name (devices.LOAD, devices.DUT). These are
+# device names (which slave to talk to), not roles: what a port *means* on a
+# bench belongs in the config's `ports:` block (see inhouse_dyno_config.yaml),
+# which a new config should get alongside the layout printed here.
 AKD_HINTS = ['LOAD', 'DUT']
 
 

@@ -21,6 +21,25 @@
 # DUT.torque x DUT.gear_ratio = 25 Nm until the DUT derate below is raised.
 load_only: true
 
+# --- 0. PORTS ---
+# The rig's mechanical ports. `role` is what commands / the UI / analysis
+# target; `prefix` is what this bench's log channels are called (they differ on
+# the gearbox bench, which is why both fields exist); `device` is the EtherCAT
+# slave behind the port; `attached` is a free-text label for reports and figure
+# titles -- NO code branches on it; `cell` names the torque sensor on that
+# shaft. This block is carried into every log's resolved_config.json.
+ports:
+  - role: input
+    prefix: dut
+    device: DUT
+    attached: none
+    cell: input_torque
+  - role: output
+    prefix: load
+    device: LOAD
+    attached: none
+    cell: load_torque
+
 # --- 1. SENSOR CONFIGURATION ---
 sensors:
   # Output torque cell
@@ -196,3 +215,6 @@ log_keys:
   - [dut_statusword, devices.DUT.statusword]
   - [cycle_time_us, cycle_dt_us] # measured PDO loop interval
   - [wkc_error, wkc_error] # expected - actual working counter; 0 = healthy
+  # Multisine preamble sample index (NaN outside a preamble). Analysis splits
+  # the excitation into exact periods on this, not on timestamps.
+  - [preamble_sample, preamble_sample]

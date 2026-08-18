@@ -228,6 +228,10 @@ class Master:
         resolved = {'mode': getattr(self, 'mode', None),
                     'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
                     'session_id': self.session_id,
+                    # The bench's ports block rides along so analysis can map
+                    # device names to log prefixes / roles / attached labels
+                    # without re-opening the bench config (see Segment.ports).
+                    'ports': self.dyno_params.get('ports'),
                     'devices': {}}
         for device_name, device in vars(self.devices).items():
             entry = {'class': type(device).__name__}

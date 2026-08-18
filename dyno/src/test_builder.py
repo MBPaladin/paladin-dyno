@@ -30,12 +30,126 @@ time strictly increases, and torque/velocity channels end at 0.
 import hashlib
 import math
 import os
+import random
 import re
 
 import yaml
 
 MOTORS = ('input', 'output')
 MODES = ('torque', 'velocity', 'position')
+
+# --- optional test preamble --------------------------------------------------
+# A recipe-level (once per test, not per segment) measurement phase that runs
+# before the first segment: a silent hold for an ambient noise floor, or that
+# hold followed by a periodic multisine torque excitation at standstill for
+# FRF / resonance analysis. Absent key = 'none', so existing recipes are
+# untouched. `role` targets a port role the loaded bench declares (or 'all');
+# per-segment `lead_in_s` is unrelated and stays exactly as it is.
+PREAMBLE_MODES = ('none', 'hold', 'multisine')
+PREAMBLE_LEVELS = ('gentle', 'normal', 'hard')
+# One user-facing amplitude control, defined as target SNR of each excited
+# line over the measured per-bin noise floor -- never as a fraction of a motor
+# rating, which would be two orders of magnitude wrong across the two ports.
+PREAMBLE_SNR_DB = {'gentle': 20.0, 'normal': 30.0, 'hard': 40.0}
+
+# Fixed multisine design parameters. Deliberately not user knobs: the whole
+# scheme rests on exact periodicity at the logging rate, and every derived
+# quantity below is stored into the generated yaml so analysis and operators
+# can see it without re-deriving.
+MULTISINE_PERIOD_S = 2.0          # -> 2000 samples/period at 1 kHz, df = 0.5 Hz
+MULTISINE_PERIODS = 12            # first 2 are ramp-in + settling, discarded
+MULTISINE_DISCARD_PERIODS = 2
+MULTISINE_BAND_HZ = (5.0, 200.0)  # low: free-shaft rigid body; high: no AA filter
+MULTISINE_LINES_PER_DECADE = 24
+MULTISINE_DETECTION_FRACTION = 0.25  # odd lines silenced to measure odd distortion
+
+
+def default_preamble():
+    return {'mode': 'none', 'quiet_s': 3.0, 'role': 'output',
+            'level': 'normal', 'seed': 1234}
+
+
+def design_multisine(seed, cycle_time_s=0.001):
+    """Derive the multisine line set. Deterministic given `seed`.
+
+    Log-spaced candidates across the band are snapped to the nearest ODD FFT
+    bin (odd-only excitation leaves every even bin empty as a clean measure of
+    even-order distortion), deduplicated, and a seeded ~25% are silenced as
+    *detection lines* measuring odd-order distortion -- the dominant kind for
+    friction and backlash. Excited lines get Schroeder phases (low crest
+    factor without windowing, which would destroy the periodicity everything
+    here depends on).
+    """
+    n_samples = int(round(MULTISINE_PERIOD_S / cycle_time_s))
+    df = 1.0 / MULTISINE_PERIOD_S
+    f_lo, f_hi = MULTISINE_BAND_HZ
+    n_candidates = int(round(MULTISINE_LINES_PER_DECADE
+                             * math.log10(f_hi / f_lo))) + 1
+    bins = []
+    for i in range(n_candidates):
+        f = f_lo * (f_hi / f_lo) ** (i / (n_candidates - 1))
+        k = int(round(f / df))
+        k = k if k % 2 else (k + 1 if (f / df) >= k else k - 1)  # nearest odd
+        if f_lo / df <= k <= f_hi / df and k not in bins:
+            bins.append(k)
+    bins.sort()
+
+    rng = random.Random(int(seed))
+    n_detect = max(1, int(round(MULTISINE_DETECTION_FRACTION * len(bins))))
+    detection = set(rng.sample(bins, n_detect))
+    excited = [k for k in bins if k not in detection]
+
+    lines = []
+    for j, k in enumerate(bins):
+        if k in detection:
+            lines.append({'bin': k, 'freq_hz': k * df, 'detection': True})
+        else:
+            # Schroeder phase over the excited lines only, indexed in order.
+            m = excited.index(k)
+            phase = -math.pi * m * (m + 1) / len(excited)
+            lines.append({'bin': k, 'freq_hz': k * df, 'detection': False,
+                          'phase': round(phase % (2 * math.pi), 6)})
+    return {
+        'period_s': MULTISINE_PERIOD_S,
+        'samples_per_period': n_samples,
+        'periods': MULTISINE_PERIODS,
+        'discard_periods': MULTISINE_DISCARD_PERIODS,
+        'df_hz': df,
+        'band_hz': list(MULTISINE_BAND_HZ),
+        'seed': int(seed),
+        'n_excited': len(excited),
+        'lines': lines,
+    }
+
+
+def validate_preamble(preamble, roles=None):
+    """Human-readable issues with a recipe's preamble block (empty = clean)."""
+    if not preamble or preamble.get('mode', 'none') == 'none':
+        return []
+    issues = []
+    mode = preamble.get('mode')
+    if mode not in PREAMBLE_MODES:
+        issues.append(f'preamble mode must be one of {PREAMBLE_MODES}, got {mode!r}')
+        return issues
+    quiet_s = float(preamble.get('quiet_s', 0.0))
+    if quiet_s < 1.0:
+        # The quiet hold is what anchors the excitation amplitude (and the
+        # ambient floor); under a second there is nothing to average.
+        issues.append(f'preamble quiet_s must be >= 1.0 s, got {quiet_s:g}')
+    if mode == 'multisine':
+        level = preamble.get('level', 'normal')
+        if level not in PREAMBLE_LEVELS:
+            issues.append(f'preamble level must be one of {PREAMBLE_LEVELS}, '
+                          f'got {level!r}')
+        try:
+            int(preamble.get('seed', 1234))
+        except (TypeError, ValueError):
+            issues.append('preamble seed must be an integer')
+        role = preamble.get('role', 'output')
+        if roles is not None and role != 'all' and role not in roles:
+            issues.append(f'preamble role {role!r} is not declared by this '
+                          f'bench (declared: {", ".join(roles)}, or "all")')
+    return issues
 
 # --- position command shaping ----------------------------------------------
 # A piecewise-linear position trace has a velocity discontinuity at every
@@ -597,10 +711,11 @@ def _validate_gridpoint(segment, limits=None):
     return issues
 
 
-def validate_recipe(recipe, limits=None):
+def validate_recipe(recipe, limits=None, roles=None):
     issues = []
     if not recipe.get('segments'):
         issues.append('Recipe has no segments')
+    issues.extend(validate_preamble(recipe.get('preamble'), roles))
     seen = set()
     for seg in recipe.get('segments', []):
         if seg['id'] in seen:
@@ -633,6 +748,23 @@ def build_yaml_dict(recipe):
     """Assemble the runner-facing yaml dict (behaviors + embedded recipe)."""
     name = sanitize_name(recipe['name'])
     behaviors = []
+    preamble = recipe.get('preamble')
+    if preamble and preamble.get('mode', 'none') != 'none':
+        settings = {'mode': preamble['mode'],
+                    'quiet_s': float(preamble.get('quiet_s', 3.0))}
+        if preamble['mode'] == 'multisine':
+            seed = int(preamble.get('seed', 1234))
+            settings.update({
+                'role': preamble.get('role', 'output'),
+                'level': preamble.get('level', 'normal'),
+                'seed': seed,
+                # The derived line taxonomy is stored (not just the seed) so
+                # analysis and operators can read the excited/detection bins
+                # straight off the yaml without re-deriving them.
+                'design': design_multisine(seed),
+            })
+        behaviors.append({'id': 'PREAMBLE', 'type': 'preamble',
+                          'settings': settings})
     for seg in recipe['segments']:
         if is_gridpoint(seg):
             # Real grid_search behavior: per-setpoint log flags, no trace csv.

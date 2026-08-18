@@ -1,3 +1,5 @@
+import math
+
 import yaml
 import numpy as np
 import pandas as pd
@@ -5,7 +7,7 @@ import time
 from deployment import dyno_paths
 # test_builder imports nothing from this package, so this stays acyclic. The
 # shared check lives there because the builder must run without numpy/pandas.
-from dyno.src.test_builder import reaction_torque_issue
+from dyno.src.test_builder import design_multisine, reaction_torque_issue
 
 # iterator that yields loops of behaviors
 def loop_iterator(loop_definition):
@@ -391,12 +393,296 @@ class GridSearch:
         yield from self.hold(zero_setpoint, 0.1)
         self.run += 1
 
+class Multisine:
+    """Optional test preamble: a silent hold, optionally followed by a periodic
+    multisine torque excitation at standstill (behavior type 'preamble').
+
+    Deliberately a separate behavior from TestTrace -- it reads no trace file
+    and generates entirely from parameters, so existing tests carry zero
+    regression risk. Everything here is SAMPLE-paced (one yield = one control
+    cycle), never wall-clock paced: coherent averaging in analysis needs exact
+    period boundaries, which perf_counter cannot provide under cycle jitter.
+    For the same reason every command carries a monotonic 'sample_index' that
+    the controller exposes for logging (log key 'preamble_sample').
+
+    Log flags reuse the grid-search span scheme so analysis granularity='run'
+    groups all phases together:
+        <id>-RUN<r>-SETPOINT0    the quiet hold
+        <id>-RUN<r>-SETPOINT<n>  one excitation block per excited role
+    Which span is which phase is left to the data (the quiet span has no
+    active command), matching the applies_to-is-a-data-predicate convention.
+
+    Excitation is torque-mode only (velocity mode would put the drive's
+    velocity loop inside the measurement, and is gated by the far more
+    restrictive acceleration limit). Amplitude is anchored to the noise floor
+    measured during the quiet hold -- never to a fraction of a motor rating,
+    which would be two orders of magnitude wrong across the two ports.
+    """
+
+    # The controller's fixed wiring: DUT always receives input_command, LOAD
+    # always receives output_command. Roles map to devices via the bench's
+    # `ports:` block; this maps the device on to a command-stream side.
+    DEVICE_TO_STREAM = {'DUT': 'input', 'LOAD': 'output'}
+    DRIFT_LIMIT_RAD = 2.0       # |position - start| that aborts an excitation
+    CEILING_FRAC_CONT = 0.05    # absolute safety stop: 5% of continuous torque
+    ROTATUM_MARGIN = 0.9        # keep commanded slew inside 90% of the limit
+    RAMP_DOWN_SAMPLES = 250     # matches TestTrace's stabilizing tail
+    SIGMA_FALLBACK_NM = 0.1     # used when no sensor_reader (preview / no cell)
+
+    def __init__(self, parameters, mode, limits, sensor_reader=None):
+        self.parameters = parameters
+        self.settings = parameters['settings']
+        self.mode = mode                    # bench name, e.g. 'inhouse'
+        self.limits = limits
+        self.sensor_reader = sensor_reader
+        self.log_id_base = parameters['id'] + '-RUN'
+        self.run = 0
+
+        self.preamble_mode = self.settings['mode']
+        assert self.preamble_mode in ('hold', 'multisine'), \
+            f"preamble mode must be 'hold' or 'multisine', got {self.preamble_mode!r}"
+        self.quiet_s = float(self.settings['quiet_s'])
+        assert self.quiet_s >= 1.0, 'preamble quiet_s must be >= 1.0 s'
+
+        with open(f"{dyno_paths.dyno_config_directory}/master_config.yaml") as f:
+            self.dt = yaml.safe_load(f)['cycle_time_us'] / 1e6
+        with open(f"{dyno_paths.dyno_config_directory}/{mode}_dyno_config.yaml") as f:
+            bench = yaml.safe_load(f)
+
+        # Continuous-torque ratings per stream side, for the absolute ceiling.
+        self._cont_torque = {'input': 4.0, 'output': 110.0}  # legacy fallbacks
+        for slave in bench.get('expected_slave_layout', []):
+            side = self.DEVICE_TO_STREAM.get(slave.get('name'))
+            value = (slave.get('params', {}).get('motor_limits', {})
+                     .get('continuous_torque'))
+            if side and value is not None:
+                self._cont_torque[side] = abs(float(value))
+
+        # Resolve the requested role(s) to targets through the bench's ports.
+        ports = bench.get('ports') or [
+            {'role': side, 'device': dev, 'cell': None}
+            for dev, side in self.DEVICE_TO_STREAM.items()]
+        commandable = [p for p in ports
+                       if p.get('device') in self.DEVICE_TO_STREAM]
+        self.targets = []
+        if self.preamble_mode == 'multisine':
+            requested = self.settings.get('role', 'output')
+            chosen = (commandable if requested == 'all' else
+                      [p for p in commandable if p.get('role') == requested])
+            assert chosen, (f"preamble role {requested!r} matches no commandable "
+                            f"port on bench {mode!r} (declared: "
+                            f"{[p.get('role') for p in commandable]})")
+            for p in chosen:
+                self.targets.append({
+                    'role': p.get('role'),
+                    'side': self.DEVICE_TO_STREAM[p['device']],
+                    'cell': p.get('cell'),
+                })
+            self.design = self.settings.get('design') or design_multisine(
+                int(self.settings.get('seed', 1234)), self.dt)
+            self.snr_db = {'gentle': 20.0, 'normal': 30.0, 'hard': 40.0}[
+                self.settings.get('level', 'normal')]
+
+    # -- waveform synthesis --------------------------------------------------
+
+    def _unit_period(self, weights):
+        """One period of the multisine with per-line amplitudes `weights`,
+        explicitly DC-nulled. Returns a float array of samples_per_period."""
+        N = int(self.design['samples_per_period'])
+        n = np.arange(N)
+        u = np.zeros(N)
+        for line, w in zip(self._excited_lines(), weights):
+            k = line['bin']
+            u += w * np.cos(2 * np.pi * k * n / N + line['phase'])
+        # There is no DC bin by construction, but any numeric DC in a torque
+        # command integrates straight into position runaway on a free shaft.
+        return u - u.mean()
+
+    def _excited_lines(self):
+        return [l for l in self.design['lines'] if not l['detection']]
+
+    def _scaled_period(self, side, sigma):
+        """Synthesize and numerically scale one period for `side`.
+
+        The shaping rule (comment kept ON PURPOSE -- this looks arbitrary
+        later and gets 'simplified' into a bug): shape to equalize SNR per
+        line, which for a roughly white noise floor means FLAT amplitude; then
+        scale to fit the torque ceiling and the rotatum budget; tilt toward
+        1/f ONLY if the slew budget is what binds, and only if that actually
+        buys a better worst-line amplitude. Scaling is numeric (measure the
+        synthesized waveform's real peak and peak slew), not analytic.
+
+        Returns (period_array, report_dict).
+        """
+        N = int(self.design['samples_per_period'])
+        n_avg = (self.design['periods'] - self.design['discard_periods'])
+        # Per-bin amplitude noise of a rectangular-window FFT of N samples,
+        # after coherent averaging across the retained periods.
+        floor = 2.0 * sigma / math.sqrt(N) / math.sqrt(n_avg)
+        target = floor * 10 ** (self.snr_db / 20.0)   # per-line amplitude [Nm]
+
+        ceiling = self.CEILING_FRAC_CONT * self._cont_torque[side]
+        rotatum = self.ROTATUM_MARGIN * self.limits[side]['rotatum']
+
+        lines = self._excited_lines()
+        f_lo = lines[0]['freq_hz']
+
+        def scaled(weights):
+            u = self._unit_period(weights)
+            peak = float(np.max(np.abs(u)))
+            # Periodic waveform: include the wrap-around step in the slew.
+            slew = float(np.max(np.abs(np.diff(np.append(u, u[0]))))) / self.dt
+            s_ceiling = ceiling / peak
+            s_rotatum = rotatum / slew
+            s = min(target, s_ceiling, s_rotatum)
+            bound = ('target SNR' if s == target else
+                     'torque ceiling' if s == s_ceiling else 'rotatum')
+            worst = s * min(weights)      # weakest line's amplitude
+            return u * s, {'scale': s, 'peak_Nm': s * peak,
+                           'peak_slew_Nm_s': s * slew, 'bound': bound,
+                           'worst_line_Nm': worst}
+
+        flat, flat_rep = scaled([1.0] * len(lines))
+        if flat_rep['bound'] != 'rotatum':
+            return flat, dict(flat_rep, shaping='flat', target_line_Nm=target,
+                              floor_Nm=floor, sigma_Nm=sigma)
+        # Slew binds: a 1/f tilt moves amplitude down-band where slew is cheap.
+        tilt, tilt_rep = scaled([f_lo / l['freq_hz'] for l in lines])
+        if tilt_rep['worst_line_Nm'] > flat_rep['worst_line_Nm']:
+            return tilt, dict(tilt_rep, shaping='1/f', target_line_Nm=target,
+                              floor_Nm=floor, sigma_Nm=sigma)
+        return flat, dict(flat_rep, shaping='flat', target_line_Nm=target,
+                          floor_Nm=floor, sigma_Nm=sigma)
+
+    # -- command generation ----------------------------------------------------
+
+    def _cmd(self, side, value, flag=None, sample_index=None):
+        cmd = {'input_mode': 'torque', 'output_mode': 'torque',
+               'input_command': 0.0, 'output_command': 0.0}
+        if side is not None:
+            cmd[f'{side}_command'] = float(value)
+        if flag is not None:
+            cmd['log_flag'] = flag
+        if sample_index is not None:
+            cmd['sample_index'] = float(sample_index)
+        return cmd
+
+    def _read(self):
+        if self.sensor_reader is None:
+            return None
+        try:
+            return self.sensor_reader()
+        except Exception:
+            return None
+
+    def commands(self):
+        # Initial command sets both drives to torque mode before timers start.
+        yield self._cmd(None, 0.0)
+
+        sample = 0
+        setpoint = 0
+        flag_base = self.log_id_base + str(self.run)
+
+        # --- quiet hold: ambient floor, and sigma for the amplitude anchor ---
+        # Runs FIRST in every mode: the floor is needed both to interpret the
+        # excitation and to set its amplitude. Structural, not a user choice.
+        n_quiet = int(round(self.quiet_s / self.dt))
+        n_settle = min(n_quiet // 3, int(round(0.5 / self.dt)))
+        sums, sumsqs, counts = {}, {}, 0
+        flag = f'{flag_base}-SETPOINT{setpoint}'
+        for i in range(n_quiet):
+            yield self._cmd(None, 0.0, flag, sample)
+            sample += 1
+            if i >= n_settle:
+                reading = self._read()
+                if reading:
+                    for name, value in reading.get('torque', {}).items():
+                        sums[name] = sums.get(name, 0.0) + value
+                        sumsqs[name] = sumsqs.get(name, 0.0) + value * value
+                    counts += 1
+        setpoint += 1
+
+        sigmas = {}
+        for name in sums:
+            mean = sums[name] / counts
+            sigmas[name] = math.sqrt(max(sumsqs[name] / counts - mean * mean, 0.0))
+        if sigmas:
+            print('Preamble: quiet-hold torque cell sigma: '
+                  + ', '.join(f'{k}={v:.4f} Nm' for k, v in sorted(sigmas.items())))
+
+        if self.preamble_mode == 'hold':
+            self.run += 1
+            return
+
+        # --- one excitation block per target role ---------------------------
+        for target in self.targets:
+            side = target['side']
+            sigma = sigmas.get(target['cell'])
+            if sigma is None:
+                # No reader (preview) or no cell on this shaft: fall back and
+                # say so. The fallback is conservative -- amplitudes stay small.
+                sigma = self.SIGMA_FALLBACK_NM
+                print(f"Preamble: no measured sigma for role '{target['role']}'"
+                      f' (cell {target["cell"]!r}); using fallback '
+                      f'{sigma:g} Nm')
+            period, rep = self._scaled_period(side, sigma)
+            print(f"Preamble: role '{target['role']}' ({side} side): "
+                  f"{rep['shaping']} shaping, peak {rep['peak_Nm']:.3f} Nm, "
+                  f"peak slew {rep['peak_slew_Nm_s']:.1f} Nm/s, bound by "
+                  f"{rep['bound']} (per-line target {rep['target_line_Nm'] * 1e3:.2f} mNm "
+                  f"over a {rep['floor_Nm'] * 1e3:.3f} mNm floor). Sanity-check "
+                  f"the peak Nm figure against expected drag.")
+
+            N = len(period)
+            flag = f'{flag_base}-SETPOINT{setpoint}'
+            setpoint += 1
+            reading = self._read()
+            pos0 = (reading or {}).get('position', {}).get(side)
+            aborted = False
+            last = 0.0
+            for p in range(int(self.design['periods'])):
+                # First period is an amplitude ramp-in (which also satisfies
+                # the start-at-zero invariant); a taper window would destroy
+                # the periodicity the whole scheme depends on.
+                env = None if p else np.arange(N) / N
+                for i in range(N):
+                    last = period[i] * (env[i] if env is not None else 1.0)
+                    yield self._cmd(side, last, flag, sample)
+                    sample += 1
+                # Free-far-shaft safety: zero-mean by construction, but any DC
+                # in command or cell integrates into position runaway. The
+                # config's velocity safety would catch it late; this is early.
+                reading = self._read()
+                pos = (reading or {}).get('position', {}).get(side)
+                if pos0 is not None and pos is not None and \
+                        abs(pos - pos0) > self.DRIFT_LIMIT_RAD:
+                    print(f'Preamble: position drifted {abs(pos - pos0):.2f} rad '
+                          f'during excitation of {side}; aborting this block')
+                    aborted = True
+                    break
+            # Ramp the command back to zero (untagged, like GridSearch ramps).
+            for i in range(self.RAMP_DOWN_SAMPLES):
+                frac = 1.0 - (i + 1) / self.RAMP_DOWN_SAMPLES
+                yield self._cmd(side, last * frac, None, sample)
+                sample += 1
+            if aborted:
+                break
+
+        self.run += 1
+
+
 class TestManager:
-    def __init__(self, test_file, mode, limits):
+    def __init__(self, test_file, mode, limits, sensor_reader=None):
+        # sensor_reader: optional zero-arg callable returning
+        # {'torque': {sensor_name: Nm}, 'position': {'input': rad, 'output': rad}}
+        # snapshotted from live telemetry. Only the preamble behavior uses it
+        # (noise-floor anchoring + drift supervision); None (as in preview /
+        # offline expansion) degrades to documented fallbacks.
         self.behaviors = {}
         self.test_config = None
         self.mode = mode
         self.limits = limits
+        self.sensor_reader = sensor_reader
         self.name = test_file.split('.')[0]
 
         with open(f"{dyno_paths.dyno_test_directory}/{test_file}", "r") as f:
@@ -421,6 +707,9 @@ class TestManager:
             self.behaviors[behavior['id']] = TestTrace(behavior, self.mode, self.limits)
         elif behavior['type'] == 'grid_search' and behavior['id'] not in self.behaviors:
             self.behaviors[behavior['id']] = GridSearch(behavior, self.mode, self.limits)
+        elif behavior['type'] == 'preamble' and behavior['id'] not in self.behaviors:
+            self.behaviors[behavior['id']] = Multisine(
+                behavior, self.mode, self.limits, self.sensor_reader)
         elif behavior['type'] == 'loop':
             for looped_behavior in behavior['behaviors']:
                 self._load_behavior(looped_behavior)

@@ -105,8 +105,37 @@ class Segment:
     def device_params(self, name):
         return self.devices().get(name, {}).get('params', {})
 
+    # A bench's `ports:` block (carried into resolved_config.json) maps each
+    # mechanical port to: `role` (what commands and the UI target), `prefix`
+    # (what this bench's log channels are called), `device` (which EtherCAT
+    # slave), `attached` (free text for figure titles -- nothing branches on
+    # it), and optionally `cell` (the torque sensor on that shaft).
+    def ports(self):
+        return self.config.get('ports') or []
+
+    def port_by_role(self, role):
+        for port in self.ports():
+            if port.get('role') == role:
+                return port
+        return None
+
+    def attached_label(self, role):
+        """Human label for what is bolted to a port, for figure titles."""
+        port = self.port_by_role(role)
+        attached = (port or {}).get('attached')
+        return str(attached) if attached and attached != 'none' else ''
+
     def prefix(self, device_name):
-        """Config device name -> log channel prefix ('LOAD' -> 'load')."""
+        """Config device name -> log channel prefix.
+
+        Read from the bench's `ports:` block when one exists. The lowercase
+        fallback is only correct on benches whose prefixes happen to equal
+        their device names (`DUT`/`LOAD` -> `dut_*`/`load_*`); the gearbox
+        bench logs `input_*`/`output_*` and silently matched nothing under it.
+        """
+        for port in self.ports():
+            if port.get('device') == device_name and port.get('prefix'):
+                return str(port['prefix'])
         return device_name.lower()
 
 

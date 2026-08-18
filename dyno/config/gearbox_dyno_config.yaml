@@ -1,5 +1,22 @@
 # GEARBOX DYNO CONFIG
 
+# --- 0. PORTS ---
+# See inhouse_dyno_config.yaml for the field definitions. This bench is the
+# one whose log prefixes (`input_*`/`output_*`) differ from its device names
+# (`DUT`/`LOAD`) -- without this block, analysis lowercases the device name
+# and silently finds no channels.
+ports:
+  - role: input
+    prefix: input
+    device: DUT
+    attached: gearbox_input
+    cell: input_torque
+  - role: output
+    prefix: output
+    device: LOAD
+    attached: gearbox_output
+    cell: output_torque
+
 # --- 1. SENSOR CONFIGURATION ---
 # All logical sensors go here. Port mapping handles the hardware routing.
 sensors:

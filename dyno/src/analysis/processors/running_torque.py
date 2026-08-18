@@ -79,15 +79,22 @@ def stft(sig, fs, win_n, hop):
 
     Scaled so a pure sinusoid reads its own peak amplitude in the signal's
     units, which is what makes the ripple numbers below quotable in Nm.
+
+    The window is the PERIODIC Hann (np.hanning is the symmetric variant,
+    which slightly biases amplitudes quoted in Nm), and the FFT is zero-padded
+    2x: plain Hann scalloping loss reaches 1.4 dB for a line landing between
+    bins, which would bias dominant_line_Nm directly.
     """
     win_n = min(int(win_n), len(sig))
-    win = np.hanning(win_n)
-    fr = np.fft.rfftfreq(win_n, 1.0 / fs)
+    win = np.hanning(win_n + 1)[:-1]          # periodic Hann
+    nfft = 2 * win_n
+    fr = np.fft.rfftfreq(nfft, 1.0 / fs)
     starts = np.arange(0, len(sig) - win_n + 1, hop, dtype=int)
     frames = np.empty((len(starts), len(fr)))
     for i, k in enumerate(starts):
         seg = sig[k:k + win_n]
-        frames[i] = np.abs(np.fft.rfft((seg - seg.mean()) * win)) * 2 / win.sum()
+        frames[i] = np.abs(np.fft.rfft((seg - seg.mean()) * win,
+                                       n=nfft)) * 2 / win.sum()
     return fr, frames, starts
 
 
@@ -105,6 +112,15 @@ def _parse_orders(text):
 
 def _db(x, ref):
     return 20.0 * np.log10(np.asarray(x) / ref + 1e-12)
+
+
+def _nice_bin(span, target=50):
+    """A readable bin width giving roughly `target` bins across `span`:
+    the raw quotient snapped to a 1/2/2.5/5 x 10^k grid."""
+    raw = max(span / target, 1e-9)
+    mag = 10.0 ** np.floor(np.log10(raw))
+    return float(min((mag * m for m in (1.0, 2.0, 2.5, 5.0, 10.0)),
+                     key=lambda w: abs(w - raw)))
 
 
 @register
@@ -132,23 +148,37 @@ class RunningTorque(Processor):
         # -- drag curve ------------------------------------------------------
         'smooth_s':         (0.1,    float, 'Rolling-average width used to detrend '
                                             'torque into ripple [s]'),
-        'vel_bin_rad_s':    (0.25,    float, 'Velocity bin width for the drag curve [rad/s]'),
+        'vel_bin_rad_s':    (0.0,    float, 'Velocity bin width for the drag curve '
+                                            '[rad/s]; 0 = derive from the sweep '
+                                            'span (~50 occupied bins)'),
         'min_bin_samples':  (200,    int,   'Samples a velocity bin needs to be reported'),
         'fit_min_vel':      (1.0,    float, 'Ignore |w| below this in the Coulomb+viscous fit [rad/s]'),
         'tare_from_leadin': (True,   bool,  'Subtract the stationary lead-in mean from the torque cell'),
         # -- spectral --------------------------------------------------------
-        'stft_win':         (1024,   int,   'STFT window [samples]'),
+        'stft_win':         (0,      int,   'STFT window [samples]; 0 = derive '
+                                            'from the measured sweep rate and '
+                                            'the highest overlaid order'),
         'stft_overlap':     (0.75,   float, 'STFT window overlap, 0-1'),
         'fmax_hz':          (500.0,  float, 'Top of the plotted frequency axis [Hz]'),
         'fmin_hz':          (1.0,    float, 'Ignore below this when picking dominant lines [Hz]'),
         'speed_source':     ('measured', str, "Speed axis from 'measured' or 'command' velocity"),
-        'speed_bin_rad_s':  (0.1,   float, 'Speed bin width for the folded spectrogram [rad/s]'),
+        'speed_bin_rad_s':  (0.0,   float, 'Speed bin width for the folded '
+                                           'spectrogram [rad/s]; 0 = derive '
+                                           'from peak speed (~50 bins)'),
         'moving_min_speed': (0.5,   float, 'Frames slower than this are not part of '
                                             'the moving record [rad/s]'),
         'orders':           ('1,2,3', str,  'Driven-shaft orders to overlay'),
         'overlay_fast_shaft': (False, bool,  'Overlay the far-shaft (mesh/cogging) '
                                             'orders as well as the driven-shaft ones'),
-        'db_floor':         (-40.0,  float, 'Bottom of the colour scale [dB]'),
+        'db_floor':         (0.0,    float, 'Bottom of the colour scale [dB]; '
+                                            '0 = derive from the map\'s actual '
+                                            'dynamic range'),
+        'resonance_overlay_hz': ('', str,   'Comma-separated frequencies to draw '
+                                            'as horizontal lines on the '
+                                            'spectrograms (and hyperbolas on the '
+                                            'Campbell map); populate from '
+                                            'multisine_frf\'s '
+                                            'structural_resonances_hz metric'),
         'min_static_frames': (3,     int,   'STFT frames the lead-in needs to serve as a floor'),
         'order_min_speed_frac': (0.4, float, 'Order spectrum ignores frames below this '
                                              'fraction of peak speed, where order '
@@ -158,6 +188,9 @@ class RunningTorque(Processor):
         'fig_drag':          (True,  bool,  'Drag torque vs velocity'),
         'fig_order_spectrum': (True, bool,  'Amplitude vs shaft order'),
         'fig_spectrogram':   (True,  bool,  'Spectrograms (vs time and vs |speed|)'),
+        'fig_campbell':      (True,  bool,  'Campbell/order map: |speed| vs order, '
+                                            'so orders are horizontal lines and '
+                                            'resonances are hyperbolas'),
         'fig_waterfall':     (False,  bool,  'Waterfalls (vs time and vs |speed|)'),
         'fig_vs_time':       (True,  bool,  'Emit the time-axis members of the above'),
         'fig_vs_speed':      (True,  bool,  'Emit the |speed|-axis members of the above'),
@@ -183,12 +216,20 @@ class RunningTorque(Processor):
         Read from the command rather than assumed from the test's `lead_in_s`:
         the builder's lead-in and the secondary axis' settle time both land in
         it, so the data knows the real number and the recipe does not.
+
+        'Uncommanded' means NO torque or velocity command channel is active --
+        not merely the sweep's own velocity command. A torque-commanded
+        excitation is stationary in velocity terms and would otherwise pass as
+        'at rest', silently folding real excitation into the noise floor.
+        (Position commands are exempt: a held position is non-zero at rest.)
         """
         v = np.abs(np.nan_to_num(seg[vch], nan=np.inf))
         still = v <= vel_tol
-        if vcmd_ch and seg.has(vcmd_ch):
-            cmd = np.nan_to_num(seg[vcmd_ch], nan=0.0)
-            still &= np.abs(cmd) <= cmd_tol
+        for ch in seg.channels():
+            if ch.endswith(('_velocity_command', '_torque_command')) \
+                    and seg.is_active(ch):
+                cmd = np.nan_to_num(seg[ch], nan=0.0)
+                still &= np.abs(cmd) <= cmd_tol
         if not still[0]:
             return 0
         stop = np.argmin(still)                  # first False
@@ -226,7 +267,7 @@ class RunningTorque(Processor):
         # 2. The sweep has to visit many speeds, or there is no drag curve to
         #    fit and no ray to distinguish from a resonance.
         v = np.nan_to_num(cat(vch), nan=0.0)
-        bw = d['vel_bin_rad_s']
+        bw = d['vel_bin_rad_s'] or _nice_bin(float(v.max() - v.min()))
         occupied = np.bincount(np.clip(
             ((v - v.min()) // bw).astype(int), 0, None))
         n_bins = int(np.count_nonzero(occupied >= d['min_bin_samples']))
@@ -287,6 +328,27 @@ class RunningTorque(Processor):
 
         smooth_n = max(3, int(round(params['smooth_s'] * fs)))
 
+        # Ports: label each stream side by what the config says is attached,
+        # so two reports from different mechanical configurations stay
+        # distinguishable at a glance (the baseline-vs-gearbox workflow).
+        self._attached = {}
+        for port in seg.ports():
+            side = {'DUT': 'input', 'LOAD': 'output'}.get(port.get('device'))
+            attached = port.get('attached')
+            if side and attached and attached != 'none':
+                self._attached[side] = str(attached)
+
+        # No analog anti-alias filter sits ahead of the torque cell, so real
+        # content above Nyquist folds down and appears as genuine lines.
+        if float(params['fmax_hz']) >= 0.49 * fs:
+            res.add('warn', 'aliasing_possible',
+                    f'fmax_hz={params["fmax_hz"]:g} is essentially Nyquist '
+                    f'({fs / 2:.0f} Hz) and there is no analog anti-alias '
+                    f'filter ahead of the cell: real content above '
+                    f'{fs / 2:.0f} Hz folds down and is indistinguishable from '
+                    f'a genuine line. Treat unexplained lines near the top of '
+                    f'the band with suspicion.')
+
         # -- gather, tare -------------------------------------------------
         v = np.concatenate([np.nan_to_num(s[vch], nan=0.0) for s in segs])
         tq_raw = np.concatenate([np.nan_to_num(s[tch], nan=0.0) for s in segs])
@@ -314,6 +376,15 @@ class RunningTorque(Processor):
 
         # -- drag curve ----------------------------------------------------
         bw = params['vel_bin_rad_s']
+        if not bw:
+            # Target ~50 occupied bins whatever the record: a fixed width is
+            # wrong for both a 20 s and a 200 s run.
+            bw = _nice_bin(float(v.max() - v.min()))
+            res.add('info', 'derived_vel_bin',
+                    f'vel_bin_rad_s derived as {bw:g} rad/s: the sweep spans '
+                    f'{float(v.max() - v.min()):.2f} rad/s and ~50 bins keeps '
+                    f'each one above min_bin_samples while resolving the drag '
+                    f'curve. Set vel_bin_rad_s explicitly to override.')
         edges = np.arange(np.floor(v.min() / bw) * bw,
                           np.ceil(v.max() / bw) * bw + bw, bw)
         centers = 0.5 * (edges[:-1] + edges[1:])
@@ -384,6 +455,25 @@ class RunningTorque(Processor):
 
         # -- spectra --------------------------------------------------------
         win_n = int(params['stft_win'])
+        if win_n <= 0:
+            # A harmonic drifting at df/dt smears by (df/dt)*T_win across the
+            # window; keeping that under one bin width (1/T_win) gives
+            # T_win <= 1/sqrt(df/dt), with df/dt taken for the fastest
+            # OVERLAID order (that is the line the map exists to resolve).
+            sweep = np.abs(np.diff(moving_average(np.abs(v), smooth_n))) * fs
+            sweep_rate = float(np.percentile(sweep, 95)) if len(sweep) else 0.0
+            o_max = max(_parse_orders(params['orders']) or [1.0])
+            if params['overlay_fast_shaft'] and ratio != 1:
+                o_max *= ratio
+            dfdt = o_max * sweep_rate / _TWO_PI
+            t_win = 1.0 / np.sqrt(dfdt) if dfdt > 0 else 1.0
+            win_n = int(2 ** np.clip(np.round(np.log2(t_win * fs)), 7, 11))
+            res.add('info', 'derived_stft_win',
+                    f'stft_win derived as {win_n} samples ({win_n / fs:.2f} s): '
+                    f'the sweep moves |w| at ~{sweep_rate:.2f} rad/s^2, so the '
+                    f'{o_max:g}x order drifts at {dfdt:.2f} Hz/s and a window '
+                    f'longer than 1/sqrt(df/dt) = {t_win:.2f} s would smear it '
+                    f'past one bin width. Set stft_win explicitly to override.')
         hop = max(1, int(round(win_n * (1.0 - float(params['stft_overlap'])))))
         spec = self._spectra(segs, tch, vch, vcmd_ch, tare, fs, win_n, hop, params)
 
@@ -425,6 +515,12 @@ class RunningTorque(Processor):
 
         # -- speed-folded spectra -------------------------------------------
         sbw = params['speed_bin_rad_s']
+        if not sbw:
+            sbw = _nice_bin(vpeak)
+            res.add('info', 'derived_speed_bin',
+                    f'speed_bin_rad_s derived as {sbw:g} rad/s (~50 bins over '
+                    f'the {vpeak:.2f} rad/s sweep). Set speed_bin_rad_s '
+                    f'explicitly to override.')
         s_edges = np.arange(0.0, np.ceil(vpeak / sbw) * sbw + sbw, sbw)
         s_centers = 0.5 * (s_edges[:-1] + s_edges[1:])
         s_bin = np.clip(np.digitize(f_speed, s_edges) - 1, 0, len(s_centers) - 1)
@@ -506,9 +602,27 @@ class RunningTorque(Processor):
                 ospec, peaks, ratio, backdrive, tch,
                 float(np.mean(floor[band])) if floor is not None else None)))
 
+        if not params['db_floor']:
+            # Bottom of the colour scale from the map's ACTUAL dynamic range: a
+            # fixed -40 dB either crushes a quiet map or drowns a loud one.
+            db = _db(np.maximum(frames[moving][:, keep], 1e-15),
+                     float(np.nanmax(frames[moving][:, keep])))
+            derived_floor = float(np.clip(np.nanpercentile(db, 5), -80.0, -20.0))
+            params = dict(params, db_floor=derived_floor)
+            res.add('info', 'derived_db_floor',
+                    f'db_floor derived as {derived_floor:.0f} dB (5th '
+                    f'percentile of the moving-record map, clipped to '
+                    f'[-80, -20]). Set db_floor explicitly to override.')
+
         res.figures.extend(self._spectral_figures(
             fr, keep, frames, f_time, f_speed, by_speed, s_edges,
             s_centers, floor, mean_spec, ratio, backdrive, tch, params))
+
+        if params['fig_campbell']:
+            res.figures.append(('campbell', self._fig_campbell(
+                fr, keep, by_speed, s_centers, s_edges,
+                _parse_orders(params['orders']), ratio, backdrive, tch,
+                params)))
 
         res.tables.append(('drag_curve', self._csv_drag(centers, bmean, bripple, bcount)))
         if ospec is not None:
@@ -829,7 +943,12 @@ class RunningTorque(Processor):
     # -- figures -------------------------------------------------------------
 
     def _order_label(self, ratio, backdrive):
-        return ('input' if backdrive else 'output') + ' shaft'
+        # Far-shaft label; the `attached` text from the bench's ports block
+        # rides along so two reports from different mechanical configurations
+        # (bare vs gearbox bolted up) stay distinguishable at a glance.
+        side = 'input' if backdrive else 'output'
+        attached = getattr(self, '_attached', {}).get(side)
+        return f'{side} shaft ({attached})' if attached else f'{side} shaft'
 
     def _draw_orders(self, ax, orders, ratio, backdrive, x_plot, speed, fmax,
                      fast_shaft=True):
@@ -866,6 +985,17 @@ class RunningTorque(Processor):
                     f'{label} orders ({", ".join(f"{o:g}x" for o in orders)})')
                 ax.plot(x_plot[order], f[order], style, color=color, lw=1.0,
                         alpha=0.7, label=lbl)
+                shown = True
+
+    @staticmethod
+    def _draw_resonances(ax, overlays, fmax):
+        """Known structural resonances (from multisine_frf) as horizontal
+        dashed lines on a frequency-axis map."""
+        shown = False
+        for f in overlays:
+            if 0 < f <= fmax:
+                ax.axhline(f, color='w', ls=':', lw=1.0, alpha=0.8,
+                           label=None if shown else 'known resonances')
                 shown = True
 
     @staticmethod
@@ -907,6 +1037,7 @@ class RunningTorque(Processor):
 
         figs = []
         orders = _parse_orders(params['orders'])
+        overlays = _parse_orders(params['resonance_overlay_hz'])
         fmax = float(fr[keep][-1])
         db_floor = float(params['db_floor'])
 
@@ -937,6 +1068,7 @@ class RunningTorque(Processor):
                                     vmin=vmin, vmax=vmax, shading='nearest')
                 self._draw_orders(ax, orders, ratio, backdrive, f_time, f_speed,
                                   fmax, fast_shaft=params['overlay_fast_shaft'])
+                self._draw_resonances(ax, overlays, fmax)
                 ax.set_xlabel('Time (s)')
                 ax.set_ylabel('Frequency (Hz)')
                 ax.set_ylim(0, fmax)
@@ -958,6 +1090,7 @@ class RunningTorque(Processor):
                 self._draw_orders(ax, orders, ratio, backdrive, s_centers,
                                   s_centers, fmax,
                                   fast_shaft=params['overlay_fast_shaft'])
+                self._draw_resonances(ax, overlays, fmax)
                 ax.set_xlabel('|Velocity| of the driven shaft (rad/s)')
                 ax.set_ylabel('Frequency (Hz)')
                 ax.set_xlim(s_edges[0], s_edges[-1])
@@ -982,6 +1115,69 @@ class RunningTorque(Processor):
                     plt, fr, keep, groups, labels, norm, floor_ref,
                     f'{tch} spectra vs |speed|{title_tag}')))
         return figs
+
+    def _fig_campbell(self, fr, keep, by_speed, s_centers, s_edges, orders,
+                      ratio, backdrive, tch, params):
+        """Campbell/order map: the speed-folded spectrogram with the frequency
+        axis regridded onto shaft order PER SPEED ROW, keeping the speed axis
+        instead of averaging it away (this is `by_speed` + the order spectrum's
+        regrid, combined). Orders become horizontal lines; fixed structural
+        resonances become hyperbolas order = 2*pi*f / |w| -- the exact
+        complement of the frequency-axis map, and the view in which an order
+        crossing a resonance is unmistakable.
+        """
+        import matplotlib.pyplot as plt
+
+        fmax = float(fr[keep][-1])
+        overlays = _parse_orders(params['resonance_overlay_hz'])
+        db_floor = float(params['db_floor']) or -40.0
+
+        valid = ~np.isnan(by_speed[:, 0]) & (s_centers > 1e-6)
+        fig, ax = plt.subplots(figsize=(12, 8))
+        if np.count_nonzero(valid) < 2:
+            ax.text(0.5, 0.5, 'not enough speed bins', ha='center',
+                    transform=ax.transAxes)
+            return fig
+
+        # Order resolution collapses at low speed (df*2pi/w); the axis top is
+        # set where the fastest row's band ends so nothing is extrapolated.
+        vpeak = float(s_centers[valid][-1])
+        o_max = fmax * _TWO_PI / vpeak
+        o_step = float(fr[1]) * _TWO_PI / vpeak
+        grid = np.arange(0.0, o_max, o_step)
+        z = np.full((np.count_nonzero(valid), len(grid)), np.nan)
+        for i, (row, w) in enumerate(zip(by_speed[valid], s_centers[valid])):
+            o_row = fr * _TWO_PI / w
+            z[i] = np.interp(grid, o_row[keep], row[keep],
+                             left=np.nan, right=np.nan)
+
+        db, vmin, vmax = self._map_db(z, False, db_floor)
+        pcm = ax.pcolormesh(s_centers[valid], grid, db.T, cmap='magma',
+                            vmin=vmin, vmax=vmax, shading='nearest')
+        for n in orders:
+            ax.axhline(n, color='cyan', lw=1.0, alpha=0.7)
+            ax.text(vpeak, n, f' {n:g}x', color='cyan', fontsize=7, va='bottom')
+        shown = False
+        for f_res in overlays:
+            hyp = np.where(s_centers[valid] > 0,
+                           f_res * _TWO_PI / s_centers[valid], np.nan)
+            ax.plot(s_centers[valid], np.where(hyp <= grid[-1], hyp, np.nan),
+                    'w:', lw=1.2, alpha=0.85,
+                    label=None if shown else 'known resonances')
+            shown = True
+        ax.set_ylim(0, min(grid[-1], 4.0 * max(orders or [1.0]) * max(ratio, 1)))
+        ax.set_xlabel('|Velocity| of the driven shaft (rad/s)')
+        ax.set_ylabel('Order (multiples of driven-shaft rate)')
+        ax.set_title(f'{tch} Campbell map -- orders are horizontal, fixed '
+                     f'resonances are hyperbolas'
+                     + (f'; far shaft: {self._order_label(ratio, backdrive)}'
+                        if ratio != 1 else ''))
+        if shown:
+            ax.legend(loc='upper right', fontsize=8, facecolor='0.25',
+                      labelcolor='w', framealpha=0.6)
+        fig.colorbar(pcm, ax=ax, label='Amplitude (dB re map peak)')
+        fig.tight_layout()
+        return fig
 
     def _spec_canvas(self, plt, fr, keep, mean_spec, floor, ylabel, params):
         """One figure: optional record-averaged spectrum on top, map below."""

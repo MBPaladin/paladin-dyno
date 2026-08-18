@@ -207,6 +207,11 @@ class TestBuilderWindow(QWidget):
         except Exception:
             self._cont_torque_cfg = {'input': None, 'output': None}
         self.segments = [test_builder.default_segment()]
+        self.preamble = test_builder.default_preamble()
+        try:
+            self._roles = test_preview.commandable_roles(mode)
+        except Exception:
+            self._roles = ['input', 'output']
         self._param_widgets = {}
         self._loading = False  # guard: suppress form->model writes during load
         self._view_only = False
@@ -270,6 +275,67 @@ class TestBuilderWindow(QWidget):
 
         # Middle: segment editor --------------------------------------------
         editor = QVBoxLayout()
+
+        # Recipe-level (NOT per-segment, which is why this sits above the
+        # segment editor): an optional measurement preamble that runs once,
+        # before the first segment. Off by default and folded away, but the
+        # toggle label names the active mode so a non-default preamble is never
+        # hidden (see _refresh_preamble_toggle).
+        self.preamble_toggle = QPushButton()
+        self.preamble_toggle.setCheckable(True)
+        self.preamble_toggle.setStyleSheet('text-align: left; border: none;')
+        editor.addWidget(self.preamble_toggle)
+        self.preamble_panel = QWidget()
+        pre_form = QFormLayout(self.preamble_panel)
+        pre_form.setContentsMargins(12, 0, 0, 0)
+        self.preamble_mode = QComboBox()
+        self.preamble_mode.addItems(list(test_builder.PREAMBLE_MODES))
+        self.preamble_mode.setToolTip(
+            'Optional measurement phase before the first segment. "hold" is a '
+            'silent standstill that gives analysis an ambient noise floor. '
+            '"multisine" (experimental) additionally injects a broadband '
+            'periodic multisine into one shaft\'s torque command at standstill '
+            'so analysis can extract structural resonances and honest '
+            'noise/distortion bounds. Neither touches the per-segment '
+            'lead-in holds.')
+        pre_form.addRow('Mode', self.preamble_mode)
+        self.preamble_quiet = self._spin(1.0, 60.0, 3.0)
+        self.preamble_quiet.setToolTip(
+            'Silent hold before anything is excited. This is measured, not '
+            'dead time: analysis reads the ambient noise floor from it, and '
+            'the multisine anchors its amplitude to the torque cell noise '
+            'measured here -- which is why it always runs first.')
+        pre_form.addRow('Quiet hold [s]', self.preamble_quiet)
+        self.preamble_role = QComboBox()
+        self.preamble_role.addItems(self._roles + ['all'])
+        self.preamble_role.setToolTip(
+            'Which port to excite, by the role this bench declares in its '
+            'config\'s ports block. "all" runs one excitation block per '
+            'declared role, back to back -- resonances for each side of the '
+            'dyno in one run.')
+        pre_form.addRow('Excited role', self.preamble_role)
+        self.preamble_level = QComboBox()
+        self.preamble_level.addItems(list(test_builder.PREAMBLE_LEVELS))
+        self.preamble_level.setToolTip(
+            'Excitation strength as target SNR over the measured noise floor '
+            '(gentle 20 dB / normal 30 dB / hard 40 dB) -- deliberately not a '
+            'fraction of any motor rating. The absolute amplitude in Nm is '
+            'therefore only known at run time, after the quiet hold measures '
+            'the cell; the console reports it, and it should be sanity-checked '
+            'against expected drag.')
+        pre_form.addRow('Level', self.preamble_level)
+        self.preamble_seed = QSpinBox()
+        self.preamble_seed.setRange(0, 1_000_000)
+        self.preamble_seed.setValue(1234)
+        self.preamble_seed.setToolTip(
+            'Seeds which excited lines are silenced as distortion-detection '
+            'lines. Keep it fixed to make runs reproducible bin-for-bin; '
+            'change it to get an independent line selection.')
+        pre_form.addRow('Seed', self.preamble_seed)
+        self.preamble_panel.setVisible(False)
+        editor.addWidget(self.preamble_panel)
+        self.preamble_toggle.toggled.connect(self._toggle_preamble)
+        self._refresh_preamble_toggle()
 
         # Segment-level: repeats wrap the whole segment (both channels) in a
         # loop behavior, so they belong to neither drive.
@@ -415,6 +481,12 @@ class TestBuilderWindow(QWidget):
         self.sec_settle.valueChanged.connect(self._commit_form)
         self.repeats_spin.valueChanged.connect(self._commit_form)
         self.lead_in_spin.valueChanged.connect(self._commit_form)
+        self.preamble_mode.currentTextChanged.connect(self._commit_preamble)
+        self.preamble_role.currentTextChanged.connect(self._commit_preamble)
+        self.preamble_level.currentTextChanged.connect(self._commit_preamble)
+        self.preamble_quiet.valueChanged.connect(self._commit_preamble)
+        self.preamble_seed.valueChanged.connect(self._commit_preamble)
+        self._apply_preamble_states()
 
     @staticmethod
     def _spin(lo, hi, value):
@@ -423,6 +495,16 @@ class TestBuilderWindow(QWidget):
         box.setDecimals(4)
         box.setValue(value)
         return box
+
+    def _toggle_preamble(self, checked):
+        self.preamble_panel.setVisible(checked)
+        self._refresh_preamble_toggle()
+
+    def _refresh_preamble_toggle(self):
+        arrow = '▾' if self.preamble_toggle.isChecked() else '▸'
+        mode = self.preamble_mode.currentText()
+        hint = '' if mode == 'none' else f'   ({mode})'
+        self.preamble_toggle.setText(f'{arrow} Preamble (whole test){hint}')
 
     def _toggle_shaping(self, checked):
         self.shaping_panel.setVisible(checked)
@@ -673,18 +755,79 @@ class TestBuilderWindow(QWidget):
         self._apply_field_states(seg)
         self._update_preview()
 
+    # --- preamble ----------------------------------------------------------
+
+    def _apply_preamble_states(self):
+        """Show only the fields the selected preamble mode uses."""
+        mode = self.preamble_mode.currentText()
+        self.preamble_quiet.setEnabled(mode != 'none')
+        for widget in (self.preamble_role, self.preamble_level,
+                       self.preamble_seed):
+            widget.setEnabled(mode == 'multisine')
+        self._refresh_preamble_toggle()
+
+    def _commit_preamble(self, *_):
+        if self._loading:
+            return
+        self.preamble = {'mode': self.preamble_mode.currentText(),
+                         'quiet_s': self.preamble_quiet.value(),
+                         'role': self.preamble_role.currentText(),
+                         'level': self.preamble_level.currentText(),
+                         'seed': self.preamble_seed.value()}
+        self._apply_preamble_states()
+        self._update_preview()
+
+    def _load_preamble_form(self, preamble):
+        self.preamble = dict(test_builder.default_preamble(), **(preamble or {}))
+        self.preamble_mode.setCurrentText(self.preamble['mode'])
+        self.preamble_quiet.setValue(float(self.preamble['quiet_s']))
+        role = self.preamble['role']
+        if self.preamble_role.findText(role) < 0:
+            self.preamble_role.addItem(role)   # foreign bench's role: keep it visible
+        self.preamble_role.setCurrentText(role)
+        self.preamble_level.setCurrentText(self.preamble['level'])
+        self.preamble_seed.setValue(int(self.preamble['seed']))
+        # Unfold for a recipe that actually has one: a preamble costs run time
+        # and shows up in the preview, so it must not arrive folded away.
+        if self.preamble['mode'] != 'none':
+            self.preamble_toggle.setChecked(True)
+        self._apply_preamble_states()
+
+    def _preamble_duration(self):
+        """Preview duration of the preamble in seconds (0 when none)."""
+        mode = self.preamble.get('mode', 'none')
+        if mode == 'none':
+            return 0.0
+        duration = float(self.preamble.get('quiet_s', 3.0))
+        if mode == 'multisine':
+            n_roles = (len(self._roles)
+                       if self.preamble.get('role') == 'all' else 1)
+            per_block = (test_builder.MULTISINE_PERIODS
+                         * test_builder.MULTISINE_PERIOD_S + 0.25)
+            duration += n_roles * per_block
+        return duration
+
     # --- preview & validation ----------------------------------------------
 
     def _recipe(self):
-        return {'name': self.name_edit.text(), 'segments': self.segments}
+        recipe = {'name': self.name_edit.text(), 'segments': self.segments}
+        # Absent key = none, so recipes without a preamble stay byte-identical
+        # to what older builds produced (and re-hash identically on open).
+        if self.preamble.get('mode', 'none') != 'none':
+            recipe['preamble'] = dict(self.preamble)
+        return recipe
 
     def _update_preview(self):
         # Route each segment's two channels onto the mode plots, repeats
         # unrolled, with a NaN break between segments so curves don't bridge.
         series = {(motor, mode): ([], []) for motor in test_builder.MOTORS
                   for mode in test_builder.MODES}
-        t_offset = 0.0
-        issues = []
+        # The preamble is drawn as a shaded block, not as keyframes: its
+        # 24,000-point waveform would bury the plot, and its amplitude is only
+        # known at run time (after the quiet hold measures the cell noise).
+        t_offset = self._preamble_duration()
+        self._draw_preamble_region(t_offset)
+        issues = list(test_builder.validate_preamble(self.preamble, self._roles))
         for seg in self.segments:
             issues.extend(f"[{seg['id']}] {m}"
                           for m in test_builder.validate_segment(seg, self.limits))
@@ -718,6 +861,32 @@ class TestBuilderWindow(QWidget):
                             f'({len(self.segments)} segment(s))')
         self._check_dirty()
         return issues
+
+    def _draw_preamble_region(self, duration):
+        """Shade the preamble's span on the torque plot.
+
+        Shading only, deliberately no text: a pg.TextItem is sized in PIXELS,
+        so its extent in data coords depends on the current y scale. On a
+        torque plot with no torque keyframes (a velocity-only recipe) nothing
+        else bounds y, so letting one drive autorange closed a feedback loop
+        with no fixed point but zero -- each preview redraw shrank the range
+        ~1e-4x and walked the axis into denormals (-5e-306) within a dozen
+        edits. The region itself is safe (it reports no y bounds) and must
+        stay a bounds-contributing item, or the x autorange starts at the
+        first curve sample and scrolls the whole preamble off the left edge.
+        """
+        plot = self.plot_widget.getItem(0, 0)   # torque is _PLOTS row 0
+        if getattr(self, '_preamble_region', None) is not None:
+            for item in self._preamble_region:
+                plot.removeItem(item)
+            self._preamble_region = None
+        if duration <= 0 or plot is None:
+            return
+        region = pg.LinearRegionItem([0.0, duration], movable=False,
+                                     brush=pg.mkBrush(120, 120, 220, 40))
+        region.setZValue(-10)
+        plot.addItem(region)
+        self._preamble_region = [region]
 
     def _update_grid_warning(self):
         """Yellow-flag the current gridpoint segment's continuous-torque field
@@ -817,6 +986,9 @@ class TestBuilderWindow(QWidget):
         self._armed_hash = None  # _select_segment must not fire a stale dirty
         self.segments = recipe['segments'] or [test_builder.default_segment()]
         self.name_edit.setText(recipe.get('name', 'untitled'))
+        self._loading = True
+        self._load_preamble_form(recipe.get('preamble'))
+        self._loading = False
         self._refresh_list(0)
         self._select_segment(0)
         # The file on disk is what the rig would run, so arm it even when the
@@ -831,6 +1003,9 @@ class TestBuilderWindow(QWidget):
         self._armed_hash = None
         self.segments = [test_builder.default_segment()]
         self.name_edit.setText('my_test')
+        self._loading = True
+        self._load_preamble_form(None)
+        self._loading = False
         self._refresh_list(0)
         self._select_segment(0)
         self.status.setText('')
@@ -842,7 +1017,8 @@ class TestBuilderWindow(QWidget):
         for widget in (self.name_edit, self.save_button, self.seg_list,
                        self.seg_buttons_wrap, self.seg_box, self.primary_box,
                        self.secondary_box, self.shaping_toggle,
-                       self.shaping_panel):
+                       self.shaping_panel, self.preamble_toggle,
+                       self.preamble_panel):
             widget.setEnabled(not view_only)
         self.validation_label.setStyleSheet(
             'color: gray;' if view_only else 'color: #d62728;')
@@ -869,6 +1045,7 @@ class TestBuilderWindow(QWidget):
         self._expansion_thread.start()
 
     def _clear_curves(self):
+        self._draw_preamble_region(0.0)
         for by_motor in self.curves.values():
             for curve in by_motor.values():
                 curve.setData([], [])

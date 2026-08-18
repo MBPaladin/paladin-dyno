@@ -44,8 +44,29 @@ MAX_CYCLES = 2_000_000
 _TRACE_HOLD_CYCLES = 250
 
 
-# Rig-config slave name for each motor of the command stream.
+# Rig-config slave name for each side of the command stream. This is the
+# controller's fixed wiring (DUT always receives input_command, LOAD always
+# receives output_command), NOT a statement of role -- on the actuator benches
+# the DUT device is the client actuator. Semantics live in the config's
+# `ports:` block; see commandable_roles() below.
 MOTOR_SLAVES = {'input': 'DUT', 'output': 'LOAD'}
+
+
+def ports_from_config(mode):
+    """The bench's `ports:` block (see inhouse_dyno_config.yaml), or []."""
+    with open(f"{dyno_paths.dyno_config_directory}/{mode}_dyno_config.yaml") as f:
+        return yaml.safe_load(f).get('ports') or []
+
+
+def commandable_roles(mode):
+    """Roles the loaded bench declares on ports whose device the command
+    stream can actually reach (DUT/LOAD). Roles come from what the config
+    declares, never from counting servo drives -- a drive count gives the
+    wrong answer on actuator_production, where DUT *is* the client actuator.
+    Falls back to the two stream sides for configs without a ports block."""
+    roles = [p['role'] for p in ports_from_config(mode)
+             if p.get('role') and p.get('device') in MOTOR_SLAVES.values()]
+    return roles or list(MOTOR_SLAVES)
 
 
 def limits_from_config(mode):

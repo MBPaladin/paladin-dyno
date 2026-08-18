@@ -1,5 +1,21 @@
 # ACTUATOR DYNO CONFIG
 
+# --- 0. PORTS ---
+# See inhouse_dyno_config.yaml for the field definitions. `DUT` here is the
+# AXON client actuator (role `client`), not an input motor. The third slave,
+# `input_motor`, has no log_keys entries at all, so it gets no port until it
+# is actually logged.
+ports:
+  - role: output
+    prefix: load
+    device: LOAD
+    attached: client_actuator_input
+    cell: load_torque
+  - role: client
+    prefix: dut
+    device: DUT
+    attached: client_actuator
+
 # --- 1. SENSOR CONFIGURATION ---
 # All logical sensors go here. Port mapping handles the hardware routing.
 sensors:
@@ -107,3 +123,6 @@ log_keys:
   - [load_current, devices.LOAD.current]
   - [cycle_time_us, cycle_dt_us] # measured PDO loop interval
   - [wkc_error, wkc_error] # expected - actual working counter; 0 = healthy, >0 = dropped/late frame
+  # Multisine preamble sample index (NaN outside a preamble). Analysis splits
+  # the excitation into exact periods on this, not on timestamps.
+  - [preamble_sample, preamble_sample]
