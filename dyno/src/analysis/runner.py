@@ -59,6 +59,30 @@ def build_plan(log, only=None, segment=None, overrides=None):
     return plan
 
 
+def _output_name(out_dir, label, proc_name, slug, ext):
+    """Build an output filename, honouring a subfolder in the slug.
+
+    Flat `{label}__{proc}__{slug}.{ext}` inside analysis/ is the default. A slug
+    may carry a leading path -- 'runs/sweep_03' -- which becomes a subfolder, so
+    a processor emitting one figure per repetition does not bury its headline
+    figures under fifty siblings. The leaf keeps the full prefix so a file stays
+    identifiable once it is dragged out of the folder.
+    """
+    subdir, _, leaf = slug.rpartition('/')
+    fname = os.path.join(subdir, f'{label}__{proc_name}__{leaf}.{ext}')
+    if subdir:
+        os.makedirs(os.path.join(out_dir, subdir), exist_ok=True)
+    return fname
+
+
+def _announce(names, limit=6):
+    """Print what was written, collapsing long per-repetition runs."""
+    for name in names[:limit]:
+        print(f'  saved: {name}')
+    if len(names) > limit:
+        print(f'  saved: ... and {len(names) - limit} more')
+
+
 def _coerce(proc, key, raw):
     spec = proc.params.get(key)
     if not spec:
@@ -96,18 +120,18 @@ def execute(plan, out_dir, interactive=False):
 
         fig_names, table_names = [], []
         for slug, fig in res.figures:
-            fname = f"{entry['label']}__{proc.name}__{slug}.png"
+            fname = _output_name(out_dir, entry['label'], proc.name, slug, 'png')
             fig.savefig(os.path.join(out_dir, fname), dpi=200)
             if not interactive:
                 matplotlib.pyplot.close(fig)
             fig_names.append(fname)
-            print(f'  saved: {fname}')
+        _announce(fig_names)
         for slug, text in res.tables:
-            fname = f"{entry['label']}__{proc.name}__{slug}.csv"
+            fname = _output_name(out_dir, entry['label'], proc.name, slug, 'csv')
             with open(os.path.join(out_dir, fname), 'w') as fh:
                 fh.write(text)
             table_names.append(fname)
-            print(f'  saved: {fname}')
+        _announce(table_names)
 
         for f in res.findings:
             print(f'  [{f.level}] {f.message}')
@@ -151,6 +175,10 @@ def main(argv=None):
     global plt
     import matplotlib.pyplot as plt
     matplotlib.pyplot = plt
+    # A processor builds every figure before returning -- that is the Result
+    # contract -- so a per-repetition plotter legitimately holds dozens open
+    # until execute() saves and closes them. The warning is aimed at leaks.
+    plt.rcParams['figure.max_open_warning'] = 0
 
     with open_log(args.log_dir) as log:
         print(f'Log:      {log.path}')

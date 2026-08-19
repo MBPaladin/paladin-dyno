@@ -183,6 +183,10 @@ PATTERNS = {
         'rate':         ('Ramp rate [units/s]', 1.0, float),
         'peak_dwell_s': ('Dwell at peak [s]', 1.0, float),
         'bipolar':      ('Bipolar (sweep to -amplitude too)', True, bool),
+        # Cycle peak to peak (+A <-> -A) instead of through zero
+        # (0 -> +A -> -A -> 0). Ignored when not bipolar. See _pattern_keys.
+        'start_at_peak': ('Cycle peak-to-peak (ramp to +amplitude first)',
+                          False, bool),
         'cycles':       ('Cycles', 1, int),
     },
     'step': {
@@ -592,13 +596,39 @@ def _pattern_keys(pattern, params):
             keys.append((t, keys[-1][1]))
 
     if pattern == 'sawtooth':
-        for _ in range(max(1, int(p('cycles')))):
+        cycles = max(1, int(p('cycles')))
+        if p('bipolar') and p('start_at_peak'):
+            # Peak-anchored: engage one flank fully, then run every cycle
+            # peak to peak, so no traversal ever turns around near zero.
+            # A plain sawtooth's cycles already fuse into this in the middle
+            # (its return to zero and the next cycle's ramp up are collinear,
+            # with no dwell at zero to break them); anchoring is about the
+            # ENDS, which is where hysteresis analysis is most sensitive. It
+            # also reaches a given number of peak-to-peak traversals in
+            # 2*cycles + 2 ramps instead of 3*(cycles + 1).
+            #
+            # The lead-in 0 -> +A is the only partial pass, and it is the one
+            # that engages from an unknown backlash state -- which is exactly
+            # the leg backlash analysis drops. The trailing return to zero is
+            # not optional: a trace's torque channel must end at 0, and the
+            # zero-torque rest between levels is what separates one level's
+            # sweep from the next for post-processing.
             move(p('amplitude'), p('rate'))
             hold(p('peak_dwell_s'))
-            if p('bipolar'):
+            for _ in range(cycles):
                 move(-p('amplitude'), p('rate'))
                 hold(p('peak_dwell_s'))
+                move(p('amplitude'), p('rate'))
+                hold(p('peak_dwell_s'))
             move(0.0, p('rate'))
+        else:
+            for _ in range(cycles):
+                move(p('amplitude'), p('rate'))
+                hold(p('peak_dwell_s'))
+                if p('bipolar'):
+                    move(-p('amplitude'), p('rate'))
+                    hold(p('peak_dwell_s'))
+                move(0.0, p('rate'))
     elif pattern == 'step':
         for level in p('levels'):
             move(float(level), p('rate'))

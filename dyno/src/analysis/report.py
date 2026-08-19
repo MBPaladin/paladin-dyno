@@ -11,7 +11,7 @@ from datetime import datetime
 _LEVEL_ORDER = {'error': 0, 'warn': 1, 'info': 2}
 _LEVEL_LABEL = {'error': 'ERROR', 'warn': 'WARNING', 'info': 'note'}
 
-_SKIP_METRIC_KEYS = ('pooled', 'branches', 'top_orders')
+_SKIP_METRIC_KEYS = ('pooled', 'branches', 'top_orders', 'sweeps')
 
 
 def _fmt(v):
@@ -105,6 +105,20 @@ def render(results, log_path, width=78):
                 add(f'  {pos_s:>12}  {b["direction"]:<5} {b["n"]:>8}  '
                     f'{lin["kt_Nm_per_A"]:>11.4f}  {lin["offset_Nm"]:>12.4f}  '
                     f'{lin["r_squared"]:>9.5f}')
+            add('')
+
+        sweeps = entry.get('metrics', {}).get('sweeps')
+        if sweeps:
+            add('PER-SWEEP LOOPS')
+            add(f'  {"output pos":>12}  {"step":<5} {"backlash":>10}  '
+                f'{"stiffness":>11}  {"min R2":>7}')
+            add(f'  {"(rad)":>12}  {"":<5} {"(arc-min)":>10}  '
+                f'{"(Nm/rad)":>11}  {"":>7}')
+            for s in sweeps:
+                add(f'  {s["output_position_rad"]:>12.4f}  {s["step_direction"]:<5} '
+                    f'{s["backlash_arcmin"]:>10.3f}  '
+                    f'{s["stiffness_Nm_per_rad"]:>11.0f}  '
+                    f'{min(s["r2_pos"], s["r2_neg"]):>7.4f}')
             add('')
 
         orders = entry.get('metrics', {}).get('top_orders')
