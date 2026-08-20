@@ -35,6 +35,22 @@ the grid's own mirror symmetry instead: the physical torques at (+w, +T) and
 sensor offset and not torque. That assumes the machine itself is
 direction-symmetric, which is exactly what the CW/CCW asymmetry figure is for.
 
+A constant zero is not the whole story on the output cell. That cell also
+carries a bias whose sign flips with rotation direction -- Coulomb friction
+parasitic to the measurement path, confirmed at the bench:
+
+    T_out_measured = T_true + z + h * sign(w_out)
+
+The mirror tare above averages (+w, +T) against (-w, -T), reading (T + z + h)
+and (-T + z - h). Their mean is z, so h cancels IN THE ZERO ESTIMATE while
+surviving untouched in every individual dwell. Removing it needs the other
+symmetry of the grid: group dwells by the sign of the true output torque, which
+mode and rotation fix between them, and the two members of a group differ only
+by 2h -- the torque, the zero, the loss and any loss asymmetry are common to
+both and cancel. h is therefore measured from the (mode, rotation) sign
+structure alone, never from the loss or the forward/backdrive split, which is
+what keeps correcting it from being circular.
+
 Two independent consistency checks decide whether the resulting numbers can be
 quoted, and both are reported as findings rather than folded away:
 
@@ -109,6 +125,18 @@ class Efficiency(Processor):
         'output_torque_zero':   (None,     float, 'Force the output cell zero [Nm]'),
         'zero_drift_frac':      (0.5,      float, 'Warn when the mirror estimate drifts across the load range '
                                                   'by more than this fraction of itself (then it is not an offset)'),
+
+        # -- direction-dependent output-cell bias ------------------------------
+        # Survives the mirror tare (it cancels in the zero estimate but not in
+        # any single dwell), so it needs its own estimator. 'none' reaches the
+        # uncorrected numbers.
+        'torque_hysteresis':    ('auto',   str,   "Direction-dependent output-cell bias: 'auto' "
+                                                  "(sign structure) or 'none'"),
+        'output_torque_hyst':   (None,     float, 'Force the hysteresis term h [Nm]'),
+        'hyst_agree_tol':       (0.3,      float, 'Warn when the two independent h estimates differ '
+                                                  'by more than this [Nm]'),
+        'hyst_loss_frac':       (0.25,     float, 'Warn when h exceeds this fraction of the median '
+                                                  'loss torque (then it is not a cosmetic correction)'),
 
         # -- reporting thresholds ---------------------------------------------
         'headline_min_load_frac': (0.5,  float, 'Headline efficiency stats use dwells above this fraction '
@@ -292,9 +320,76 @@ class Efficiency(Processor):
                 'drift': abs(slope) * span if np.isfinite(slope) else float('nan'),
                 'spread': _sd(means)}
 
+    def _hysteresis(self, dwells, tol):
+        """Recover the output cell's direction-dependent bias h.
+
+        The cell reads T_true + z + h*sign(w_out). The mirror tare removes z
+        and leaves h in every dwell (see the module docstring), so h has to
+        come from the other symmetry: the sign of the TRUE output torque,
+        s = sign(T_out_true), which mode and rotation fix between them.
+
+            mode        sign(w_out)   s        the cell reads
+            forward         +1        +1        T + z + h
+            backdrive       -1        +1        T + z - h
+            backdrive       +1        -1       -T + z + h
+            forward         -1        -1       -T + z - h
+
+        Within one s group the two members differ by exactly 2h: the torque,
+        the zero, the loss torque and any forward/backdrive loss asymmetry are
+        common to both and cancel. Nothing about efficiency is assumed.
+
+        The two groups give two INDEPENDENT estimates. They are reported
+        separately on purpose -- if they disagree, the sign model itself is
+        wrong and the correction should not be applied, which no single pooled
+        number would reveal.
+
+        Estimated from RAW torque: a constant z cancels in every difference
+        above, so this does not care whether the tare has happened yet.
+        """
+        need = (('forward', +1), ('backdrive', -1),   # s = +1
+                ('backdrive', +1), ('forward', -1))   # s = -1
+        groups = {}
+        for d in dwells:
+            if d['mode'] not in _MODES:
+                continue
+            combo = (d['mode'], 1 if d['w_out'] > 0 else -1)
+            key = (abs(d['v_cmd']), abs(d['t_cmd']))
+            groups.setdefault(key, {}).setdefault(combo, []).append(d['t_out_raw'])
+
+        per_key, pos, neg, speeds = [], [], [], {}
+        for (v, _t), g in groups.items():
+            # All four combos, or the differences below are not like-for-like.
+            if not all(c in g for c in need):
+                continue
+            m = {c: float(np.mean(g[c])) for c in need}
+            h_pos = (m[need[0]] - m[need[1]]) / 2
+            h_neg = (m[need[2]] - m[need[3]]) / 2
+            per_key.append(0.5 * (h_pos + h_neg))
+            pos.append(h_pos)
+            neg.append(h_neg)
+            speeds.setdefault(v, []).append(0.5 * (h_pos + h_neg))
+
+        if not per_key:
+            return {'h': 0.0, 'h_pos': float('nan'), 'h_neg': float('nan'),
+                    'n_keys': 0, 'spread': float('nan'), 'disagree': float('nan'),
+                    'agrees': False, 'by_speed': {}}
+
+        # Median over keys: h is nominally load-independent, and a median stops
+        # a handful of ill-conditioned cells (near-zero torque command, where
+        # the mode label is noise) from dragging the estimate.
+        h_pos, h_neg = float(np.median(pos)), float(np.median(neg))
+        return {'h': float(np.median(per_key)),
+                'h_pos': h_pos, 'h_neg': h_neg,
+                'n_keys': len(per_key),
+                'spread': _sd(per_key),
+                'disagree': abs(h_pos - h_neg),
+                'agrees': abs(h_pos - h_neg) <= tol,
+                'by_speed': {v: float(np.median(vals))
+                             for v, vals in sorted(speeds.items())}}
+
     # -- physics -----------------------------------------------------------
 
-    def _derive(self, dwells, ratio, z_in, z_out, min_speed):
+    def _derive(self, dwells, ratio, z_in, z_out, min_speed, h_out=0.0):
         """Attach powers, mode, efficiency and loss torque to each dwell.
 
         `mode` is decided by the sign of the two mechanical powers, which is the
@@ -314,7 +409,7 @@ class Efficiency(Processor):
                 dropped.append(d)
                 continue
             t_in = d['t_in_raw'] - z_in
-            t_out = d['t_out_raw'] - z_out
+            t_out = d['t_out_raw'] - z_out - h_out * np.sign(d['w_out'])
             p_in = t_in * d['w_in']
             p_out = t_out * d['w_out']
 
@@ -340,7 +435,7 @@ class Efficiency(Processor):
             kept.append(d)
         return kept, dropped
 
-    def _feasible_offset(self, dwells, ratio):
+    def _feasible_offset(self, dwells, ratio, h_out=0.0):
         """Interval that a constant combined cell offset must lie in.
 
         P_loss = w_out * (ratio*T_in_raw - T_out_raw - c) >= 0 at every dwell,
@@ -349,11 +444,19 @@ class Efficiency(Processor):
         interval below is their intersection. An empty interval means no pair of
         cell zeros makes this log self-consistent, and |width| is a lower bound
         on the cross-calibration error between the cells in output Nm.
+
+        `h_out` is removed from the output reading first because it is not part
+        of c: it flips sign with rotation, so it cannot be absorbed by any
+        constant offset. That is precisely why it shows up here as an EMPTY
+        interval -- an uncorrected h opens the interval by 2h in the infeasible
+        direction, which makes the width before and after the correction the
+        natural acceptance test for the whole hysteresis model.
         """
         lo, hi = -np.inf, np.inf
         lo_at = hi_at = None
         for d in dwells:
-            m = ratio * d['t_in_raw'] - d['t_out_raw']
+            m = (ratio * d['t_in_raw']
+                 - (d['t_out_raw'] - h_out * np.sign(d['w_out'])))
             if d['w_out'] > 0 and m < hi:
                 hi, hi_at = m, d
             elif d['w_out'] < 0 and m > lo:
@@ -705,6 +808,13 @@ class Efficiency(Processor):
                         f'drift across load {z["drift"]:.4f} Nm).')
 
         # -- per-dwell physics ------------------------------------------------
+        # Two passes, because the hysteresis estimator groups dwells by `mode`
+        # and only _derive() can assign it. The first pass exists solely to get
+        # those labels; h is estimated from raw torque, so nothing it depends on
+        # changes between the passes and there is no fixed point to chase.
+        if p['torque_hysteresis'] not in ('auto', 'none'):
+            raise ValueError("torque_hysteresis must be 'auto' or 'none', "
+                             f"got {p['torque_hysteresis']!r}")
         live, standstill = self._derive(dwells, ratio, z_in, z_out,
                                         p['min_output_speed'])
         if not live:
@@ -714,6 +824,61 @@ class Efficiency(Processor):
             res.add('info', 'standstill_dwells',
                     f'{len(standstill)} dwell(s) held the output below '
                     f'{p["min_output_speed"]:g} rad/s and carry no power; dropped.')
+
+        # -- direction-dependent output bias, then the second pass -------------
+        hyst = {'h': 0.0, 'h_pos': float('nan'), 'h_neg': float('nan'),
+                'n_keys': 0, 'spread': float('nan'), 'disagree': float('nan'),
+                'agrees': False, 'by_speed': {}}
+        if p['torque_hysteresis'] == 'auto':
+            hyst = self._hysteresis(live, p['hyst_agree_tol'])
+        forced_h = p['output_torque_hyst']
+        # An estimate whose two halves disagree is evidence against the sign
+        # model, so it is reported and NOT applied. A forced value is the
+        # operator overriding that judgement and always wins.
+        h_out = (float(forced_h) if forced_h is not None
+                 else (hyst['h'] if hyst['agrees'] else 0.0))
+
+        width_before = self._feasible_offset(live, ratio)['width']
+        if h_out:
+            live, standstill = self._derive(dwells, ratio, z_in, z_out,
+                                            p['min_output_speed'], h_out)
+
+        if forced_h is not None:
+            res.add('info', 'output_hysteresis_forced',
+                    f'Output cell hysteresis forced to h = {h_out:+.4f} Nm by '
+                    f'output_torque_hyst; every dwell has h*sign(w_out) removed '
+                    f'from {out_cell}.')
+        elif hyst['n_keys'] and hyst['agrees']:
+            res.add('info', 'output_hysteresis_applied',
+                    f'{out_cell} carries a direction-dependent bias of '
+                    f'h = {h_out:+.4f} Nm, recovered from {hyst["n_keys"]} grid '
+                    f'cells that have all four (mode, rotation) combinations '
+                    f'(key-to-key spread {hyst["spread"]:.4f} Nm). The two '
+                    f'independent halves of the estimate agree: '
+                    f'{hyst["h_pos"]:+.4f} Nm from the positive-torque group and '
+                    f'{hyst["h_neg"]:+.4f} Nm from the negative-torque group, a '
+                    f'difference of {hyst["disagree"]:.4f} Nm. This term flips '
+                    f'sign with rotation, so the mirror tare cancels it in the '
+                    f'zero estimate but leaves it in every dwell; it has been '
+                    f'removed as h*sign(w_out).')
+        elif hyst['n_keys']:
+            res.add('warn', 'output_hysteresis_disagrees',
+                    f'The two independent estimates of the output cell\'s '
+                    f'direction-dependent bias disagree by '
+                    f'{hyst["disagree"]:.4f} Nm ({hyst["h_pos"]:+.4f} Nm from the '
+                    f'positive-torque group, {hyst["h_neg"]:+.4f} Nm from the '
+                    f'negative-torque group, tolerance '
+                    f'{p["hyst_agree_tol"]:g} Nm). Under the model these two '
+                    f'measure the same quantity, so disagreement means the model '
+                    f'is wrong -- something other than a rotation-dependent bias '
+                    f'is moving with direction. NO correction has been applied; '
+                    f'set output_torque_hyst to force one.')
+        elif p['torque_hysteresis'] == 'auto':
+            res.add('warn', 'output_hysteresis_unmeasurable',
+                    'No grid cell has all four (mode, rotation) combinations, so '
+                    'the output cell\'s direction-dependent bias could not be '
+                    'separated from the torque. Any such bias is still in every '
+                    'dwell below.')
 
         counts = {m: sum(1 for d in live if d['mode'] == m)
                   for m in ('forward', 'backdrive', 'dissipative', 'non_physical')}
@@ -729,8 +894,55 @@ class Efficiency(Processor):
                     f'cell sign or zero is wrong.')
 
         # -- consistency: what offset could reconcile the two cells? ----------
-        offset = self._feasible_offset(live, ratio)
+        offset = self._feasible_offset(live, ratio, h_out)
         applied_c = ratio * z_in - z_out
+        median_loss = float(np.median([d['loss_Nm'] for d in live]))
+
+        # The acceptance test for the whole hysteresis model. An uncorrected h
+        # opens the feasible interval by 2h in the infeasible direction, so if
+        # the model is right, removing h has to close most of that gap -- and if
+        # it does not, h is not what was making the two cells irreconcilable.
+        if h_out:
+            recovered = offset['width'] - width_before
+            # Only an ESTIMATED h is independent evidence. A forced one was
+            # chosen by hand, so the recovery it produces is arithmetic (the
+            # width always moves by 2h) and must not be quoted as confirmation.
+            why = (' This is the independent check on the correction: h was '
+                   'measured from the rotation sign structure alone and never '
+                   'from this interval, so the two agreeing is evidence and not '
+                   'bookkeeping.' if forced_h is None else
+                   ' h was forced rather than measured here, so this recovery is '
+                   'arithmetic -- the width moves by 2h whatever h is -- and is '
+                   'not evidence that the value is right.')
+            res.add('info', 'hysteresis_feasibility_recovery',
+                    f'Removing the direction-dependent bias moves the feasible '
+                    f'cell-offset interval from a width of {width_before:+.3f} Nm '
+                    f'to {offset["width"]:+.3f} Nm, recovering {recovered:.3f} Nm '
+                    f'({100 * recovered / abs(width_before):.0f}% of the '
+                    f'infeasibility) of cross-cell disagreement.' + why)
+            if abs(h_out) > p['hyst_loss_frac'] * abs(median_loss):
+                res.add('warn', 'hysteresis_large_vs_loss',
+                        f'The direction-dependent bias h = {h_out:+.4f} Nm is '
+                        f'{100 * abs(h_out) / abs(median_loss):.0f}% of the median '
+                        f'loss torque ({median_loss:.3f} Nm). This is not a '
+                        f'cosmetic correction: uncorrected, it biases the forward '
+                        f'and backdrive losses in opposite directions by that '
+                        f'much, and any efficiency number taken from a log '
+                        f'processed with torque_hysteresis=none carries it.')
+        if hyst['n_keys'] and len(hyst['by_speed']) > 1:
+            # Speed dependence is the physical signature: a Coulomb term is
+            # roughly flat, a viscous one climbs. It also exposes the slow rows,
+            # where the output turns under a revolution and the number is a
+            # breakaway torque rather than steady friction.
+            res.add('info', 'hysteresis_by_speed',
+                    'Direction-dependent bias by input speed: '
+                    + ', '.join(f'{v:g} rad/s -> {hv:+.3f} Nm'
+                                for v, hv in hyst['by_speed'].items())
+                    + '. A constant term is Coulomb friction in the measurement '
+                      'path; the rise with speed is the viscous part. The slowest '
+                      'rows turn the output less than a revolution per dwell, so '
+                      'their value is a breakaway torque rather than a steady '
+                      'one -- see the partial-revolution finding.')
         over = [d for d in live if d['mode'] in ('forward', 'backdrive')
                 and d['eff'] > 1.0]
         if offset['width'] < 0:
@@ -881,6 +1093,17 @@ class Efficiency(Processor):
             'output_zero_mirror_pairs': zeros['output']['n_pairs'],
             'input_zero_drift_Nm': zeros['input']['drift'],
             'output_zero_drift_Nm': zeros['output']['drift'],
+            'torque_hysteresis_method': p['torque_hysteresis'],
+            'output_hysteresis_applied_Nm': h_out,
+            'output_hysteresis_estimate_Nm': hyst['h'],
+            'output_hysteresis_pos_group_Nm': hyst['h_pos'],
+            'output_hysteresis_neg_group_Nm': hyst['h_neg'],
+            'output_hysteresis_group_disagreement_Nm': hyst['disagree'],
+            'output_hysteresis_n_keys': hyst['n_keys'],
+            'output_hysteresis_spread_Nm': hyst['spread'],
+            'output_hysteresis_by_input_speed_Nm': hyst['by_speed'],
+            'median_loss_torque_Nm': median_loss,
+            'combined_cell_offset_feasible_width_uncorrected_Nm': width_before,
             'n_dwells': len(live),
             'n_grid_cells': len(cells),
             'n_forward': counts['forward'],
@@ -920,6 +1143,11 @@ class Efficiency(Processor):
                 if offset['width'] >= 0 else
                 f'no pair of cell zeros reconciles them, so they disagree by at '
                 f'least {abs(offset["width"]):.2f} Nm at the output')
+        hyst_note = (
+            f' The output cell also carries a {h_out:+.2f} Nm bias that flips '
+            f'sign with rotation, which the mirror tare cannot see; removing it '
+            f'closed {100 * (offset["width"] - width_before) / abs(width_before):.0f}% '
+            f'of the gap between the two cells.' if h_out else '')
         res.summary = (
             f'{len(live)} dwells over {len(cells)} grid cells at {ratio:g}:1, '
             f'every operating point measured both forward and backdriven. Above '
@@ -933,5 +1161,5 @@ class Efficiency(Processor):
             f'{100 * fits["forward"]["slope"]:.1f}% of output torque. Every '
             f'number here reads both cells, so it carries their disagreement, '
             f'and the light-load end is where that hurts: {band}, which is why '
-            f'{len(over)} dwell(s) read above 100%.')
+            f'{len(over)} dwell(s) read above 100%.{hyst_note}')
         return res

@@ -167,7 +167,7 @@ class RunningTorque(Processor):
                                            'from peak speed (~50 bins)'),
         'moving_min_speed': (0.5,   float, 'Frames slower than this are not part of '
                                             'the moving record [rad/s]'),
-        'orders':           ('1,2,3', str,  'Driven-shaft orders to overlay'),
+        'orders':           ('1,5,10', str,  'Driven-shaft orders to overlay'),
         'overlay_fast_shaft': (False, bool,  'Overlay the far-shaft (mesh/cogging) '
                                             'orders as well as the driven-shaft ones'),
         'db_floor':         (0.0,    float, 'Bottom of the colour scale [dB]; '
