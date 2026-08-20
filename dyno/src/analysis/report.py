@@ -11,7 +11,8 @@ from datetime import datetime
 _LEVEL_ORDER = {'error': 0, 'warn': 1, 'info': 2}
 _LEVEL_LABEL = {'error': 'ERROR', 'warn': 'WARNING', 'info': 'note'}
 
-_SKIP_METRIC_KEYS = ('pooled', 'branches', 'top_orders', 'sweeps')
+_SKIP_METRIC_KEYS = ('pooled', 'branches', 'top_orders', 'sweeps',
+                     'absorber_pooled', 'absorber_branches')
 
 
 def _fmt(v):
@@ -25,6 +26,14 @@ def _fmt(v):
 
 
 def _wrap(text, width, indent):
+    # A finding carrying its own newlines is pre-formatted -- a copy-pasteable
+    # config snippet is the reason this exists -- so it is indented but never
+    # reflowed. Reflowing would silently join its lines into prose.
+    if '\n' in text:
+        return ('\n' + ' ' * indent).join(
+            _wrap(line, width, indent) if len(line) > width else line
+            for line in text.split('\n'))
+
     words, lines, cur = text.split(), [], ''
     for w in words:
         if cur and len(cur) + 1 + len(w) > width:
@@ -83,29 +92,32 @@ def render(results, log_path, width=78):
                 add(f'  {k:<{klen}}  {_fmt(v)}')
             add('')
 
-        pooled = entry.get('metrics', {}).get('pooled')
-        if pooled:
-            add('POOLED FIT')
-            for model in ('linear', 'tanh'):
-                if model in pooled:
-                    add(f'  {model}:')
-                    for k, v in pooled[model].items():
-                        add(f'    {k:<28}  {_fmt(v)}')
-            add('')
+        # current_torque can characterize a second motor in the same run, under
+        # 'absorber_'-prefixed keys. Both sets render the same way.
+        for prefix, label in (('', ''), ('absorber_', 'ABSORBER ')):
+            pooled = entry.get('metrics', {}).get(f'{prefix}pooled')
+            if pooled:
+                add(f'{label}POOLED FIT')
+                for model in ('linear', 'tanh'):
+                    if model in pooled:
+                        add(f'  {model}:')
+                        for k, v in pooled[model].items():
+                            add(f'    {k:<28}  {_fmt(v)}')
+                add('')
 
-        branches = entry.get('metrics', {}).get('branches')
-        if branches:
-            add('PER-BRANCH LINEAR FITS')
-            add(f'  {"park angle":>12}  {"dir":<5} {"n":>8}  {"kt (Nm/A)":>11}  '
-                f'{"offset (Nm)":>12}  {"R2":>9}')
-            for b in branches:
-                pos = b.get('level_position_rad')
-                pos_s = f'{pos * 57.29578:8.3f} deg' if pos is not None else '     n/a'
-                lin = b['linear']
-                add(f'  {pos_s:>12}  {b["direction"]:<5} {b["n"]:>8}  '
-                    f'{lin["kt_Nm_per_A"]:>11.4f}  {lin["offset_Nm"]:>12.4f}  '
-                    f'{lin["r_squared"]:>9.5f}')
-            add('')
+            branches = entry.get('metrics', {}).get(f'{prefix}branches')
+            if branches:
+                add(f'{label}PER-BRANCH LINEAR FITS')
+                add(f'  {"park angle":>12}  {"dir":<5} {"n":>8}  {"kt (Nm/A)":>11}  '
+                    f'{"offset (Nm)":>12}  {"R2":>9}')
+                for b in branches:
+                    pos = b.get('level_position_rad')
+                    pos_s = f'{pos * 57.29578:8.3f} deg' if pos is not None else '     n/a'
+                    lin = b['linear']
+                    add(f'  {pos_s:>12}  {b["direction"]:<5} {b["n"]:>8}  '
+                        f'{lin["kt_Nm_per_A"]:>11.4f}  {lin["offset_Nm"]:>12.4f}  '
+                        f'{lin["r_squared"]:>9.5f}')
+                add('')
 
         sweeps = entry.get('metrics', {}).get('sweeps')
         if sweeps:

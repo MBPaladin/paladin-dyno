@@ -154,6 +154,10 @@ class RunningTorque(Processor):
         'min_bin_samples':  (200,    int,   'Samples a velocity bin needs to be reported'),
         'fit_min_vel':      (1.0,    float, 'Ignore |w| below this in the Coulomb+viscous fit [rad/s]'),
         'tare_from_leadin': (True,   bool,  'Subtract the stationary lead-in mean from the torque cell'),
+        'invert_torque_sign': (False, bool, 'Negate the torque cell against velocity, so '
+                                            'drag reads negative when turning positive. '
+                                            'Affects the drag curve and its fits only; '
+                                            'the spectra are amplitude-only and unchanged'),
         # -- spectral --------------------------------------------------------
         'stft_win':         (0,      int,   'STFT window [samples]; 0 = derive '
                                             'from the measured sweep rate and '
@@ -245,14 +249,24 @@ class RunningTorque(Processor):
         # 1. One motor is turning under a velocity command. A torque-commanded
         #    sweep is the stiction test, not this; a stationary log is the
         #    blocked-rotor characterization.
+        #
+        #    Ranked by whether the axis is actually velocity-COMMANDED before
+        #    how fast it spun. Peak speed alone identifies the driver only on a
+        #    rig where the far shaft is free; on a directly-coupled bench both
+        #    motors read the same sweep to within sensor noise, so a bare
+        #    max-by-speed lets noise pick the driver, and the log then fails the
+        #    command check below as 'torque-driven' when it is nothing of the
+        #    sort. The command channel says who is driving; the tachometer only
+        #    says what turned.
         spinning = []
         for dev in self._motors(seg):
             vch = f'{seg.prefix(dev)}_velocity'
             v = np.nan_to_num(cat(vch), nan=0.0)
-            spinning.append((float(np.max(np.abs(v))), dev, vch))
+            commanded = seg.is_active(f'{seg.prefix(dev)}_velocity_command')
+            spinning.append((commanded, float(np.max(np.abs(v))), dev, vch))
         if not spinning:
             return Applicability('no', 'no motor exposes a velocity channel')
-        peak, motor, vch = max(spinning)
+        _, peak, motor, vch = max(spinning)
         if peak < 4 * d['fit_min_vel']:
             return Applicability(
                 'no', f'fastest axis is {motor} at {peak:.3f} rad/s peak; nothing '
@@ -374,6 +388,21 @@ class RunningTorque(Processor):
                         f'floor to reference the spectra against. Add a lead-in '
                         f'(the builder\'s `lead_in_s`) to get both.')
 
+        # Applied AFTER the tare, and to the drag path only. The tare is a cell
+        # offset in the cell's own units, so it has to come off before the
+        # convention is changed; the spectra rebuild their own signal from the
+        # segments and are amplitude-only, where a global negation is a phase
+        # flip that nothing downstream reads.
+        invert = bool(params['invert_torque_sign'])
+        if invert:
+            tq = -tq
+            res.add('info', 'torque_sign_inverted',
+                    f'invert_torque_sign is set, so {tch} has been negated after '
+                    f'taring: drag now reads negative while turning positive. The '
+                    f'Coulomb and viscous magnitudes are unchanged -- this flips '
+                    f'the signed per-direction intercepts and slopes, and the drag '
+                    f'curve\'s quadrants, nothing else.')
+
         # -- drag curve ----------------------------------------------------
         bw = params['vel_bin_rad_s']
         if not bw:
@@ -427,7 +456,11 @@ class RunningTorque(Processor):
                 res.add('info', 'cell_sign',
                         f'{tch} reads positive while turning positive, i.e. it '
                         f'reports the torque the motor applies rather than the '
-                        f'drag reacting to it. Magnitudes are unaffected.')
+                        f'drag reacting to it. Magnitudes are unaffected; set '
+                        f'invert_torque_sign=true to flip the drag curve into the '
+                        f'drag-opposes-motion convention.'
+                        + (' (invert_torque_sign is already set, so the cell\'s raw '
+                           'convention was the opposite of this.)' if invert else ''))
         else:
             res.add('warn', 'single_direction',
                     f'Only one rotation direction cleared |w| >= {fmin_v} rad/s, so '
@@ -562,6 +595,7 @@ class RunningTorque(Processor):
             'sample_rate_hz': fs,
             'lead_in_s': lead_s,
             'tare_Nm': tare if params['tare_from_leadin'] else 0.0,
+            'torque_sign_inverted': invert,
             'peak_speed_rad_s': vpeak,
             'coulomb_drag_Nm': coulomb,
             'viscous_drag_Nm_per_rad_s': viscous,
@@ -594,7 +628,7 @@ class RunningTorque(Processor):
         if params['fig_drag']:
             res.figures.append(('drag_vs_velocity', self._fig_drag(
                 centers, bmean, bripple, fit, coulomb, viscous, motor, tch,
-                backdrive, ratio)))
+                backdrive, ratio, invert)))
 
         if params['fig_order_spectrum'] and ospec is not None:
             band = keep & (fr >= params['fmin_hz'])
@@ -1256,7 +1290,7 @@ class RunningTorque(Processor):
         return fig
 
     def _fig_drag(self, centers, bmean, bripple, fit, coulomb, viscous, motor,
-                  tch, backdrive, ratio):
+                  tch, backdrive, ratio, invert=False):
         import matplotlib.pyplot as plt
 
         fig, (axL, axR) = plt.subplots(1, 2, figsize=(16, 7))
@@ -1272,7 +1306,7 @@ class RunningTorque(Processor):
         axL.axhline(0, color='k', lw=0.5)
         axL.axvline(0, color='k', lw=0.5)
         axL.set_xlabel('Driven-shaft velocity (rad/s)')
-        axL.set_ylabel(f'{tch} (Nm, tared)')
+        axL.set_ylabel(f'{tch} (Nm, tared{", sign inverted" if invert else ""})')
         axL.set_title(f'{motor} {"back-drive" if backdrive else "forward"} running '
                       f'torque' + (f' ({ratio:g}:1)' if ratio != 1 else ''))
         axL.grid(True, alpha=0.35)

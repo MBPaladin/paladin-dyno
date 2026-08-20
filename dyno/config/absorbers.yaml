@@ -110,12 +110,12 @@ RTC-0020: #New small motor: values need correcting
     kt: 0.983
     k_tanh: 0.0001
   motor_limits:
-    torque: 12
+    torque: 20
     velocity: 600
-    acceleration: 50 #Rad/s^2
+    acceleration: 800 #Rad/s^2
     rotatum: 500 #Nm/s, 4 x peak torque value
   drive_params:
-    i_cont: 7
+    i_cont: 20
 
 # NOTE: the simulation sandbox's fake AKD drives report names SIM-<name>
 # (e.g. SIM-DUT) which deliberately do NOT appear here, so sim drives resolve

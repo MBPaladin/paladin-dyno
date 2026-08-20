@@ -76,8 +76,16 @@ class Processor:
     granularity: str = 'run'
     params: dict = {}         # {key: (default, type, help)}
 
+    # Set by the runner from --set before applies_to is called. Predicates gate
+    # on defaults(), so without this an operator overriding a gate threshold
+    # would see the override reach run() and silently not reach the predicate
+    # that decided whether run() happens at all.
+    overrides: dict = {}
+
     def defaults(self):
-        return {k: v[0] for k, v in self.params.items()}
+        d = {k: v[0] for k, v in self.params.items()}
+        d.update(self.overrides)
+        return d
 
     def applies_to(self, segs: 'list[Segment]') -> Applicability:
         raise NotImplementedError

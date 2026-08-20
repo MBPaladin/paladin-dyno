@@ -14,17 +14,17 @@ Output Torque:
     - 30
   data_keys: # defines which log entries to pull for the scope
     - input_torque
-    - load_torque
+    #- load_torque
     - dut_torque_command
     - load_torque_command
   legends: # defines legends for the above keys
     - Measured Input Torque
-    - Measured Output Torque
+    #- Measured Output Torque
     - DUT Torque Command
     - LOAD Torque Command
   pens: # sets colors for each trace
     - y
-    - g
+    #- g
     - c
     - c
 Output Velocity:

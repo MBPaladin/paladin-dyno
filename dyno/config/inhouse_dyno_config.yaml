@@ -113,23 +113,23 @@ expected_slave_layout:
   - { model: EL3208, name: rtd_module }
   - { model: ELM3004, name: adc_1 }
   - model: AKD
-    name: DUT
+    name: LOAD
     params:
-      flip_torque_sign: False
-      gear_ratio: 26
+      flip_torque_sign: True
+      gear_ratio: 1
       motor_params:
         kt: 0.983
         k_tanh: 0.0001
       motor_limits:
-        torque: 12
-        continuous_torque: 7
+        torque: 20
+        continuous_torque: 20
         velocity: 600
-        acceleration: 50 #Rad/s^2
-        rotatum: 500 #Nm/s, 4 x peak torque value
+        acceleration: 800 #Rad/s^2
+        rotatum: 20 #Nm/s, 4 x peak torque value
       drive_params:
         i_cont: 7
   - model: AKD
-    name: LOAD
+    name: DUT
     params:
       flip_torque_sign: True
       gear_ratio: 1 # Output should always be set to 1
@@ -144,6 +144,24 @@ expected_slave_layout:
         rotatum: 1000 #Nm/s, 4 x peak torque value
       drive_params:
         i_cont: 15
+  - model: ELMO
+    name: ELMOMOTOR
+    params:
+      flip_torque_sign: False
+      gear_ratio: 1
+      motor_params: { kt: 0.315, k_tanh: 0.0001 }
+      motor_limits:
+        torque: 20 #max 14
+        continuous_torque: 18 #max 10 maybe
+        velocity: 200
+        acceleration: 800
+        rotatum: 20
+      drive_params:
+        i_cont: 56.570
+        i_rated: 56.570      # torque -> per-mille scaling
+        counts_per_rev: 262144                 # 2^18
+        position_counter_bits: 32              # 18 if 0x6064 wraps each rev
+        pdo_profile: compact                 
 
 # Measured values over these limits stop the test.
 #
@@ -158,7 +176,7 @@ expected_slave_layout:
 # this check rather than tripping it.
 safeties:
   output_torque: { source: devices.adc_1.load_torque, limit: 220 } # Nm, derated for bringup
-  output_velocity: { source: devices.LOAD.velocity, limit: 60 } # rad/s, derated for bringup
+  output_velocity: { source: devices.LOAD.velocity, limit: 200 } # rad/s, derated for bringup
   input_velocity: { source: devices.DUT.velocity, limit: 600 } # rad/s, catches a back-driven DUT
   load_stator_temp: { source: devices.rtd_module.load_stator_temp, limit: 100 } # C
 

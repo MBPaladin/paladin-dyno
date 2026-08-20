@@ -26,6 +26,13 @@ ELM3002_PRODUCT_CODE = 1344368041
 AKD_PRODUCT_CODE = 4279108
 AXON_PRODUCT_CODE = 2454913024
 
+# Elmo Motion Control. Read off the in-house chain at slave 5 with bus_scan:
+# product 198948 (0x00030924), revision 0x00010420, vendor 154 (0x9A), which
+# reports 'Drum' as its 0x1008 device name. Other Elmo families will have their
+# own product code - check bus_scan before reusing this on another rig.
+ELMO_VENDOR_ID = 154
+ELMO_PRODUCT_CODE = 198948
+
 # utilit classes
 
 class Unwrapper:
@@ -666,44 +673,56 @@ AKD_PDO_PROFILES = {
 
 AKD_PDO_PROFILE_DEFAULT = 'extended'
 
-_AKD_STRUCT_CACHE = {}
+_PDO_STRUCT_CACHE = {}
 
 
-def akd_pdo_structs(profile):
-    """(RxPDO, TxPDO) ctypes structures for a named profile.
+def pdo_structs(profiles, family, profile):
+    """(RxPDO, TxPDO) ctypes structures for a named profile of a drive family.
 
     Cached, because from_buffer_copy is called on these at 1 kHz and the type
-    identity should be stable across the life of a drive.
+    identity should be stable across the life of a drive. `family` only
+    separates the cache namespaces and names the generated types - two drives
+    can legitimately have a profile of the same name and a different layout.
     """
-    if profile not in _AKD_STRUCT_CACHE:
+    key = (family, profile)
+    if key not in _PDO_STRUCT_CACHE:
         built = []
         for direction in ('rx', 'tx'):
             fields = []
-            for entries in AKD_PDO_PROFILES[profile][direction].values():
+            for entries in profiles[profile][direction].values():
                 for _index, _sub, _bits, field, ctype in entries:
                     fields.append((field or f'_pad{len(fields)}', ctype))
-            built.append(type(f'AKD_{direction.upper()}PDO_{profile}',
+            built.append(type(f'{family}_{direction.upper()}PDO_{profile}',
                               (ctypes.Structure,),
                               {'_pack_': 1, '_fields_': fields}))
-        _AKD_STRUCT_CACHE[profile] = tuple(built)
-    return _AKD_STRUCT_CACHE[profile]
+        _PDO_STRUCT_CACHE[key] = tuple(built)
+    return _PDO_STRUCT_CACHE[key]
+
+
+def resolve_pdo_profile(profiles, default, env_var, family, params=None):
+    """Resolve which PDO profile a drive should use.
+
+    Precedence: the env var (applies to every drive of the family at once, so a
+    size bisect needs no file edits between runs) > drive_params.pdo_profile
+    from absorbers.yaml or the rig config > the family default.
+    """
+    profile = os.environ.get(env_var)
+    if not profile:
+        profile = ((params or {}).get('drive_params') or {}).get(
+            'pdo_profile', default)
+    if profile not in profiles:
+        raise ValueError(f'unknown {family} PDO profile {profile!r}; choose '
+                         f'one of: ' + ', '.join(profiles))
+    return profile
+
+
+def akd_pdo_structs(profile):
+    return pdo_structs(AKD_PDO_PROFILES, 'AKD', profile)
 
 
 def akd_pdo_profile(params=None):
-    """Resolve which PDO profile a drive should use.
-
-    Precedence: DYNO_AKD_PDO_PROFILE (applies to every AKD at once, so a size
-    bisect needs no file edits between runs) > drive_params.pdo_profile from
-    absorbers.yaml or the rig config > 'extended'.
-    """
-    profile = os.environ.get('DYNO_AKD_PDO_PROFILE')
-    if not profile:
-        profile = ((params or {}).get('drive_params') or {}).get(
-            'pdo_profile', AKD_PDO_PROFILE_DEFAULT)
-    if profile not in AKD_PDO_PROFILES:
-        raise ValueError(f'unknown AKD PDO profile {profile!r}; choose one of: '
-                         + ', '.join(AKD_PDO_PROFILES))
-    return profile
+    return resolve_pdo_profile(AKD_PDO_PROFILES, AKD_PDO_PROFILE_DEFAULT,
+                               'DYNO_AKD_PDO_PROFILE', 'AKD', params)
 
 
 # Per-cycle trace of the DS402 handshake during a mode change. This runs inside
@@ -821,6 +840,10 @@ class AKD:
 
         self.digital_out_state = 0x00000000
         self.mode_dict = {7:2,3:1,4:0,0:-1} #Converts from KM mode nomenclature to 0 = torque, 1 = velocity, 2 = position
+        # The same mapping the other way, for what update_modes writes into
+        # 0x6060. Kept as data rather than inline literals because ELMO shares
+        # update_modes and drives the cyclic synchronous modes (8/9/10) instead.
+        self._mode_to_op = {'position':7,'velocity':3,'torque':4}
 
     def _rx_set(self, field, value):
         '''Write an RxPDO field the active profile maps. Returns whether it did.
@@ -940,16 +963,11 @@ class AKD:
                 print(self.name, self.state, self.target_mode, self.mode,
                       f'sw=0x{sw:04X}')
             if self.state == 'ready_to_sw_on': # only write _rx_pdo.control_mode when the drive is in the specific state. adjust the internal tracking of the operating mode
-                if self.target_mode == 'position':
-                    self._rx_pdo.control_mode = 7
-                    self.pos_cmd_offset = getattr(self._tx_pdo, 'actual_position', 0)
-                    self.mode = 'position'
-                elif self.target_mode == 'velocity':
-                    self._rx_pdo.control_mode = 3
-                    self.mode = 'velocity'
-                elif self.target_mode == 'torque':
-                    self._rx_pdo.control_mode = 4
-                    self.mode = 'torque'
+                if self.target_mode in self._mode_to_op:
+                    self._rx_pdo.control_mode = self._mode_to_op[self.target_mode]
+                    if self.target_mode == 'position':
+                        self.pos_cmd_offset = getattr(self._tx_pdo, 'actual_position', 0)
+                    self.mode = self.target_mode
 
             # Once drive confirms mode change, return to normal operation        
             if self.servo_drive_mode == 2 and self.target_mode == 'position':
@@ -1230,6 +1248,528 @@ class AKD:
                 current_ff *= -1
             self._rx_command('torque_ff',
                              int(current_ff/self.params['drive_params']['i_cont']*1000))
+
+# --- Elmo process-data profiles ----------------------------------------------
+#
+# Same table-driven scheme as AKD_PDO_PROFILES above, with one structural
+# difference: on this Elmo EVERY PDO mapping object is read-only (probed over
+# SDO on the in-house rig's drive, 2026-08-19 - writing any 0x16xx/0x1Axx :0
+# aborts with 0x06010002, including the nominally 'configurable' 0x161E/0x1A1E).
+# Profiles therefore cannot invent their own layouts; they are composed by
+# ASSIGNING the drive's fixed mapping objects to the sync managers (0x1C12/
+# 0x1C13, up to 8 slots each), and every PDO key below must match the fixed
+# content the drive reports for that object, byte for byte, because the ctypes
+# structs are generated from these rows.
+#
+# The drive exposes each interesting object as its own single-entry fixed PDO,
+# which is what the profiles are built from. The multi-object combos (0x1605,
+# 0x1606, ...) are deliberately avoided: they bundle objects we do not command
+# (e.g. 0x6072 max_torque in 0x1605 - mapping it would force us to write a
+# live torque limit every cycle).
+#
+# Fixed maps used here, as read back from the drive:
+#   rx  0x160A [controlword:16]        tx  0x1A0A [statusword:16]
+#       0x160B [op_mode_cmd:8, pad:8]      0x1A0B [op_mode_disp:8, pad:8]
+#       0x160C [target_torque:16]          0x1A0E [actual_position:32]
+#       0x1618 [torque_offset:16]          0x1A11 [actual_velocity:32]
+#       0x160F [target_position:32]        0x1A13 [actual_torque:16]
+#       0x161C [target_velocity:32]        0x1A1F [actual_current:16]
+#       0x161D [digital_outputs:32]
+_EL_CONTROLWORD     = (0x6040, 0x00, 16, 'controlword',     ctypes.c_uint16)
+_EL_TARGET_TORQUE   = (0x6071, 0x00, 16, 'target_torque',   ctypes.c_int16)
+_EL_TORQUE_OFFSET   = (0x60B2, 0x00, 16, 'torque_offset',   ctypes.c_int16)
+_EL_TARGET_POSITION = (0x607A, 0x00, 32, 'target_position', ctypes.c_int32)
+_EL_TARGET_VELOCITY = (0x60FF, 0x00, 32, 'target_velocity', ctypes.c_int32)
+_EL_DIGITAL_OUTPUTS = (0x60FE, 0x01, 32, 'digital_outputs', ctypes.c_uint32)
+_EL_CONTROL_MODE    = (0x6060, 0x00,  8, 'control_mode',    ctypes.c_int8)
+
+_EL_STATUSWORD      = (0x6041, 0x00, 16, 'statusword',      ctypes.c_uint16)
+_EL_ACTUAL_POSITION = (0x6064, 0x00, 32, 'actual_position', ctypes.c_int32)
+_EL_ACTUAL_VELOCITY = (0x606C, 0x00, 32, 'actual_velocity', ctypes.c_int32)
+_EL_ACTUAL_TORQUE   = (0x6077, 0x00, 16, 'actual_torque',   ctypes.c_int16)
+_EL_ACTUAL_CURRENT  = (0x6078, 0x00, 16, 'actual_current',  ctypes.c_int16)
+_EL_OP_MODE         = (0x6061, 0x00,  8, 'op_mode',         ctypes.c_int8)
+# The fixed maps pair each 8-bit mode object with an 8-bit pad; index 0x0000
+# is what the drive itself reports for that filler entry.
+_EL_RX_PAD8         = (0x0000, 0x00,  8, None,               ctypes.c_int8)
+_EL_TX_PAD8         = (0x0000, 0x00,  8, None,               ctypes.c_int8)
+
+# Shared Tx side: every profile but 'minimal' reads the same six objects.
+_EL_TX_FULL = {0x1A0A: [_EL_STATUSWORD],
+               0x1A0E: [_EL_ACTUAL_POSITION],
+               0x1A11: [_EL_ACTUAL_VELOCITY],
+               0x1A13: [_EL_ACTUAL_TORQUE],
+               0x1A1F: [_EL_ACTUAL_CURRENT],
+               0x1A0B: [_EL_OP_MODE, _EL_TX_PAD8]}
+
+ELMO_PDO_PROFILES = {
+    # Everything. 20 B / 7 PDOs out, 16 B / 6 PDOs in.
+    'extended': {
+        'rx': {0x160A: [_EL_CONTROLWORD],
+               0x160C: [_EL_TARGET_TORQUE],
+               0x1618: [_EL_TORQUE_OFFSET],
+               0x160F: [_EL_TARGET_POSITION],
+               0x161C: [_EL_TARGET_VELOCITY],
+               0x161D: [_EL_DIGITAL_OUTPUTS],
+               0x160B: [_EL_CONTROL_MODE, _EL_RX_PAD8]},
+        'tx': _EL_TX_FULL,
+    },
+    # Full motion control, minus the digital outputs (only the stack light uses
+    # them, via _write_led). 16 B / 6 out, 16 B / 6 in.
+    'compact': {
+        'rx': {0x160A: [_EL_CONTROLWORD],
+               0x160C: [_EL_TARGET_TORQUE],
+               0x1618: [_EL_TORQUE_OFFSET],
+               0x160F: [_EL_TARGET_POSITION],
+               0x161C: [_EL_TARGET_VELOCITY],
+               0x160B: [_EL_CONTROL_MODE, _EL_RX_PAD8]},
+        'tx': _EL_TX_FULL,
+    },
+    # Read-only: every feedback object, no motion commands. This is the profile
+    # to bring a new drive up on - the chain reaches OP and every logged channel
+    # can be sanity-checked against the drive's own front end before anything is
+    # capable of moving. 4 B / 2 out, 16 B / 6 in.
+    'telemetry': {
+        'rx': {0x160A: [_EL_CONTROLWORD],
+               0x160B: [_EL_CONTROL_MODE, _EL_RX_PAD8]},
+        'tx': _EL_TX_FULL,
+    },
+    # The floor: state machine out, statusword in. Nothing moves and nothing is
+    # logged but the DS402 state. If even this fails, the problem is not the
+    # choice of assigned PDOs.
+    'minimal': {
+        'rx': {0x160A: [_EL_CONTROLWORD],
+               0x160B: [_EL_CONTROL_MODE, _EL_RX_PAD8]},
+        'tx': {0x1A0A: [_EL_STATUSWORD]},
+    },
+}
+
+ELMO_PDO_PROFILE_DEFAULT = 'compact'
+
+
+def elmo_pdo_structs(profile):
+    return pdo_structs(ELMO_PDO_PROFILES, 'ELMO', profile)
+
+
+def elmo_pdo_profile(params=None):
+    return resolve_pdo_profile(ELMO_PDO_PROFILES, ELMO_PDO_PROFILE_DEFAULT,
+                               'DYNO_ELMO_PDO_PROFILE', 'ELMO', params)
+
+
+class ELMO:
+    '''Elmo servo drive, DS402 over CoE. Sibling of AKD, not a subclass.
+
+    The DS402 half - the statusword decode, the controlword walk in
+    update_modes, the shutdown/release handover, the fault-reset pulse - is
+    standard and is carried over from AKD unchanged. What differs is everything
+    Kollmorgen-specific:
+
+      commands      AKD commands current directly through 0x2071 (mA) and
+                    position through the interpolated-position record 0x60C1:01
+                    in mode 7. This uses the cyclic synchronous modes instead
+                    (csp/csv/cst = 8/9/10) with their stock targets 0x607A /
+                    0x60FF / 0x6071, which is the right family for a DC-synced
+                    1 kHz loop and what Elmo documents for one.
+
+      units         AKD.setup writes 0x3660/0x3659 to force 2^32 counts/rev and
+                    mRPM, so its scaling constants are fixed. An Elmo reports
+                    position and velocity in FEEDBACK COUNTS and counts/s, so
+                    the conversion needs the encoder resolution -
+                    drive_params.counts_per_rev.
+
+      torque        0x6071 is per-thousand of a rated reference, not an amp. The
+                    torque -> current path (kt / k_tanh) is kept identical to
+                    AKD so the two benches linearise the same way, and only the
+                    final current -> per-mille step is new, via
+                    drive_params.i_rated.
+
+      identity      DRV.NAME lives at 0x2031 on an AKD; here the absorbers.yaml
+                    lookup uses the standard 0x1008 manufacturer device name.
+
+    UNVERIFIED ON HARDWARE. Three things must be confirmed on the real drive
+    before this is trusted to move a motor, and all three are silent failures
+    rather than loud ones:
+
+      1. Whether 0x6071 is scaled per-thousand of RATED TORQUE (0x6076) or of
+         RATED CURRENT (0x6075). Elmo firmware has shipped both readings. Getting
+         it wrong scales every torque command by the ratio between them.
+      2. Whether this firmware accepts a fully custom PDO map or only its
+         predefined ones. If mapping is refused, start at the 'minimal' profile.
+      3. Whether 0x6064 accumulates turns or wraps every revolution - see
+         position_counter_bits in __init__. counts_per_rev alone does not
+         answer this, and the two settings give completely different position
+         signals from the same encoder.
+
+    Bring it up on the 'telemetry' profile, confirm position/velocity/torque
+    against the drive's own front end, and only then move to 'compact'.
+    '''
+
+    def __init__(self, slave, name, params):
+        self._slave = slave
+        self.name = name
+        self.params = params
+
+        print('\n#### Configuring ', self.name, ' ####\n')
+
+        with open(dyno_paths.dyno_config_directory + '/absorbers.yaml', 'r') as f:
+            absorber_params = yaml.safe_load(f)
+
+        # 0x1008 is the standard manufacturer device name. Unlike the AKD's
+        # 0x2031 this is NOT operator-settable on every Elmo family, so an
+        # absorber entry may have to be keyed on the model string rather than on
+        # a per-axis name. Whatever it returns is printed below so the right key
+        # can be read off a bringup log.
+        try:
+            drive_name = (self._slave.sdo_read(0x1008, 0)
+                          .split(b'\x00')[0].decode('utf-8', 'ignore').strip())
+        except Exception as e:
+            print(f'{self.name}: could not read device name (0x1008): {e}')
+            drive_name = ''
+        print(f'{self.name} reports device name: {drive_name!r}')
+
+        layout_params = params if params is not None else {}
+        if drive_name in absorber_params:
+            print('Loading absorber params for: ', drive_name)
+            self.params, self.params_provenance = deep_merge(
+                layout_params, absorber_params[drive_name],
+                base_src='dyno config', override_src=f'absorbers.yaml:{drive_name}')
+        else:
+            print(self.name, ' drive params not found in absorber config. Using dyno config params')
+            self.params, self.params_provenance = deep_merge(
+                layout_params, {}, base_src='dyno config')
+
+        # counts_per_rev and i_rated are additions over the AKD's required set:
+        # the AKD forces its own units at setup time and commands amps directly,
+        # so it needs neither. There is no sane default for either - a guessed
+        # encoder resolution silently scales every position and velocity in the
+        # log, so this refuses to run without them.
+        validate_required_params(
+            self.params,
+            ['flip_torque_sign', 'gear_ratio',
+             'motor_params.kt', 'motor_params.k_tanh',
+             'motor_limits.torque', 'motor_limits.velocity',
+             'motor_limits.acceleration', 'motor_limits.rotatum',
+             'drive_params.i_cont', 'drive_params.i_rated',
+             'drive_params.counts_per_rev'],
+            context=f'ELMO {self.name} (drive {drive_name!r})')
+        print_params_provenance(f'{self.name} ({drive_name})',
+                                self.params, self.params_provenance)
+
+        self.counts_per_rev = self.params['drive_params']['counts_per_rev']
+
+        # NOT a limit and NOT a value to pick conservatively. This is the
+        # denominator that converts amps into the per-thousand units 0x6071 and
+        # 0x60B2 are expressed in, so it has exactly one correct value: whatever
+        # rated reference THIS DRIVE is configured with (0x6075, or 0x6076/kt).
+        # It is read off the drive, not derived from a motor datasheet.
+        #
+        # Delivered torque = commanded torque x (drive's rated / this value).
+        # So setting it low does not derate anything, it multiplies every torque
+        # command: halve it and the motor produces twice the torque asked for.
+        # motor_limits.torque does not protect against this - that clamp is
+        # applied in Nm further up send_command, before this scaling, so a
+        # command already limited to 12 Nm can still arrive at the shaft as 60.
+        #
+        # To derate for bringup, lower motor_limits.torque. That is the knob
+        # that is actually a ceiling, it is enforced in Nm, and the test builder
+        # pre-checks against it too.
+        self.i_rated = self.params['drive_params']['i_rated']
+
+        # Where 0x6064 rolls over, which is NOT the same question as how many
+        # counts there are in a revolution. On the AKD the two coincide (it is
+        # forced to 2^32 counts/rev, so its counter wraps once per revolution
+        # and one constant answers both); on an 18-bit Elmo they do not, and
+        # guessing picks between two very different position signals:
+        #
+        #   32  the drive accumulates turns and 0x6064 only rolls at the int32
+        #       boundary. Position is continuous across revolutions. This is the
+        #       usual behaviour for an incremental or multi-turn absolute
+        #       feedback and is the default.
+        #   18  0x6064 is single-turn absolute and wraps every revolution. The
+        #       unwrapper has to run at 2^18 to reconstruct turns.
+        #
+        # Getting this wrong is loud rather than subtle, which is the one mercy
+        # here: set 32 on a single-turn drive and logged position is a sawtooth
+        # resetting every revolution; set 18 on an accumulating drive and
+        # position jumps by ~16384 rev the first time the raw count exceeds
+        # 2^18. Either is obvious on the 'telemetry' profile in the first turn
+        # of the shaft, which is the reason to bring the drive up on it.
+        #
+        # 18 also buys a SPEED CEILING that 32 does not. Unwrapper only detects a
+        # wrap when consecutive samples straddle it inside its 10% guard bands,
+        # so a counter that rolls once per revolution needs <0.1 rev per process
+        # cycle: ~107 rev/s, 672 rad/s at the 1 kHz loop. Above that, turns are
+        # silently miscounted and logged position walks away from the truth -
+        # velocity and torque stay correct, so nothing else looks wrong. A
+        # 32-bit accumulating counter rolls every ~8192 rev instead and has no
+        # practical ceiling. Prefer 32 unless the drive genuinely wraps.
+        # NB the DUT's configured velocity limit here is 600 rad/s, which leaves
+        # only ~12% margin on that ceiling if 18 is selected.
+        self.position_counter_bits = self.params['drive_params'].get(
+            'position_counter_bits', 32)
+        if self.position_counter_bits not in (18, 32):
+            print(f'WARNING: {self.name} position_counter_bits='
+                  f'{self.position_counter_bits} is unusual; expected the '
+                  f'feedback width (18) or the int32 rollover (32).')
+        print(f'{self.name} position: {self.counts_per_rev} counts/rev, '
+              f'0x6064 treated as a {self.position_counter_bits}-bit counter')
+
+        self.pdo_profile = elmo_pdo_profile(self.params)
+        self._pdo_map = ELMO_PDO_PROFILES[self.pdo_profile]
+        RxPDO, TxPDO = elmo_pdo_structs(self.pdo_profile)
+        self._rx_pdo = RxPDO()  # Master -> Slave (Output to drive)
+        self._tx_pdo = TxPDO()  # Slave -> Master (Input from drive)
+        self._rx_fields = {field for field, _ctype in RxPDO._fields_}
+        self._tx_fields = {field for field, _ctype in TxPDO._fields_}
+        self._unmapped_warned = set()
+
+        self.pos_offset = 0
+        self.velocity = 0
+        self.position = 0
+        self.current = 0
+        self.torque = 0
+
+        self.torque_command = math.nan
+        self.velocity_command = math.nan
+        self.position_command = math.nan
+
+        self._rx_pdo.controlword = 0x00FF  # fault reset
+
+        self.state = None
+        self.sw_enable = False
+        self.shutdown = False
+
+        self.position_unwrapper = Unwrapper(fs_counts=2**self.position_counter_bits)
+
+        # Cyclic synchronous torque. The AKD's equivalent here is 4 (profile
+        # torque); the cyclic modes are the ones that expect a fresh target
+        # every DC cycle, which is what this loop provides.
+        self._rx_pdo.control_mode = 10
+        self.mode = 'torque'
+        self.switching_modes = False
+        self.pos_cmd_offset = 0
+
+        self.position_offset = 0
+        self.flip_torque_sign = self.params['flip_torque_sign']
+        self.flip_direction_sign = self.params.get('flip_direction_sign', False)
+
+        self.torque_limit = self.params['motor_limits']['torque']
+        self.velocity_limit = self.params['motor_limits']['velocity']
+        self.acceleration_limit = self.params['motor_limits']['acceleration']
+        self.rotatum_limit = self.params['motor_limits']['rotatum']
+
+        self.fault = True
+        self.enabled = False
+
+        self._fault_reset_cycles = 0
+
+        self.digital_out_state = 0x00000000
+        # 0x6061 display value -> this stack's 0 = torque, 1 = velocity,
+        # 2 = position. csp/csv/cst, against the AKD's ip/pv/tq.
+        self.mode_dict = {8: 2, 9: 1, 10: 0, 0: -1}
+        self._mode_to_op = {'position': 8, 'velocity': 9, 'torque': 10}
+
+    # --- shared with AKD, verbatim ---------------------------------------
+    _rx_set = AKD._rx_set
+    _rx_command = AKD._rx_command
+    request_fault_reset = AKD.request_fault_reset
+    released = AKD.released
+    update_modes = AKD.update_modes
+    set_dout = AKD.set_dout
+    write_rxpdo = AKD.write_rxpdo
+
+    def command_operating_mode(self, mode):
+        if 'op_mode' not in self._tx_fields:
+            print(f"WARNING: {self.name} PDO profile '{self.pdo_profile}' does "
+                  f"not map op_mode, so a switch to {mode} can never be "
+                  f"confirmed by the drive. Refusing the mode change.")
+            return
+        print(self.name, ' Switching from  ', self.mode, ' to ', mode, ' mode')
+        # Snap position target to actual before de-enabling to zero following error
+        if self.mode == 'position':
+            self._rx_set('target_position',
+                         getattr(self._tx_pdo, 'actual_position', 0))
+        self.target_mode = mode
+        self.switching_modes = True
+
+        self.torque_command = math.nan
+        self.velocity_command = math.nan
+        self.position_command = math.nan
+
+    def setup(self):
+        # No equivalent of the AKD's 0x3598 (IL.KP) readback or its 0x3660/0x3659
+        # unit forcing: on an Elmo the position/velocity units are the feedback's
+        # and are handled in software via counts_per_rev.
+
+        if 'digital_outputs' in self._rx_fields:
+            # Hex 0x00030000 = (1 << 16) | (1 << 17)
+            mask_val = 0x00030000
+            self._slave.sdo_write(index=0x60FE, subindex=2, data=mask_val.to_bytes(4, 'little'))
+
+        # Clear the sync-manager assignments only. The mapping objects
+        # themselves are all read-only on this drive (see the profile table
+        # comments), so unlike the AKD there is nothing else to clear - and
+        # nothing stale to inherit, since the assignment lists fully determine
+        # the process image when the maps are fixed.
+        for pdo_obj in [0x1C12, 0x1C13]:
+            self._slave.sdo_write(index=pdo_obj, subindex=0, data=0x00.to_bytes(1, 'little'))
+
+        self._write_pdo_map()
+
+        # Interpolation time = 1 ms, matching the process-data cycle. Standard
+        # DS402, same as the AKD.
+        val, power = 1, -3
+        self._slave.sdo_write(index=0x60C2, subindex=1, data=val.to_bytes(1, 'little', signed=False))
+        self._slave.sdo_write(index=0x60C2, subindex=2, data=power.to_bytes(1, 'little', signed=True))
+
+    def _write_pdo_map(self):
+        '''Assign the active profile's fixed PDOs to the sync managers.
+
+        Unlike AKD._write_pdo_map this never writes a mapping object: they are
+        all read-only on this drive, and each profile row mirrors the fixed
+        content the drive reports. Only the 0x1C12/0x1C13 assignment lists
+        (slots first, counts last, same order the AKD path uses) are written.
+        '''
+        rx, tx = self._pdo_map['rx'], self._pdo_map['tx']
+
+        for sm_index, pdo_map in ((0x1C12, rx), (0x1C13, tx)):
+            for slot, pdo_index in enumerate(pdo_map, 1):
+                self._slave.sdo_write(index=sm_index, subindex=slot,
+                                      data=pdo_index.to_bytes(2, 'little'))
+            self._slave.sdo_write(index=sm_index, subindex=0,
+                                  data=len(pdo_map).to_bytes(1, 'little'))
+
+    def process_txpdo(self):
+        '''Reads the latest input bytes from the slave and populates the TxPDO structure.'''
+        if len(self._slave.input) == ctypes.sizeof(self._tx_pdo):
+            self._tx_pdo = type(self._tx_pdo).from_buffer_copy(self._slave.input)
+        else:
+            print(f'WARNING: {self.name} (ELMO) input buffer size mismatch! '
+                  f'Expected {ctypes.sizeof(self._tx_pdo)}, Got {len(self._slave.input)}')
+
+        tx = self._tx_pdo
+        raw_position = getattr(tx, 'actual_position', 0)
+        raw_velocity = getattr(tx, 'actual_velocity', 0)
+        raw_current = getattr(tx, 'actual_current', 0)
+        raw_torque = getattr(tx, 'actual_torque', 0)
+        raw_op_mode = getattr(tx, 'op_mode', 0)
+
+        if not raw_position == 0 and self.pos_offset == 0:
+            self.pos_offset = raw_position
+
+        # Unwrapper works in unsigned counts. A 32-bit counter arrives as a
+        # signed int32 and is shifted into [0, 2^32) and back (the AKD does the
+        # same); a single-turn counter is already unsigned within its own span,
+        # and the modulo only guards a drive that sign-extends it.
+        span = 2**self.position_counter_bits
+        if self.position_counter_bits == 32:
+            self.unwrapped_ticks = self.position_unwrapper(raw_position + span//2) - span//2
+        else:
+            self.unwrapped_ticks = self.position_unwrapper(raw_position % span)
+        if self.flip_direction_sign:
+            self.unwrapped_ticks = -self.unwrapped_ticks
+        # Counts -> rad. The AKD divides by a fixed 2^32 because it forces that
+        # resolution at setup; here it is whatever the feedback actually is.
+        self.position = 2*math.pi*self.unwrapped_ticks/self.counts_per_rev + self.position_offset
+
+        # 0x606C is counts/s on an Elmo, against the AKD's mRPM.
+        self.velocity = 2*math.pi*raw_velocity/self.counts_per_rev
+        if self.flip_direction_sign:
+            self.velocity = -self.velocity
+
+        # Both of these are per-thousand of a rated reference, not engineering
+        # units - see the class docstring's item 1, which applies to the decode
+        # exactly as it does to the command.
+        self.current = raw_current * self.i_rated / 1000
+        self.torque = raw_torque / 1000
+
+        self.servo_drive_mode = self.mode_dict.get(raw_op_mode, -1)
+        self.statusword = tx.statusword
+
+        self.update_modes()
+
+        self._rx_set('digital_outputs', self.digital_out_state)
+
+        # Zero out RX entries, they'll be filled in later
+        self._rx_set('target_torque', 0)
+        self._rx_set('target_position', 0)
+        self._rx_set('target_velocity', 0)
+        self._rx_set('torque_offset', 0)
+
+    def send_command(self, command, torque_ff=0):
+        if self.mode == 'position':
+            self.position_command = command
+            drive_cmd = -command if self.flip_direction_sign else command
+            self._rx_command('target_position',
+                             int(drive_cmd*self.counts_per_rev/(2*math.pi) + self.pos_cmd_offset))
+
+        elif self.mode == 'velocity':
+            v_limit = self.params['motor_limits']['velocity']
+            if abs(command) > v_limit:
+                print(self.name, ' velocity command of ', command, ' exceeds limit of ', v_limit)
+                command = np.sign(command) * v_limit
+
+            self.velocity_command = command
+            drive_cmd = -command if self.flip_direction_sign else command
+            self._rx_command('target_velocity',
+                             int(drive_cmd*self.counts_per_rev/(2*math.pi)))
+
+        elif self.mode == 'torque':
+            t_limit = self.params['motor_limits']['torque']
+            if abs(command) > t_limit:
+                print(self.name, ' torque command of ', command, ' exceeds limit of ', t_limit)
+                command = np.sign(command) * t_limit
+
+            self.torque_command = command
+            kt = self.params['motor_params']['kt']
+            k_tanh = self.params['motor_params']['k_tanh']
+            current_target = np.arctanh(command * k_tanh / kt) / k_tanh
+
+            if self.flip_torque_sign:
+                current_target = -current_target
+            # Amps -> per-thousand of rated. This is the one step that differs
+            # from the AKD, which writes mA straight into 0x2071.
+            self._rx_command('target_torque',
+                             self._permille(current_target, 'target_torque'))
+
+        if not torque_ff == 0:
+            kt = self.params['motor_params']['kt']
+            k_tanh = self.params['motor_params']['k_tanh']
+            current_ff = np.arctanh(torque_ff * k_tanh / kt) / k_tanh
+            if self.flip_torque_sign:
+                current_ff *= -1
+            self._rx_command('torque_offset',
+                             self._permille(current_ff, 'torque_offset'))
+
+    # Per-thousand-of-rated saturation limit. 0x6071 and 0x60B2 are both int16,
+    # and ctypes does not raise on overflow - it truncates, so 40000 lands in
+    # the PDO as -25536. That is not a clipped command, it is a full-magnitude
+    # command in the WRONG DIRECTION, delivered to a drive that has no way to
+    # know it was meant as a positive one. On a coupled dyno that is the worst
+    # arithmetic failure available.
+    _PERMILLE_MAX = 32767
+
+    def _permille(self, current, field):
+        '''Amps -> per-thousand of rated, clamped, complaining once per field.
+
+        Reaching the clamp means i_rated is wrong by ~30x or more, not that a
+        test asked for too much torque - motor_limits.torque has already capped
+        the command in Nm by the time this runs. So it is a configuration error
+        being caught late, and it says so rather than reporting a torque limit.
+        '''
+        value = int(current/self.i_rated*1000)
+        if abs(value) > self._PERMILLE_MAX:
+            if field not in self._unmapped_warned:
+                self._unmapped_warned.add(field)
+                print(f'WARNING: {self.name} {field} of {value} per-mille '
+                      f'exceeds the int16 range and has been clamped. '
+                      f'drive_params.i_rated={self.i_rated} A is almost '
+                      f'certainly wrong - it must match the drive\'s own rated '
+                      f'reference (0x6075/0x6076), not a value picked for '
+                      f'headroom.')
+            value = int(math.copysign(self._PERMILLE_MAX, value))
+        return value
+
 
 class AXON():
     # Mode-change tunables. The position-target path enters velocity mode first,
@@ -2099,6 +2639,14 @@ DEVICE_CLASSES = {
         # back off both drives. The rest of the stack already assumes DC is
         # running: master.py calls config_dc() and the cyclic loop steers on
         # self._master.dc_time. The AKD was simply never opted in.
+        'has_dc': True
+        },
+    'ELMO': {
+        'id': ELMO_PRODUCT_CODE,
+        'class': ELMO,
+        # Same reasoning as the AKD below: the cyclic synchronous modes this
+        # driver uses expect a DC-synced target every cycle, so this is not
+        # optional here the way it is for a free-running I/O terminal.
         'has_dc': True
         },
     'AXON': {

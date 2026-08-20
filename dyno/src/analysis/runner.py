@@ -26,8 +26,27 @@ def build_plan(log, only=None, segment=None, overrides=None):
 
     Returns a list of plan entries. Applicability is recorded even when the
     verdict is 'no', so --list can explain why something was skipped.
+
+    `overrides` is the raw {key: str} from --set. It is coerced and installed on
+    each processor *before* its predicate runs, because predicates gate on
+    defaults(): an override applied only to the plan entry afterwards would
+    reach run() but not the decision about whether run() ever happens.
+    Raises ValueError if a key is recognized by no processor, or if a value
+    does not cast.
     """
     procs = [get_processor(only)] if only else all_processors()
+    for k, raw in (overrides or {}).items():
+        takers = [p for p in procs if k in p.params]
+        if not takers:
+            raise ValueError(_unknown_param_message(k, procs))
+        for proc in takers:
+            try:
+                value = _coerce(proc, k, raw)
+            except ValueError as exc:
+                raise ValueError(f'{proc.name} parameter {k!r} rejected '
+                                 f'{raw!r}: {exc}') from exc
+            proc.overrides = {**proc.overrides, k: value}
+
     plan = []
     for proc in procs:
         for label, segs in log.grouped(proc.granularity):
@@ -42,9 +61,11 @@ def build_plan(log, only=None, segment=None, overrides=None):
                       f'{type(exc).__name__}: {exc}')
             if verdict is None:
                 continue
+            # defaults() already carries this processor's overrides, and they
+            # win: an operator forcing a value outranks the predicate's guess.
             params = proc.defaults()
             params.update(verdict.params)
-            params.update(overrides or {})
+            params.update(proc.overrides)
             plan.append({
                 'processor': proc.name,
                 'title': proc.title,
@@ -81,6 +102,16 @@ def _announce(names, limit=6):
         print(f'  saved: {name}')
     if len(names) > limit:
         print(f'  saved: ... and {len(names) - limit} more')
+
+
+def _unknown_param_message(key, procs):
+    """A --set typo should print the whole menu, not just the rejection."""
+    lines = [f'no processor in this plan has a parameter {key!r}']
+    for proc in procs:
+        lines.append(f'\n{proc.name} accepts:')
+        for pk, (default, _t, help_) in proc.params.items():
+            lines.append(f'  {pk:<22} (default {default})  {help_}')
+    return '\n'.join(lines)
 
 
 def _coerce(proc, key, raw):
@@ -186,33 +217,18 @@ def main(argv=None):
         for s in log.segments:
             print(f'  {s.raw_id:<32} n={len(s):>8}  {s.duration:7.1f}s')
 
+        # A --set key only has to be known to the processors it is aimed at --
+        # a plan routinely mixes processors with disjoint parameters, so a key
+        # that is meaningless to one of them is normal and must not abort the
+        # others. Only a key that no processor recognizes is a typo worth
+        # stopping for.
         raw_overrides = dict(kv.split('=', 1) for kv in args.set)
-        plan = build_plan(log, only=args.only, segment=args.segment)
-
-        # Coerce late: casting needs the proc. A --set key only has to be known
-        # to the processors it is aimed at -- a plan routinely mixes processors
-        # with disjoint parameters, so a key that is meaningless to one of them
-        # is normal and must not abort the others. Only a key that no processor
-        # in the plan recognizes is a typo worth stopping for.
-        for k, v in raw_overrides.items():
-            takers = [e for e in plan if k in e['_proc'].params]
-            if not takers:
-                print(f'\nerror: no processor in this plan has a parameter '
-                      f'{k!r}', file=sys.stderr)
-                for entry in plan:
-                    proc = entry['_proc']
-                    print(f'\n{proc.name} accepts:', file=sys.stderr)
-                    for pk, (default, _t, help_) in proc.params.items():
-                        print(f'  {pk:<22} (default {default})  {help_}',
-                              file=sys.stderr)
-                return 2
-            for entry in takers:
-                try:
-                    entry['params'][k] = _coerce(entry['_proc'], k, v)
-                except ValueError as exc:
-                    print(f'\nerror: {entry["_proc"].name} parameter {k!r} '
-                          f'rejected {v!r}: {exc}', file=sys.stderr)
-                    return 2
+        try:
+            plan = build_plan(log, only=args.only, segment=args.segment,
+                              overrides=raw_overrides)
+        except ValueError as exc:
+            print(f'\nerror: {exc}', file=sys.stderr)
+            return 2
 
         if args.list:
             print('\nApplicability:')
