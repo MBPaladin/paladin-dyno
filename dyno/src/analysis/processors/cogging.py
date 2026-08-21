@@ -11,10 +11,14 @@ Views produced (each with a CSV):
      the slowest speed, one trace per load level. Slowest speed only: the cell
      and its filtering attenuate angle-locked ripple as its temporal frequency
      rises, so the slow dwell is the least-filtered look at the pattern.
-  2. Cogging vs pole phase -- the same data folded over one pole-pair period
-     (2pi / pole_pairs), pooling every pole. `pole_pairs` can be given, or
-     auto-detected from the dominant spatial order of the no-load trace.
-  3. Cogging vs load -- ripple peak-to-peak (from the pole-phase fold) against
+  2. Ripple vs ripple-order phase -- the same data folded over one period of
+     the dominant angle-locked ripple order (2pi / ripple_order), pooling every
+     period. `ripple_order` can be given, or auto-detected from the dominant
+     spatial order of the no-load trace. It is a property of the measured
+     ripple, not of the motor: the fold period need not equal the pole-pair
+     count, and a peak-picking detector cannot tell a fundamental from one of
+     its harmonics. Label these views as an order, never as a pole count.
+  3. Ripple vs load -- ripple peak-to-peak (from the ripple-order fold) against
      load level, one line per speed.
   4. Torque ratio vs speed -- measured torque / commanded torque per dwell,
      one line per load level: how speed erodes the ability to achieve the
@@ -76,9 +80,9 @@ class Cogging(Processor):
     title = 'Cogging / Torque Ripple (speed x load grid)'
     description = (
         'Folds measured torque over shaft angle across a grid of speed '
-        'plateaus and load levels: cogging vs mechanical angle, vs pole '
-        'phase, ripple amplitude vs load, and achieved/commanded torque '
-        'ratio vs speed.'
+        'plateaus and load levels: ripple vs mechanical angle, vs phase '
+        'within the dominant ripple order, ripple amplitude vs load, and '
+        'achieved/commanded torque ratio vs speed.'
     )
     granularity = 'run'
 
@@ -87,15 +91,15 @@ class Cogging(Processor):
         'torque_motor':    (None, str,   'Motor holding the load levels (auto-detected)'),
         'position_channel': (None, str,  'Continuous shaft angle channel (auto-detected)'),
         'torque_channel':  (None, str,   'Torque cell on the torque motor shaft (auto-detected)'),
-        'pole_pairs':      (0,    int,   'Electrical periods per mechanical revolution; '
-                                         '0 = auto-detect from the dominant spatial order '
-                                         'of the slowest lightest-load trace'),
+        'ripple_order':    (0,    int,   'Ripple periods per mechanical revolution to fold '
+                                         'over; 0 = auto-detect from the dominant spatial '
+                                         'order of the slowest lightest-load trace'),
         'mech_bins':       (360,  int,   'Angle bins over one full revolution'),
-        'pole_bins':       (32,   int,   'Angle bins over one pole-pair period'),
+        'phase_bins':      (32,   int,   'Angle bins over one ripple period'),
         'min_revs':        (2.0,  float, 'Revolutions a dwell needs for its fold to be used'),
         'ratio_min_cmd':   (0.5,  float, 'Skip |torque command| below this in the '
                                          'torque-ratio view [Nm]'),
-        'max_auto_order':  (256,  int,   'Ceiling for the auto-detected pole_pairs'),
+        'max_auto_order':  (256,  int,   'Ceiling for the auto-detected ripple_order'),
     }
 
     # -- detection -----------------------------------------------------------
@@ -202,16 +206,23 @@ class Cogging(Processor):
             {'velocity_motor': vmotor, 'torque_motor': tmotor,
              'position_channel': pch, 'torque_channel': tch})
 
-    # -- pole-pair auto-detection ----------------------------------------------
+    # -- ripple-order auto-detection -------------------------------------------
 
-    def _detect_pole_pairs(self, pos, tq, max_order):
+    def _detect_ripple_order(self, pos, tq, max_order):
         """Dominant spatial order of the torque-vs-angle signal.
 
         Resample torque onto a uniform angle grid (the dwell's speed ripple
         makes the raw samples non-uniform in angle), FFT over angle, and take
-        the strongest peak in cycles/rev. Cogging repeats once per pole pair,
-        so that order IS the pole-pair count when the trace is dominated by
-        cogging -- which is why the no-load slow dwell is used.
+        the strongest peak in cycles/rev.
+
+        This is the order to fold over, and nothing more. It is NOT a pole-pair
+        count: peak-picking a single bin cannot separate a fundamental from its
+        harmonics (a machine with a strong 3rd order reads as 3x its pole
+        pairs), cannot separate angle-locked ripple from time-locked content
+        that happens to land on an order at this one speed, and reports the
+        winner even when the runner-up is a hair behind. Cross-check a detected
+        order against a second speed plateau -- angle-locked content holds its
+        order, time-locked content does not -- before reading physics into it.
         """
         theta = pos - pos[0]
         span = float(abs(theta[-1]))
@@ -251,24 +262,30 @@ class Cogging(Processor):
                 return None, None
             return s[pch], s[tch]
 
-        # -- pole pairs ------------------------------------------------------
-        pp = int(params['pole_pairs'])
+        # -- ripple order ----------------------------------------------------
+        order = int(params['ripple_order'])
+        order_source = 'specified'
         base_load = min(loads, key=abs)
-        if pp <= 0:
+        if order <= 0:
+            order_source = 'detected'
             p0, q0 = trace(slow, base_load)
-            pp = self._detect_pole_pairs(p0, q0, params['max_auto_order'])
-            if pp <= 0:
-                res.add('warn', 'pole_pairs_unknown',
-                        'pole_pairs could not be auto-detected (no dominant '
+            order = self._detect_ripple_order(p0, q0, params['max_auto_order'])
+            if order <= 0:
+                res.add('warn', 'ripple_order_unknown',
+                        'ripple_order could not be auto-detected (no dominant '
                         'spatial order in the no-load slow dwell); the '
-                        'pole-phase views are skipped. Set pole_pairs '
+                        'ripple-order views are skipped. Set ripple_order '
                         'explicitly to get them.')
             else:
-                res.add('info', 'pole_pairs_detected',
-                        f'pole_pairs auto-detected as {pp}: the dominant '
+                res.add('info', 'ripple_order_detected',
+                        f'ripple_order auto-detected as {order}: the dominant '
                         f'spatial order of {tch} vs angle in the {slow:g} '
-                        f'rad/s, {base_load:g} Nm dwell. Set pole_pairs '
-                        f'explicitly to override.')
+                        f'rad/s, {base_load:g} Nm dwell. This is a fold period, '
+                        f'not a motor property -- it may be a harmonic of the '
+                        f'true fundamental, and a single peak pick cannot rule '
+                        f'out time-locked content that only looks angle-locked '
+                        f'at this speed. Confirm against another speed plateau '
+                        f'before quoting it. Set ripple_order to override.')
 
         res.add('info', 'slow_fold_only',
                 f'Angle-folded views use the {slow:g} rad/s plateau only: the '
@@ -301,26 +318,26 @@ class Cogging(Processor):
         res.tables.append(('vs_mech_angle',
                            _wide_csv('angle_deg', c * 360, mech_cols)))
 
-        # -- 2) cogging vs pole phase + 3) ripple vs load ----------------------
-        # Peak-to-peak per (speed, load) comes from the pole-phase fold, which
-        # pools every pole and so is the lowest-noise ripple estimate.
+        # -- 2) ripple vs ripple-order phase + 3) ripple vs load ---------------
+        # Peak-to-peak per (speed, load) comes from the ripple-order fold, which
+        # pools every period and so is the lowest-noise ripple estimate.
         pkpk = {}          # {(speed, load): pkpk}
-        if pp > 0:
-            period = _TWO_PI / pp
+        if order > 0:
+            period = _TWO_PI / order
             # Phase reference: put the no-load slow trace's peak at 0.
             p0, q0 = trace(slow, base_load)
-            c0, m0, _, _ = _fold((p0 / period) % 1.0, q0, params['pole_bins'])
+            c0, m0, _, _ = _fold((p0 / period) % 1.0, q0, params['phase_bins'])
             offset = float(c0[np.nanargmax(m0 - np.nanmean(m0))])
 
             fig, ax = plt.subplots(figsize=(13, 7))
-            pole_cols = []
+            phase_cols = []
             for i, load in enumerate(loads):
                 for speed in speeds:
                     p, q = trace(speed, load)
                     if p is None:
                         continue
                     c, m, sd, _ = _fold(((p / period) - offset) % 1.0, q,
-                                        params['pole_bins'])
+                                        params['phase_bins'])
                     m = m - np.nanmean(m)
                     pkpk[(speed, load)] = float(np.nanmax(m) - np.nanmin(m))
                     if speed != slow:
@@ -329,19 +346,19 @@ class Cogging(Processor):
                     ax.plot(c * 100, m, color=color, lw=1.6, label=f'{load:g} Nm')
                     ax.fill_between(c * 100, m - sd, m + sd, color=color,
                                     alpha=0.15)
-                    pole_cols += [(f'{load:g}Nm_mean', m),
-                                  (f'{load:g}Nm_std', sd)]
-            ax.set_xlabel(f'Pole phase (%, one of {pp} pole periods)')
+                    phase_cols += [(f'{load:g}Nm_mean', m),
+                                   (f'{load:g}Nm_std', sd)]
+            ax.set_xlabel(f'Phase within one 1/{order} rev period (%)')
             ax.set_ylabel(f'{tch} ripple (Nm, mean-subtracted)')
-            ax.set_title(f'{tmotor} cogging vs pole phase '
-                         f'({pp} pole pairs) @ {slow:g} rad/s')
+            ax.set_title(f'{tmotor} torque ripple folded at order {order} '
+                         f'({order_source}) @ {slow:g} rad/s')
             ax.axhline(0, color='k', lw=0.5)
             ax.grid(alpha=0.4)
             ax.legend(title='Load')
             fig.tight_layout()
-            res.figures.append(('vs_pole_phase', fig))
-            res.tables.append(('vs_pole_phase',
-                               _wide_csv('phase_percent', c * 100, pole_cols)))
+            res.figures.append(('vs_ripple_order', fig))
+            res.tables.append(('vs_ripple_order',
+                               _wide_csv('phase_percent', c * 100, phase_cols)))
 
             fig, ax = plt.subplots(figsize=(11, 7))
             load_cols = []
@@ -352,8 +369,8 @@ class Cogging(Processor):
                         label=f'{speed:g} rad/s')
                 load_cols.append((f'{speed:g}rad_s_pkpk_Nm', ys))
             ax.set_xlabel('Load / commanded torque (Nm)')
-            ax.set_ylabel('Ripple peak-to-peak (Nm, pole-phase fold)')
-            ax.set_title(f'{tmotor} cogging amplitude vs load')
+            ax.set_ylabel(f'Ripple peak-to-peak (Nm, order-{order} fold)')
+            ax.set_title(f'{tmotor} ripple amplitude vs load')
             ax.grid(alpha=0.4)
             ax.legend(title='Speed')
             fig.tight_layout()
@@ -400,13 +417,14 @@ class Cogging(Processor):
                     f'a kt or cell-scale error instead.')
 
         # -- metrics -----------------------------------------------------------
-        slow_pkpk = {f'{ld:g}Nm': pkpk.get((slow, ld)) for ld in loads} if pp else {}
+        slow_pkpk = {f'{ld:g}Nm': pkpk.get((slow, ld)) for ld in loads} if order else {}
         res.metrics.update({
             'velocity_motor': vmotor,
             'torque_motor': tmotor,
             'position_channel': pch,
             'torque_channel': tch,
-            'pole_pairs': pp if pp > 0 else None,
+            'ripple_order': order if order > 0 else None,
+            'ripple_order_source': order_source if order > 0 else None,
             'speeds_rad_s': speeds,
             'loads_Nm': loads,
             'slowest_speed_rad_s': slow,
@@ -416,9 +434,9 @@ class Cogging(Processor):
                              for (sp, ld), r in sorted(ratios.items())},
         })
         headline = (f'{np.nanmax(list(slow_pkpk.values())):.3f} Nm pk-pk ripple '
-                    f'(pole fold, {pp} pole pairs)'
+                    f'(folded at order {order})'
                     if slow_pkpk and any(v is not None for v in slow_pkpk.values())
-                    else 'pole-phase fold unavailable')
+                    else 'ripple-order fold unavailable')
         res.summary = (
             f'{tmotor} over {len(speeds)} speeds x {len(loads)} loads: '
             f'{headline} at {slow:g} rad/s; torque tracking spans '

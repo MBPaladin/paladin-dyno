@@ -129,7 +129,7 @@ expected_slave_layout:
       drive_params:
         i_cont: 7
   - model: AKD
-    name: DUT
+    name: GIANTMOTOR
     params:
       flip_torque_sign: True
       gear_ratio: 1 # Output should always be set to 1
@@ -145,7 +145,7 @@ expected_slave_layout:
       drive_params:
         i_cont: 15
   - model: ELMO
-    name: ELMOMOTOR
+    name: DUT
     params:
       flip_torque_sign: False
       gear_ratio: 1

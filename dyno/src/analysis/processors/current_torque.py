@@ -1017,16 +1017,19 @@ class CurrentTorque(Processor):
         if 'A_Nm' in pooled['tanh']:
             ax.plot(x, tanh_model(x, pooled['tanh']['A_Nm'], pooled['tanh']['B_per_A']),
                     'g--', lw=1.5,
-                    label=f"tanh: kt0 = {abs(pooled['tanh']['small_signal_kt_Nm_per_A']):.4f}, "
+                    label=f"tanh: kt = {abs(pooled['tanh']['small_signal_kt_Nm_per_A']):.4f}, "
                           f"R2 = {pooled['tanh']['r_squared']:.5f}")
         if cfg_kt:
             ax.plot(x, np.sign(kt) * cfg_kt * x, 'r', lw=1.5,
                     label=f'specsheet kt = {cfg_kt} Nm/A')
         # The tanh curve restated in the drive's own coordinates, monospaced so
         # it can be read off the figure and pasted into the config unaltered.
+        # The equation above the block is the forward form the drive inverts,
+        # so the two constants are readable as more than bare numbers.
         drive = drive_params_from_tanh(pooled['tanh'])
         if drive:
             ax.text(0.02, 0.97,
+                    f'T = (kt / k_tanh) * tanh(k_tanh * I)\n'
                     f'motor_params:\n'
                     f'  kt:     {drive["kt"]:.4f}\n'
                     f'  k_tanh: {drive["k_tanh"]:.6f}',

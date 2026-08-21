@@ -158,6 +158,14 @@ class RunningTorque(Processor):
                                             'drag reads negative when turning positive. '
                                             'Affects the drag curve and its fits only; '
                                             'the spectra are amplitude-only and unchanged'),
+        'symmetric_drag':   (True, bool,  'Assume drag is the same in both directions, '
+                                           'so the offset between the two flank '
+                                           'intercepts is torque-cell bias rather than '
+                                           'physics. Subtracts that common-mode bias, '
+                                           'which puts the origin midway between the '
+                                           'fitted flanks. Coulomb and viscous terms are '
+                                           'unchanged; the per-direction intercepts and '
+                                           'the folded curves are not'),
         # -- spectral --------------------------------------------------------
         'stft_win':         (0,      int,   'STFT window [samples]; 0 = derive '
                                             'from the measured sweep rate and '
@@ -467,6 +475,48 @@ class RunningTorque(Processor):
                     f'Coulomb and viscous drag cannot be separated -- a one-sided '
                     f'fit cannot tell a friction offset from a cell offset.')
 
+        # -- symmetric-drag correction --------------------------------------
+        # Under the symmetry assumption the two flanks are T = +-Tc + b*w + q,
+        # with q a common-mode cell bias that no tare caught (a lead-in tare
+        # only removes the offset present at standstill; a cell that shifts
+        # once it is loaded or once the shaft turns keeps its own). Coulomb
+        # already comes from the DIFFERENCE of the intercepts, so it never saw
+        # q; the SUM is what q lives in, and halving it recovers it exactly.
+        # Everything the fit reports is therefore unchanged except the two
+        # signed intercepts, which is the point -- the curve moves, the drag
+        # numbers do not.
+        #
+        # This is an assumption, not a measurement: a genuinely direction-
+        # dependent drag (a preloaded lip seal, a helical stage thrusting into
+        # a bearing one way and off it the other) is silently absorbed into
+        # `cell_bias_Nm`. It is quoted as its own metric so it can be checked
+        # against a second run taken with the cell rotated in its mount, where
+        # a real bias flips with the cell and real asymmetry does not.
+        symmetric = bool(params['symmetric_drag'])
+        cell_bias = 0.0
+        if symmetric and 'pos' in fit and 'neg' in fit:
+            cell_bias = 0.5 * (fit['pos'][1] + fit['neg'][1])
+            tq = tq - cell_bias
+            bmean = bmean - cell_bias
+            fit = {tag: (slope, intercept - cell_bias)
+                   for tag, (slope, intercept) in fit.items()}
+            res.add('info', 'symmetric_bias_removed',
+                    f'symmetric_drag is set, so the {cell_bias:+.4f} Nm common-mode '
+                    f'offset between the two flank intercepts is read as {tch} bias, '
+                    f'not as direction-dependent friction, and has been subtracted. '
+                    f'The origin now sits midway between the flanks and they read '
+                    f'{fit["pos"][1]:+.3f} / {fit["neg"][1]:+.3f} Nm. That bias is '
+                    f'{100 * abs(cell_bias) / max(coulomb, 1e-9):.0f}% of the '
+                    f'{coulomb:.3f} Nm Coulomb term; Coulomb and viscous drag are '
+                    f'unchanged by it. If the drag really is asymmetric, this has '
+                    f'hidden that asymmetry -- clear symmetric_drag to see it.')
+        elif symmetric:
+            res.add('warn', 'symmetric_bias_unavailable',
+                    f'symmetric_drag is set but only one direction cleared '
+                    f'|w| >= {fmin_v} rad/s, so there is no second flank to centre '
+                    f'against and no bias could be removed. The drag curve is '
+                    f'uncorrected.')
+
         vpeak = float(np.max(np.abs(v)))
         drag_at_peak = coulomb + viscous * vpeak
 
@@ -596,6 +646,8 @@ class RunningTorque(Processor):
             'lead_in_s': lead_s,
             'tare_Nm': tare if params['tare_from_leadin'] else 0.0,
             'torque_sign_inverted': invert,
+            'symmetric_drag_assumed': symmetric,
+            'cell_bias_Nm': cell_bias,
             'peak_speed_rad_s': vpeak,
             'coulomb_drag_Nm': coulomb,
             'viscous_drag_Nm_per_rad_s': viscous,
@@ -628,7 +680,7 @@ class RunningTorque(Processor):
         if params['fig_drag']:
             res.figures.append(('drag_vs_velocity', self._fig_drag(
                 centers, bmean, bripple, fit, coulomb, viscous, motor, tch,
-                backdrive, ratio, invert)))
+                backdrive, ratio, invert, cell_bias)))
 
         if params['fig_order_spectrum'] and ospec is not None:
             band = keep & (fr >= params['fmin_hz'])
@@ -1290,7 +1342,7 @@ class RunningTorque(Processor):
         return fig
 
     def _fig_drag(self, centers, bmean, bripple, fit, coulomb, viscous, motor,
-                  tch, backdrive, ratio, invert=False):
+                  tch, backdrive, ratio, invert=False, cell_bias=0.0):
         import matplotlib.pyplot as plt
 
         fig, (axL, axR) = plt.subplots(1, 2, figsize=(16, 7))
@@ -1306,7 +1358,8 @@ class RunningTorque(Processor):
         axL.axhline(0, color='k', lw=0.5)
         axL.axvline(0, color='k', lw=0.5)
         axL.set_xlabel('Driven-shaft velocity (rad/s)')
-        axL.set_ylabel(f'{tch} (Nm, tared{", sign inverted" if invert else ""})')
+        axL.set_ylabel(f'{tch} (Nm, tared{", sign inverted" if invert else ""}'
+                       f'{", bias removed" if cell_bias else ""})')
         axL.set_title(f'{motor} {"back-drive" if backdrive else "forward"} running '
                       f'torque' + (f' ({ratio:g}:1)' if ratio != 1 else ''))
         axL.grid(True, alpha=0.35)
@@ -1314,8 +1367,23 @@ class RunningTorque(Processor):
 
         # Folded: the two directions on top of each other. Agreement is the
         # check that this is friction and not a cell offset masquerading as it.
+        #
+        # With symmetric_drag set that check has been spent -- the bias was
+        # chosen to make the flanks agree at w=0 -- so the uncorrected pair is
+        # drawn behind it. The gap between ghost and solid IS the correction,
+        # and what remains between the two solid curves is the part symmetry
+        # could not explain: a slope difference, which no constant offset can
+        # produce. That residual is the only thing left on this panel worth
+        # reading as physics once the origin has been centred.
         pos = centers >= 0
         neg = centers < 0
+        if cell_bias:
+            raw = bmean + cell_bias
+            axR.plot(centers[pos], np.abs(raw[pos]), ':', lw=1.0, color='tab:red',
+                     alpha=0.55,
+                     label=f'before removing {cell_bias:+.4f} Nm cell bias')
+            axR.plot(-centers[neg], np.abs(raw[neg]), ':', lw=1.0, color='tab:green',
+                     alpha=0.55)
         axR.plot(centers[pos], np.abs(bmean[pos]), 'o-', ms=4, color='tab:red',
                  label='positive direction')
         axR.plot(-centers[neg], np.abs(bmean[neg]), 'o-', ms=4, color='tab:green',
@@ -1327,7 +1395,9 @@ class RunningTorque(Processor):
                          np.abs(bmean[neg]) + bripple[neg], color='tab:green', alpha=0.15)
         axR.set_xlabel('|Driven-shaft velocity| (rad/s)')
         axR.set_ylabel('|Running torque| (Nm)')
-        axR.set_title('Both directions folded, with the ripple band')
+        axR.set_title('Both directions folded, with the ripple band'
+                      + ('\nsymmetric_drag: origin centred between the flanks, so '
+                         'only a slope difference is real' if cell_bias else ''))
         axR.grid(True, alpha=0.35)
         axR.legend(fontsize=8)
         fig.tight_layout()
