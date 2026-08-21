@@ -112,7 +112,7 @@ RTC-0020: #New small motor: values need correcting
   motor_limits:
     torque: 20
     velocity: 600
-    acceleration: 800 #Rad/s^2
+    acceleration: 1000 #Rad/s^2
     rotatum: 500 #Nm/s, 4 x peak torque value
   drive_params:
     i_cont: 20
