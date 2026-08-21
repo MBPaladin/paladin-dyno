@@ -44,7 +44,7 @@ ports:
 sensors:
   # Output torque cell
   load_torque:
-    port: RESERVED_ADC
+    port: RESERVED_ADC_1
     fs_v: 5
     fs_pos: 500
     offset: 0
@@ -52,9 +52,16 @@ sensors:
 
   # Input torque cell
   input_torque:
-    port: ADC1
+    port: RESERVED_ADC_2
     fs_v: 10
     fs_pos: 20
+    offset: 0
+    supply: NA
+
+  current_clamp:
+    port: ADC1
+    fs_v: 5
+    fs_pos: 50 
     offset: 0
     supply: NA
 
@@ -68,16 +75,16 @@ sensors:
 # no matching power_<supply> key, so omitting them is the supported way to say
 # "unpowered".
 panel_ports:
-  RESERVED_ADC:
+  RESERVED_ADC_1:
     signal_module: adc_1
     signal_channel: ch1
-  ADC1:
+  RESERVED_ADC_2:
     signal_module: adc_1
     signal_channel: ch2
-  ADC2:
+  ADC1:
     signal_module: adc_1
     signal_channel: ch3
-  ADC3:
+  ADC2:
     signal_module: adc_1
     signal_channel: ch4
   RTD1:

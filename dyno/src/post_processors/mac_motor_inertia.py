@@ -40,12 +40,18 @@ What the test shape buys, and how it is used here
    loss curve doubles as a cross-check estimator: (C_ramp - loss(w)) / alpha.
 
 Usage:
-    python dyno/src/post_processors/mac_motor_inertia.py <log.hdf5|log_dir> [-o OUTDIR]
+    python dyno/src/post_processors/mac_motor_inertia.py <log.hdf5|log_dir>
+        [-o OUTDIR] [-s STRUCTURE_INERTIA]
 
 The positional argument is either the .hdf5 log itself, the run folder holding
 it, or any parent folder -- a parent resolves to its most recently modified
 subfolder that contains a log. Outputs land next to the log unless -o says
 otherwise.
+
+Everything measured here is the whole test-side string. Pass `-s` with the dyno
+structure's inertia in kg.m^2 (couplers, adapters, cell rotor -- whatever spins
+that is not the motor under test) to have it subtracted, so the reported J and
+the plot are the motor shaft alone.
 """
 
 import argparse
@@ -575,53 +581,71 @@ def figure_losses(rows, fit, drift, tares, out_path):
     plt.close(fig)
 
 
-def figure_inertia(diffs, J, Jse, out_path):
+def figure_inertia(diffs, J, Jse, out_path, structure=0.0):
+    """J vs alpha. Everything measured here is the whole test-side string, so
+    `structure` (couplers, adapter, cell rotor -- whatever is bolted between the
+    absorber and the motor) is subtracted to leave the motor shaft alone. It is
+    treated as an exact constant: it shifts every point by the same amount and
+    widens no uncertainty."""
     _style()
     P = PALETTE
-    fig, ax = plt.subplots(1, 2, figsize=(11.5, 4.6))
+    fig, ax = plt.subplots(figsize=(6.4, 4.6))
 
     groups = _group(diffs)
     order = sorted(groups, key=lambda k: np.mean([d['alpha_mag'] for d in groups[k]]))
-    hues = [P['blue'], P['aqua'], P['yellow'], P['violet'], P['orange'], P['green']]
+    sym = 'J_{motor}' if structure else 'J_{test}'
 
+    # Show every ramp pair rather than a bar summarising them. Each pair is an
+    # independent estimate, so the raw scatter IS the repeatability -- a drawn
+    # error bar is one number derived from these points, and at n=4 it hides
+    # whether the spread is a clean cluster or one outlier. Each pair also
+    # carries its own measured alpha, which separates the repeats horizontally
+    # on its own; no jitter is invented to spread them.
+    Jm = J - structure
+    ax.axhspan((Jm - Jse) * 1e3, (Jm + Jse) * 1e3, color=P['blue'], alpha=.13, lw=0)
+    ax.axhline(Jm * 1e3, color=P['blue'], lw=2,
+               label='pooled  $%s=%.3f\\pm%.3f\\times10^{-3}$' % (sym, Jm * 1e3, Jse * 1e3))
+
+    xs, ys, allv = [], [], []
     for k, g in enumerate(order):
-        for d in groups[g]:
-            ax[0].plot(d['bins'][:, 0], d['bins'][:, 1] * 1e3, '-', lw=1.1,
-                       color=hues[k % len(hues)], alpha=.75)
-        amag = np.mean([d['alpha_mag'] for d in groups[g]])
-        ax[0].plot([], [], color=hues[k % len(hues)], lw=2,
-                   label='%s: $\\alpha\\approx%.0f$ rad/s² (%d)' % (g, amag, len(groups[g])))
-    ax[0].axhline(J * 1e3, color=INK, lw=1.4, ls='--')
-    ax[0].set_xlabel('shaft speed  $\\omega$  (rad/s)')
-    ax[0].set_ylabel('$J_{test}$  ($10^{-3}$ kg·m²)')
-    ax[0].set_title('(a)  Per-speed-bin, every run', loc='left', fontweight='bold')
-    ax[0].legend(fontsize=8, loc='lower left')
-    ax[0].set_ylim(0, max(J * 1e3 * 2.2, 1))
-
-    xs, ys, es = [], [], []
-    for g in order:
-        vals = np.array([d['J'] for d in groups[g]])
-        xs.append(np.mean([d['alpha_mag'] for d in groups[g]]))
-        ys.append(vals.mean() * 1e3)
-        es.append((vals.std(ddof=1) if len(vals) > 1 else 0.0) * 1e3)
-    ax[1].axhspan((J - Jse) * 1e3, (J + Jse) * 1e3, color=P['blue'], alpha=.13, lw=0)
-    ax[1].axhline(J * 1e3, color=P['blue'], lw=2,
-                  label='pooled  $J=%.3f\\pm%.3f\\times10^{-3}$' % (J * 1e3, Jse * 1e3))
-    ax[1].errorbar(xs, ys, yerr=es, marker='o', ms=8, ls='', capsize=4,
-                   color=P['violet'], label='per $\\alpha$ (bars = run-to-run sd)')
-    ax[1].set_xlabel('ramp acceleration  $|\\alpha|$  (rad/s²)')
-    ax[1].set_ylabel('$J_{test}$  ($10^{-3}$ kg·m²)')
-    ax[1].set_title('(b)  Estimated Inertia vs Acceleration', loc='left',
-                    fontweight='bold')
-    ax[1].legend(fontsize=8, loc='lower right')
-    ax[1].set_ylim(0, max(J * 1e3 * 2.0, 1))
+        vals = (np.array([d['J'] for d in groups[g]]) - structure) * 1e3
+        amags = np.array([d['alpha_mag'] for d in groups[g]])
+        ax.plot(amags, vals, 'o', ms=5, color=P['violet'], alpha=.75, zorder=4,
+                label='individual ramp pairs (n=%d)' % len(diffs) if k == 0 else None)
+        # A dash, not a bigger dot: within one group the repeats agree to well
+        # under a marker width, so any filled symbol at the mean simply covers
+        # the points this plot exists to show. A wide flat tick marks the level
+        # without hiding the cluster under it.
+        ax.plot(amags.mean(), vals.mean(), '_', ms=17, mew=2.2, color=INK,
+                zorder=5, label='per $\\alpha$ mean' if k == 0 else None)
+        xs.append(amags.mean())
+        ys.append(vals.mean())
+        allv.extend(vals)
+    if structure:
+        ax.plot([], [], ' ',
+                label='$J_{test}=%.3f$, structure$=%.3f\\times10^{-3}$'
+                      % (J * 1e3, structure * 1e3))
+    ax.set_xlabel('ramp acceleration  $|\\alpha|$  (rad/s²)')
+    ax.set_ylabel('$%s$  ($10^{-3}$ kg·m²)' % sym)
+    ax.set_title('Calculated %s Inertia vs Acceleration'
+                 % ('Motor' if structure else 'Test-Side'),
+                 loc='left', fontweight='bold')
+    ax.legend(fontsize=8, loc='upper right')
+    # Scale to the scatter, not to zero. The run-to-run spread here is ~2% of J,
+    # so a zero-based axis flattens every individual estimate into one line and
+    # throws away the only thing this plot is for. The axis is read off the
+    # ticks, and both the pooled value and its band stay on screen.
+    lo = min(min(allv), (Jm - Jse) * 1e3)
+    hi = max(max(allv), (Jm + Jse) * 1e3)
+    pad = max((hi - lo) * 0.35, abs(Jm * 1e3) * 0.02, 1e-3)
+    ax.set_ylim(lo - pad, hi + pad * 1.9)
     plt.tight_layout()
     fig.savefig(out_path, dpi=140)
     plt.close(fig)
 
 
 # --- main -------------------------------------------------------------------
-def analyze(log_dir, out_dir=None):
+def analyze(log_dir, out_dir=None, structure_inertia=0.0):
     resolved, path = find_log(log_dir)
     out_dir = out_dir or resolved
     os.makedirs(out_dir, exist_ok=True)
@@ -713,6 +737,20 @@ def analyze(log_dir, out_dir=None):
     print(f'          between-acceleration spread = {Jsys * 1e3:.3f} e-3 '
           f'({100 * Jsys / J:.1f}%) -- the systematic floor')
 
+    # Every estimator above sees the whole test-side string. Removing the known
+    # structure inertia is the only step that makes the number a MOTOR spec.
+    # Subtracting a constant leaves the error bar alone, so the uncertainty
+    # reported here is still the measurement's -- it does not include however
+    # well the structure figure itself is known.
+    J_motor = J - structure_inertia
+    if structure_inertia:
+        print(f'          minus dyno structure {structure_inertia * 1e3:.3f} e-3'
+              f'  ->  J_motor = {J_motor * 1e3:.3f} +/- {Jse * 1e3:.3f} e-3 kg.m^2')
+        if J_motor <= 0:
+            print(f'  WARNING: the structure inertia is at or above the measured '
+                  f'test-side total, so J_motor is non-physical. Check its units '
+                  f'(this flag wants kg.m^2, e.g. 1.2e-3).')
+
     xchecks = inertia_vs_loss_curve(b, branches, tare_fn, fit)
     xv = np.array([x['J'] for x in xchecks])
     print(f'  cross-check vs loss curve: {xv.mean()*1e3:.3f} +/- '
@@ -721,7 +759,7 @@ def analyze(log_dir, out_dir=None):
     f1 = os.path.join(out_dir, f'{stem}_losses.png')
     f2 = os.path.join(out_dir, f'{stem}_inertia.png')
     figure_losses(rows, fit, drift, tares, f1)
-    figure_inertia(diffs, J, Jse, f2)
+    figure_inertia(diffs, J, Jse, f2, structure_inertia)
 
     csv = os.path.join(out_dir, f'{stem}_loss_curve.csv')
     with open(csv, 'w') as fh:
@@ -734,6 +772,8 @@ def analyze(log_dir, out_dir=None):
     summary = dict(
         log=path, cell=b.cell, cell_sign=b.cell_sign, kt=b.kt, fs=b.fs,
         J_test_kgm2=J, J_test_se=Jse, J_test_systematic=Jsys, n_runs=len(allJ),
+        J_structure_kgm2=float(structure_inertia),
+        J_motor_kgm2=float(J_motor), J_motor_se=Jse,
         J_by_group={str(g): dict(
             alpha=float(np.mean([d['alpha_mag'] for d in v])),
             mean=float(np.mean([d['J'] for d in v])),
@@ -756,8 +796,15 @@ def main():
     ap.add_argument('log_dir', metavar='LOG',
                     help='.hdf5 log file, its run folder, or a parent folder')
     ap.add_argument('-o', '--out-dir', default=None)
+    ap.add_argument('-s', '--structure-inertia', type=float, default=0.0,
+                    metavar='KGM2',
+                    help='inertia of the dyno structure on the test side -- '
+                         'couplers, adapters, cell rotor, anything spinning that '
+                         'is not the motor under test -- in kg.m^2 (e.g. 1.2e-3). '
+                         'Subtracted from the measured total so the plot and the '
+                         'reported J are the motor shaft alone.')
     a = ap.parse_args()
-    analyze(a.log_dir, a.out_dir)
+    analyze(a.log_dir, a.out_dir, a.structure_inertia)
 
 
 if __name__ == '__main__':

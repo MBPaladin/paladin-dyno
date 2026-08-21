@@ -46,6 +46,7 @@ from ..processor import Applicability, Processor, Result
 from ..registry import register
 
 _TWO_PI = 2.0 * np.pi
+_KRPM_PER_RAD_S = 60.0 / (_TWO_PI * 1000.0)
 
 
 # -- signal helpers ---------------------------------------------------------
@@ -681,6 +682,12 @@ class RunningTorque(Processor):
             res.figures.append(('drag_vs_velocity', self._fig_drag(
                 centers, bmean, bripple, fit, coulomb, viscous, motor, tch,
                 backdrive, ratio, invert, cell_bias)))
+            # Same fit, abscissa in krpm: the viscous slope is ~105x larger and
+            # needs fewer decimals, the Coulomb intercept is untouched.
+            res.figures.append(('drag_vs_velocity_krpm', self._fig_drag(
+                centers, bmean, bripple, fit, coulomb, viscous, motor, tch,
+                backdrive, ratio, invert, cell_bias,
+                vel_scale=_KRPM_PER_RAD_S, vel_unit='krpm', slope_fmt='.3f')))
 
         if params['fig_order_spectrum'] and ospec is not None:
             band = keep & (fr >= params['fmin_hz'])
@@ -1342,8 +1349,15 @@ class RunningTorque(Processor):
         return fig
 
     def _fig_drag(self, centers, bmean, bripple, fit, coulomb, viscous, motor,
-                  tch, backdrive, ratio, invert=False, cell_bias=0.0):
+                  tch, backdrive, ratio, invert=False, cell_bias=0.0,
+                  vel_scale=1.0, vel_unit='rad/s', slope_fmt='.4f'):
         import matplotlib.pyplot as plt
+
+        # The fit is done in rad/s; plotting in another velocity unit rescales
+        # the abscissa, so every per-velocity slope (the viscous term) divides
+        # by the same factor. Coulomb terms are intercepts and do not move.
+        centers = centers * vel_scale
+        vfac = 1.0 / vel_scale
 
         fig, (axL, axR) = plt.subplots(1, 2, figsize=(16, 7))
         axL.plot(centers, bmean, 'b.-', ms=5, label='mean torque per velocity bin')
@@ -1351,13 +1365,15 @@ class RunningTorque(Processor):
             if tag in fit:
                 lim = np.nanmax(centers) if tag == 'pos' else np.nanmin(centers)
                 xs = np.linspace(0, lim, 50)
-                axL.plot(xs, fit[tag][0] * xs + fit[tag][1], '--', color=color, lw=1.5,
-                         label=f'{tag}: {fit[tag][0]:+.4f}*w {fit[tag][1]:+.3f}')
+                slope = fit[tag][0] * vfac
+                axL.plot(xs, slope * xs + fit[tag][1], '--', color=color, lw=1.5,
+                         label=f'{tag}: {slope:+{slope_fmt}}*w {fit[tag][1]:+.3f}')
         axL.plot([], [], ' ',
-                 label=f'Coulomb {coulomb:.3f} Nm, viscous {viscous:.4f} Nm/(rad/s)')
+                 label=f'Coulomb {coulomb:.3f} Nm, viscous '
+                       f'{viscous * vfac:{slope_fmt}} Nm/({vel_unit})')
         axL.axhline(0, color='k', lw=0.5)
         axL.axvline(0, color='k', lw=0.5)
-        axL.set_xlabel('Driven-shaft velocity (rad/s)')
+        axL.set_xlabel(f'Driven-shaft velocity ({vel_unit})')
         axL.set_ylabel(f'{tch} (Nm, tared{", sign inverted" if invert else ""}'
                        f'{", bias removed" if cell_bias else ""})')
         axL.set_title(f'{motor} {"back-drive" if backdrive else "forward"} running '
@@ -1377,13 +1393,13 @@ class RunningTorque(Processor):
         # reading as physics once the origin has been centred.
         pos = centers >= 0
         neg = centers < 0
-        if cell_bias:
-            raw = bmean + cell_bias
-            axR.plot(centers[pos], np.abs(raw[pos]), ':', lw=1.0, color='tab:red',
-                     alpha=0.55,
-                     label=f'before removing {cell_bias:+.4f} Nm cell bias')
-            axR.plot(-centers[neg], np.abs(raw[neg]), ':', lw=1.0, color='tab:green',
-                     alpha=0.55)
+        # if cell_bias:
+        #     raw = bmean + cell_bias
+        #     axR.plot(centers[pos], np.abs(raw[pos]), ':', lw=1.0, color='tab:red',
+        #              alpha=0.55,
+        #              label=f'before removing {cell_bias:+.4f} Nm cell bias')
+        #     axR.plot(-centers[neg], np.abs(raw[neg]), ':', lw=1.0, color='tab:green',
+        #              alpha=0.55)
         axR.plot(centers[pos], np.abs(bmean[pos]), 'o-', ms=4, color='tab:red',
                  label='positive direction')
         axR.plot(-centers[neg], np.abs(bmean[neg]), 'o-', ms=4, color='tab:green',
@@ -1393,11 +1409,9 @@ class RunningTorque(Processor):
                          label='+/- ripple RMS')
         axR.fill_between(-centers[neg], np.abs(bmean[neg]) - bripple[neg],
                          np.abs(bmean[neg]) + bripple[neg], color='tab:green', alpha=0.15)
-        axR.set_xlabel('|Driven-shaft velocity| (rad/s)')
+        axR.set_xlabel(f'|Driven-shaft velocity| ({vel_unit})')
         axR.set_ylabel('|Running torque| (Nm)')
-        axR.set_title('Both directions folded, with the ripple band'
-                      + ('\nsymmetric_drag: origin centred between the flanks, so '
-                         'only a slope difference is real' if cell_bias else ''))
+        axR.set_title('Both directions folded, with the ripple band')
         axR.grid(True, alpha=0.35)
         axR.legend(fontsize=8)
         fig.tight_layout()
