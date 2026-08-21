@@ -19,7 +19,14 @@ if TYPE_CHECKING:
 #   'setpoint' - one Segment per logged span
 #   'run'      - all spans sharing (behavior, run); one complete grid sweep
 #   'behavior' - all runs of a behavior, i.e. across loop iterations
-GRANULARITIES = ('setpoint', 'run', 'behavior')
+#   'log'      - every span in the log, in one call
+#
+# 'log' is for an analysis whose answer is a property of the whole test rather
+# than of any behavior in it: the inertia processor compares ramp pairs taken at
+# different accelerations, and the disagreement BETWEEN behaviors is its
+# uncertainty estimate. Grouped any finer it would emit one plot per
+# acceleration and have nothing left to compare them against.
+GRANULARITIES = ('setpoint', 'run', 'behavior', 'log')
 
 
 @dataclass

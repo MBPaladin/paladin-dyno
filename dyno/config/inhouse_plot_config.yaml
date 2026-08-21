@@ -69,6 +69,24 @@ Output Position:
     - g
     - c
     - c
+Current Clamp:
+  title: Current
+  unit: A
+  range: # matches the clamp's fs_pos (50 A) in inhouse_dyno_config.yaml
+    - -50
+    - 50
+  data_keys:
+    - current_clamp
+    - dut_current
+    - load_current
+  legends:
+    - Clamp Current
+    - DUT Drive Current
+    - Load Drive Current
+  pens:
+    - m
+    - r
+    - g
 Load Temperature:
   title: Temperature
   unit: C

@@ -155,7 +155,7 @@ class RunningTorque(Processor):
         'min_bin_samples':  (200,    int,   'Samples a velocity bin needs to be reported'),
         'fit_min_vel':      (1.0,    float, 'Ignore |w| below this in the Coulomb+viscous fit [rad/s]'),
         'tare_from_leadin': (True,   bool,  'Subtract the stationary lead-in mean from the torque cell'),
-        'invert_torque_sign': (False, bool, 'Negate the torque cell against velocity, so '
+        'invert_torque_sign': (True, bool, 'Negate the torque cell against velocity, so '
                                             'drag reads negative when turning positive. '
                                             'Affects the drag curve and its fits only; '
                                             'the spectra are amplitude-only and unchanged'),
@@ -180,7 +180,7 @@ class RunningTorque(Processor):
                                            'from peak speed (~50 bins)'),
         'moving_min_speed': (0.5,   float, 'Frames slower than this are not part of '
                                             'the moving record [rad/s]'),
-        'orders':           ('1,5,10', str,  'Driven-shaft orders to overlay'),
+        'orders':           ('1,5,24,48,96', str,  'Driven-shaft orders to overlay'),
         'overlay_fast_shaft': (False, bool,  'Overlay the far-shaft (mesh/cogging) '
                                             'orders as well as the driven-shaft ones'),
         'db_floor':         (0.0,    float, 'Bottom of the colour scale [dB]; '

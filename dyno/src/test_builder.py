@@ -188,6 +188,11 @@ PATTERNS = {
         'start_at_peak': ('Cycle peak-to-peak (ramp to +amplitude first)',
                           False, bool),
         'cycles':       ('Cycles', 1, int),
+        # Hold at 0 after each cycle finishes, separating one sawtooth from
+        # the next (and the last one from the secondary's next level).
+        # Defaults to 0 so existing recipes (which have no such key) compile
+        # byte-identically.
+        'end_dwell_s':  ('Dwell after done [s]', 0.0, float),
     },
     'step': {
         'levels':  ('Levels (comma separated)', [5.0, 10.0], list),
@@ -602,7 +607,7 @@ def _pattern_keys(pattern, params):
             # peak to peak, so no traversal ever turns around near zero.
             # A plain sawtooth's cycles already fuse into this in the middle
             # (its return to zero and the next cycle's ramp up are collinear,
-            # with no dwell at zero to break them); anchoring is about the
+            # unless end_dwell_s breaks them apart); anchoring is about the
             # ENDS, which is where hysteresis analysis is most sensitive. It
             # also reaches a given number of peak-to-peak traversals in
             # 2*cycles + 2 ramps instead of 3*(cycles + 1).
@@ -621,6 +626,9 @@ def _pattern_keys(pattern, params):
                 move(p('amplitude'), p('rate'))
                 hold(p('peak_dwell_s'))
             move(0.0, p('rate'))
+            # Only one end dwell here: this shape's cycles run peak to peak by
+            # design, so there is no return to zero between them to rest at.
+            hold(p('end_dwell_s'))
         else:
             for _ in range(cycles):
                 move(p('amplitude'), p('rate'))
@@ -629,6 +637,7 @@ def _pattern_keys(pattern, params):
                     move(-p('amplitude'), p('rate'))
                     hold(p('peak_dwell_s'))
                 move(0.0, p('rate'))
+                hold(p('end_dwell_s'))
     elif pattern == 'step':
         for level in p('levels'):
             move(float(level), p('rate'))

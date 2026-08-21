@@ -179,9 +179,13 @@ class Cogging(Processor):
                 'no', f'single grid cell (speed {speeds}, load {loads}); '
                       'nothing to compare across')
 
-        pch = self._position_channel(seg, tmotor)
+        pch = d['position_channel'] or self._position_channel(seg, tmotor)
         if pch is None:
             return Applicability('no', f'no position channel found for {tmotor}')
+        if not (seg.has(pch) and seg.is_active(pch)):
+            return Applicability(
+                'no', f'position channel {pch!r} is absent from this log or '
+                      'entirely NaN')
         tch = d['torque_channel'] or self._torque_channel(seg, tmotor)
         if tch is None:
             return Applicability(
@@ -202,7 +206,8 @@ class Cogging(Processor):
             f'{vmotor} holds {len(speeds)} speed plateau(s) '
             f'({speeds[0]:g}..{speeds[-1]:g} rad/s) against {len(loads)} '
             f'{tmotor} load level(s) ({loads[0]:g}..{loads[-1]:g} Nm); '
-            f'{tch} on the {tmotor} shaft, {revs:.1f} revs per slow dwell',
+            f'{tch} on the {tmotor} shaft folded over {pch}, '
+            f'{revs:.1f} revs per slow dwell',
             {'velocity_motor': vmotor, 'torque_motor': tmotor,
              'position_channel': pch, 'torque_channel': tch})
 
@@ -286,6 +291,17 @@ class Cogging(Processor):
                         f'out time-locked content that only looks angle-locked '
                         f'at this speed. Confirm against another speed plateau '
                         f'before quoting it. Set ripple_order to override.')
+
+        own = self._position_channel(segs[0], tmotor)
+        if pch != own:
+            res.add('warn', 'borrowed_angle_reference',
+                    f'The fold is referenced to {pch}, not the {tmotor} '
+                    f'encoder ({own or "none active"}). That is only sound if '
+                    f'the two shafts are rigidly coupled at 1:1 -- any lash or '
+                    f'wind-up between them shifts the angle by a varying '
+                    f'amount and smears the folded shape. Angles here are '
+                    f'{pch} angles; do not quote a feature at a mechanical '
+                    f'angle as if it were located on the {tmotor} rotor.')
 
         res.add('info', 'slow_fold_only',
                 f'Angle-folded views use the {slow:g} rad/s plateau only: the '
@@ -380,32 +396,45 @@ class Cogging(Processor):
                                          load_cols)))
 
         # -- 4) torque ratio vs speed ------------------------------------------
-        fig, ax = plt.subplots(figsize=(11, 7))
+        # An unloaded log (every torque command at zero, e.g. windings open for
+        # a pure-cogging measurement) has nothing to take a ratio against.
         ratio_cols, ratios = [], {}
         used_loads = [ld for ld in loads if abs(ld) >= params['ratio_min_cmd']]
-        for i, load in enumerate(used_loads):
-            ys = []
-            for speed in speeds:
-                s = by_cell.get((speed, load))
-                r = (float(np.nanmean(s[tch])) / load) if s is not None else np.nan
-                ys.append(r)
-                if s is not None:
-                    ratios[(speed, load)] = r
-            ys = np.array(ys)
-            color = cmap(i / max(len(used_loads) - 1, 1))
-            ax.plot(speeds, ys, 'o-', color=color, lw=1.6, label=f'{load:g} Nm')
-            ratio_cols.append((f'{load:g}Nm', ys))
-        ax.axhline(1.0, color='k', lw=0.8, ls=':')
-        ax.set_xlabel('Speed (rad/s)')
-        ax.set_ylabel(f'Achieved / commanded torque ({tch} / command)')
-        ax.set_title(f'{tmotor}: how speed affects torque tracking')
-        ax.grid(alpha=0.4)
-        ax.legend(title='Commanded torque')
-        fig.tight_layout()
-        res.figures.append(('torque_ratio_vs_speed', fig))
-        res.tables.append(('torque_ratio_vs_speed',
-                           _wide_csv('speed_rad_s', np.asarray(speeds, float),
-                                     ratio_cols)))
+        if not used_loads:
+            res.add('warn', 'no_load_axis',
+                    f'No load level reaches ratio_min_cmd '
+                    f'({params["ratio_min_cmd"]:g} Nm) -- commanded torque is '
+                    f'{loads[0]:g} Nm across the whole log, so there is no load '
+                    f'axis. The torque-ratio view is skipped and the '
+                    f'ripple-vs-load view carries a single point per speed. '
+                    f'The angle fold is unaffected: it is a valid no-load '
+                    f'cogging measurement, just not the speed x load grid this '
+                    f'processor is named for.')
+        else:
+            fig, ax = plt.subplots(figsize=(11, 7))
+            for i, load in enumerate(used_loads):
+                ys = []
+                for speed in speeds:
+                    s = by_cell.get((speed, load))
+                    r = (float(np.nanmean(s[tch])) / load) if s is not None else np.nan
+                    ys.append(r)
+                    if s is not None:
+                        ratios[(speed, load)] = r
+                ys = np.array(ys)
+                color = cmap(i / max(len(used_loads) - 1, 1))
+                ax.plot(speeds, ys, 'o-', color=color, lw=1.6, label=f'{load:g} Nm')
+                ratio_cols.append((f'{load:g}Nm', ys))
+            ax.axhline(1.0, color='k', lw=0.8, ls=':')
+            ax.set_xlabel('Speed (rad/s)')
+            ax.set_ylabel(f'Achieved / commanded torque ({tch} / command)')
+            ax.set_title(f'{tmotor}: how speed affects torque tracking')
+            ax.grid(alpha=0.4)
+            ax.legend(title='Commanded torque')
+            fig.tight_layout()
+            res.figures.append(('torque_ratio_vs_speed', fig))
+            res.tables.append(('torque_ratio_vs_speed',
+                               _wide_csv('speed_rad_s', np.asarray(speeds, float),
+                                         ratio_cols)))
 
         if ratios:
             worst = min(ratios, key=lambda k: ratios[k])

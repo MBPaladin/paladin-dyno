@@ -136,7 +136,7 @@ expected_slave_layout:
       drive_params:
         i_cont: 7
   - model: AKD
-    name: GIANTMOTOR
+    name: DUT
     params:
       flip_torque_sign: True
       gear_ratio: 1 # Output should always be set to 1
@@ -151,24 +151,26 @@ expected_slave_layout:
         rotatum: 1000 #Nm/s, 4 x peak torque value
       drive_params:
         i_cont: 15
+  # SMALL (MAGIC?) MAC MOTOR
   - model: ELMO
-    name: DUT
+    name: ELMOMOTOR
     params:
       flip_torque_sign: False
       gear_ratio: 1
-      motor_params: { kt: 0.315, k_tanh: 0.0001 }
+      motor_params: { kt: 0.183, k_tanh: 0.0326 }
+      spec_sheet: { kt: .424}
       motor_limits:
-        torque: 20 #max 14
-        continuous_torque: 18 #max 10 maybe
-        velocity: 200
+        torque: 5.4 
+        continuous_torque: 3.4 
+        velocity: 100
         acceleration: 800
-        rotatum: 20
+        rotatum: 500
       drive_params:
-        i_cont: 56.570
-        i_rated: 56.570      # torque -> per-mille scaling
+        i_cont: 21.21
+        i_rated: 21.21      # torque -> per-mille scaling
         counts_per_rev: 262144                 # 2^18
         position_counter_bits: 32              # 18 if 0x6064 wraps each rev
-        pdo_profile: compact                 
+        pdo_profile: compact                  
 
 # Measured values over these limits stop the test.
 #
@@ -184,7 +186,7 @@ expected_slave_layout:
 safeties:
   output_torque: { source: devices.adc_1.load_torque, limit: 220 } # Nm, derated for bringup
   output_velocity: { source: devices.LOAD.velocity, limit: 200 } # rad/s, derated for bringup
-  input_velocity: { source: devices.DUT.velocity, limit: 600 } # rad/s, catches a back-driven DUT
+  input_velocity: { source: devices.DUT.velocity, limit: 100 } # rad/s, catches a back-driven DUT
   load_stator_temp: { source: devices.rtd_module.load_stator_temp, limit: 100 } # C
 
 # Torque cell tare: the GUI's Tare button averages each listed cell at rest and

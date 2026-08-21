@@ -208,6 +208,12 @@ class Log:
         list of (label, [Segment]) preserving log order."""
         if granularity == 'setpoint':
             return [(s.raw_id, [s]) for s in self.segments]
+        if granularity == 'log':
+            # One group, every span. The label becomes an output filename
+            # prefix, so it is a fixed word rather than a joined list of
+            # behavior names -- those run to dozens of characters on a real
+            # test and would make every file unreadable.
+            return [('ALL', list(self.segments))] if self.segments else []
 
         keyfn = (lambda s: s.group_key) if granularity == 'run' else (lambda s: s.behavior)
         order, buckets = [], {}

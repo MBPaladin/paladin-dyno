@@ -1,3 +1,4 @@
+# BIG MAC MOTOR
   - model: ELMO
     name: DUT
     params:
@@ -15,4 +16,24 @@
         i_rated: 56.570      # torque -> per-mille scaling
         counts_per_rev: 262144                 # 2^18
         position_counter_bits: 32              # 18 if 0x6064 wraps each rev
-        pdo_profile: compact             
+        pdo_profile: compact          
+
+# SMALL (MAGIC?) MAC MOTOR
+  - model: ELMO
+    name: DUT
+    params:
+      flip_torque_sign: False
+      gear_ratio: 1
+      motor_params: { kt: 0.5, k_tanh: 0.0001 }
+      motor_limits:
+        torque: 5.4 #max 14
+        continuous_torque: 3.4 #max 10 maybe
+        velocity: 90
+        acceleration: 800
+        rotatum: 500
+      drive_params:
+        i_cont: 56.570
+        i_rated: 56.570      # torque -> per-mille scaling
+        counts_per_rev: 262144                 # 2^18
+        position_counter_bits: 32              # 18 if 0x6064 wraps each rev
+        pdo_profile: compact        

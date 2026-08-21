@@ -239,7 +239,7 @@ class TestBuilderWindow(QWidget):
         super().__init__(parent)
         self.mode = mode
         self.setWindowTitle('Test Builder')
-        self.resize(1280, 800)
+        self.resize(1536, 960)
         try:
             self.limits = test_preview.limits_from_config(mode)
         except Exception:

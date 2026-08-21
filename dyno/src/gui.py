@@ -305,7 +305,6 @@ class Window(QWidget):
         self.plots = []
         for i in range(self.num_plots):
             plot_key = list(self.plot_params.keys())[i]
-            plot_params = self.plot_params[plot_key]
 
             # Create the drop down selector to change what the scope shows
             selection_box = QComboBox()
@@ -314,9 +313,7 @@ class Window(QWidget):
             selection_box.currentIndexChanged.connect(self.__change_scopes)
 
             # creat thge plot. the y range is defined from the plot_config file
-            plot = self.plot_widget.addPlot(row=i, col=0, title=plot_params['title'])
-            # plot.getViewBox().setYRange(plot_params['range'][0], plot_params['range'][1])
-            plot.setLabel('left', plot_params['unit'])
+            plot = self.plot_widget.addPlot(row=i, col=0)
             plot.showGrid(x=True, y=True, alpha=0.5)
             if i == 0:
                 # We drive the x-range ourselves (rolling window in redraw), so keep
@@ -324,26 +321,26 @@ class Window(QWidget):
                 plot.getViewBox().enableAutoRange(x=False)
             if i > 0:
                 plot.setXLink(self.plots[0]['plot']) # link x range of all other plots to the first
+
+            # One legend per scope, parented once here. __load_scope refills it;
+            # parenting a fresh LegendItem on every scope change stacks the old
+            # ones on top of each other in the corner.
             legend = pg.LegendItem(offset=(80, 10))
             legend.setParentItem(plot)
 
-            # for each curve that should be on the graph, load that trace from the data buffer and plot it
-            curves = []
-            for ui, data_key in enumerate(plot_params['data_keys']):               
-                curve = plot.plot(self.gui_data[0,:], self.trace(data_key), pen=plot_params['pens'][ui], name=plot_params['legends'][ui])
-                legend.addItem(curve, plot_params['legends'][ui])
-                curves.append(curve)
-
-            # create a dictionary of the objects associated with the scope in order to adjust them later
-            plot = {
-                'plot':plot,
-                'selector':selection_box,
-                'curves': curves,
-                'data_keys':self.plot_params[plot_key]['data_keys']
+            # a dictionary of the objects associated with the scope, so they can be adjusted later
+            entry = {
+                'plot': plot,
+                'selector': selection_box,
+                'legend': legend,
+                'curves': [],
+                'data_keys': [],
+                'key': None,
             }
+            self.__load_scope(entry, plot_key)
 
             # append that dictionary to a list of plots, and add the plot to the gui
-            self.plots.append(plot)
+            self.plots.append(entry)
             self.controls_layout.addWidget(selection_box)
 
         # --- Test Selection section: centered header, launcher button beneath
@@ -439,6 +436,12 @@ class Window(QWidget):
         self.controls_layout.addStretch(1)
         self.main_layout.addWidget(self.plot_widget, stretch=5)
         self.main_layout.addWidget(self.controls_widget, stretch=1)
+
+        # Open larger than the layout's natural hint, which packs the scopes
+        # tighter than is readable at a glance across the bench. Taller than it
+        # is wider: the extra height is what the stacked scopes actually need.
+        hint = self.sizeHint()
+        self.resize(int(hint.width() * 1.2), int(hint.height() * 1.4))
 
     def __build_safeties_panel(self):
         """Collapsible read-only view of the config's `safeties:` section, one
@@ -1094,31 +1097,48 @@ class Window(QWidget):
         self._armed_stale = True
         self.__refresh_status()
 
+    def __load_scope(self, entry, plot_key):
+        # Point one scope at plot_key: drop whatever it was drawing and rebuild
+        # its curves, pens and legend from that key's config.
+        #
+        # The curves have to be torn down every time, not only when the number
+        # of traces changes. A curve owns its pen and its legend label, so
+        # reusing one for a different key draws the new data in the old color
+        # under the old legend text; and any curve left behind in the plot keeps
+        # showing its last frame forever, because redraw() only ever feeds the
+        # curves listed in entry['curves'].
+        plot = entry['plot']
+        plot_params = self.plot_params[plot_key]
+
+        for curve in entry['curves']:
+            plot.removeItem(curve)
+        entry['legend'].clear()
+
+        plot.setTitle(plot_params['title'])
+        plot.setLabel('left', plot_params['unit'])
+        # plot.getViewBox().setYRange(plot_params['range'][0], plot_params['range'][1])
+
+        # for each curve that should be on the graph, load that trace from the data buffer and plot it
+        curves = []
+        for ui, data_key in enumerate(plot_params['data_keys']):
+            curve = plot.plot(self.gui_data[0,:], self.trace(data_key), pen=plot_params['pens'][ui], name=plot_params['legends'][ui])
+            entry['legend'].addItem(curve, plot_params['legends'][ui])
+            curves.append(curve)
+
+        entry['curves'] = curves
+        entry['data_keys'] = plot_params['data_keys']
+        entry['key'] = plot_key
+
     # called if you change which scope is selected in the dropdown
     def __change_scopes(self):
-        # Find the changed scope
-        inds_changed = [i for i in range(self.num_plots) if not self.plots[i]['plot'].titleLabel.text == self.plots[i]['selector'].currentText()]
-        
-        for i in inds_changed:
-            plot_key = self.plots[i]['selector'].currentText()
-            plot_params = self.plot_params[plot_key]
-
-            self.plots[i]['plot'].setTitle(plot_params['title'])
-            self.plots[i]['data_keys'] = plot_params['data_keys']
-            # self.plots[i]['plot'].getViewBox().setYRange(plot_params['range'][0], plot_params['range'][1])
-            self.plots[i]['plot'].setLabel('left', plot_params['unit'])
-
-            if not len(self.plots[i]['curves']) == len(self.plots[i]['data_keys']):
-                legend = pg.LegendItem(offset=(80, 10)) # Adjust offset as needed
-                legend.setParentItem(self.plots[i]['plot'])
-
-                curves = []
-                for ui, data_key in enumerate(plot_params['data_keys']):               
-                    curve = self.plots[i]['plot'].plot(self.gui_data[0,:], self.trace(data_key), pen=plot_params['pens'][ui], name=plot_params['legends'][ui])
-                    legend.addItem(curve, plot_params['legends'][ui])
-                    curves.append(curve)
-                
-                self.plots[i]['curves'] = curves
+        # Find the changed scope. This compares against the key we last loaded,
+        # not the plot's title: the title is the config's 'title' field, which
+        # is a different string from the dropdown entry (the config key), so the
+        # old title comparison flagged every scope on every change.
+        for entry in self.plots:
+            plot_key = entry['selector'].currentText()
+            if plot_key != entry['key']:
+                self.__load_scope(entry, plot_key)
 
     def trace(self, trace_key):
         if trace_key in self.log_keys:
