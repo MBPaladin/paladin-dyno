@@ -34,30 +34,10 @@ if '--sim' in sys.argv:
     print('#### SIMULATION MODE ####')
 
 
-# Both of the settings below work around one root cause: setup.sh grants the
-# venv interpreter file capabilities (cap_net_raw etc), so the kernel execs us
-# with AT_SECURE=1 and dumpable=2, which leaves /proc/<pid>/* owned by root.
-# xdg-desktop-portal probes /proc/<pid>/root to classify the caller, cannot open
-# it, and denies every request:
-#   "Portal operation not allowed: Unable to open /proc/<pid>/root"
-# Dropping the capabilities is not an option - the GUI itself calls
-# sched_setscheduler(SCHED_FIFO) and forks the EtherCAT Controller, which
-# inherits its privileges. PR_SET_DUMPABLE(1) restores the /proc ownership but
-# the portal still refuses, so both fixes below avoid the portal instead.
-
-# On Wayland, GNOME does not decorate Qt windows; Qt draws its own title bar and
-# reads the button layout from the (denied) Settings portal, so the window ends
-# up with no close/minimize/maximize buttons. XWayland gets mutter's server-side
-# decorations and never consults the portal. run_sim.sh already pins this for
-# unrelated WSLg reasons; only default it so an explicit setting still wins.
-if not os.environ.get('QT_QPA_PLATFORM') and os.environ.get('WAYLAND_DISPLAY'):
-    os.environ['QT_QPA_PLATFORM'] = 'xcb'
-
-# Qt's native file dialog is portal-backed. When the portal denies the request
-# the dialog window is created but never mapped, leaving getOpenFileName parked
-# in its modal event loop - the GUI looks hung with nothing on screen. Qt's own
-# widget dialog needs no portal. Must be set before the QApplication exists.
-QApplication.setAttribute(Qt.ApplicationAttribute.AA_DontUseNativeDialogs, True)
+# Portal/capability workarounds (QT_QPA_PLATFORM, AA_DontUseNativeDialogs).
+# Shared with the standalone analysis UI, which runs the same cap-granted
+# interpreter and hits the same portal denials. Must run before QApplication.
+from dyno.src import qt_env  # noqa: E402,F401
 
 from dyno.src import logger, test_builder
 from dyno.src.logger import Logger
@@ -661,10 +641,12 @@ class Window(QWidget):
         text_edit = QTextEdit()
         layout.addWidget(text_edit)
         buttons = QHBoxLayout()
-        save_btn = QPushButton('Save Notes')
+        ANALYZE_RESULT = 3  # save notes, then open the analysis UI on this log
+        analyze_btn = QPushButton('Save && Analyze')
+        analyze_btn.setStyleSheet('background-color: #2e9e3e; color: white;')
+        analyze_btn.clicked.connect(lambda: dialog.done(ANALYZE_RESULT))
+        save_btn = QPushButton('Save Data')
         save_btn.clicked.connect(dialog.accept)
-        skip_btn = QPushButton('Skip')
-        skip_btn.clicked.connect(dialog.reject)
         DELETE_RESULT = 2  # distinct from QDialog Accepted (1) / Rejected (0)
         delete_btn = QPushButton('Delete test log')
         delete_btn.setStyleSheet('background-color: #c62828; color: white;')
@@ -689,8 +671,8 @@ class Window(QWidget):
 
         revert_timer.timeout.connect(disarm)
         delete_btn.clicked.connect(on_delete_clicked)
+        buttons.addWidget(analyze_btn)
         buttons.addWidget(save_btn)
-        buttons.addWidget(skip_btn)
         buttons.addWidget(delete_btn)
         layout.addLayout(buttons)
         text_edit.setFocus()
@@ -703,8 +685,15 @@ class Window(QWidget):
                 self.__delete_test_log(log_dir)
                 return
             notes = text_edit.toPlainText().strip() if result else ''
+            # Empty notes write nothing: the Logger already wrote the setup
+            # half of <test>.txt, and there is nothing to add to it. This is
+            # exactly what the retired Skip button did.
             if notes:
                 self.__save_experiment_notes(log_dir, test_name, notes)
+            if result == ANALYZE_RESULT:
+                # Notes are saved above, BEFORE the window opens, so the
+                # analysis never races the notes write.
+                self.__launch_analysis(log_dir)
 
         dialog.finished.connect(on_finished)
         # Center over the main window; some window managers (WSLg
@@ -720,6 +709,32 @@ class Window(QWidget):
         dialog.open()
         pg.Qt.QtCore.QTimer.singleShot(0, center)
         pg.Qt.QtCore.QTimer.singleShot(100, center)
+
+    def __launch_analysis(self, log_dir):
+        """Open the analysis UI preselected on a just-finished log.
+
+        A separate process, not a shared in-process window: a crash in the
+        analysis path must not take the rig GUI (and its EtherCAT child) down
+        with it. Launched under `nice -n 10` unconditionally -- this GUI runs
+        SCHED_FIFO and forks the EtherCAT controller, and a matplotlib
+        subprocess competing for CPU is a real-time hazard, not a cosmetic one.
+        """
+        if self._log_active:
+            QMessageBox.warning(
+                self, 'Test running',
+                'A test is logging right now. Analysis competes with the '
+                'real-time loop for CPU; run it after the test finishes.')
+            return
+        folder = f"{dyno_paths.dyno_logs_directory}/{log_dir}"
+        script = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(
+                os.path.abspath(__file__)))), 'launch', 'analysis.sh')
+        try:
+            subprocess.Popen(['nice', '-n', '10', script, folder],
+                             start_new_session=True)
+        except OSError as e:
+            QMessageBox.warning(self, 'Analysis',
+                                f'Could not launch the analysis UI: {e}')
 
     def __delete_test_log(self, log_dir):
         folder = f"{dyno_paths.dyno_logs_directory}/{log_dir}"
