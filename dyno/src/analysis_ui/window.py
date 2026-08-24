@@ -10,12 +10,12 @@ import json
 import os
 import re
 
-from PySide6.QtCore import QProcess, Qt, QThread, QUrl, Signal
+from PySide6.QtCore import QProcess, QSettings, Qt, QThread, QUrl, Signal
 from PySide6.QtGui import QBrush, QColor, QDesktopServices
-from PySide6.QtWidgets import (QFileDialog, QHBoxLayout, QLabel, QMessageBox,
-                               QPlainTextEdit, QPushButton, QSplitter,
-                               QTreeWidget, QTreeWidgetItem, QVBoxLayout,
-                               QWidget)
+from PySide6.QtWidgets import (QCheckBox, QFileDialog, QHBoxLayout, QLabel,
+                               QMessageBox, QPlainTextEdit, QPushButton,
+                               QSplitter, QTreeWidget, QTreeWidgetItem,
+                               QVBoxLayout, QWidget)
 
 from deployment import dyno_paths
 from dyno.src.analysis import runner
@@ -96,6 +96,7 @@ class AnalysisWindow(QWidget):
         self._build_thread = None
         self._proc = None
         self._no_override_confirmed = False
+        self._settings = QSettings('paladin', 'dyno-analysis')
 
         layout = QVBoxLayout(self)
 
@@ -140,6 +141,11 @@ class AnalysisWindow(QWidget):
         self._all_yes_btn.clicked.connect(lambda: self._select(verdict='yes'))
         self._none_btn = QPushButton('Select none')
         self._none_btn.clicked.connect(lambda: self._select(verdict=None))
+        self._show_no = QCheckBox('Show "no" candidates')
+        self._show_no.setToolTip(
+            'Rows the predicate rejected are hidden by default. Tick to see '
+            'them and their reasons -- a "no" can still be forced.')
+        self._show_no.toggled.connect(self._apply_filter)
         self._run_btn = QPushButton('Run')
         self._run_btn.clicked.connect(self._run)
         self._cancel_btn = QPushButton('Cancel')
@@ -147,7 +153,7 @@ class AnalysisWindow(QWidget):
         self._cancel_btn.setEnabled(False)
         self._open_btn = QPushButton('Open analysis folder')
         self._open_btn.clicked.connect(self._open_folder)
-        for b in (self._all_yes_btn, self._none_btn):
+        for b in (self._all_yes_btn, self._none_btn, self._show_no):
             controls.addWidget(b)
         controls.addStretch(1)
         for b in (self._open_btn, self._cancel_btn, self._run_btn):
@@ -161,7 +167,12 @@ class AnalysisWindow(QWidget):
     # ------------------------------------------------------------ log loading
 
     def _pick_folder(self):
-        start = self._log_dir or dyno_paths.dyno_logs_directory
+        # Runs no longer necessarily live under dyno/logs -- the rig GUI can
+        # save one anywhere -- so remember where the last one was opened from
+        # and start there. dyno/logs stays the first-launch default.
+        start = (self._log_dir
+                 or self._settings.value('last_log_parent')
+                 or dyno_paths.dyno_logs_directory)
         folder = QFileDialog.getExistingDirectory(
             self, 'Select log folder', start)
         if folder:
@@ -171,6 +182,7 @@ class AnalysisWindow(QWidget):
         if self._build_thread and self._build_thread.isRunning():
             return
         self._log_dir = folder
+        self._settings.setValue('last_log_parent', os.path.dirname(folder))
         self._log_label.setText(f'{folder}  (building plan…)')
         self._tree.clear()
         self._items.clear()
@@ -193,9 +205,7 @@ class AnalysisWindow(QWidget):
             entries, os.path.join(self._log_dir, runner.PLAN_FILENAME))
         self._tree.blockSignals(True)
         for label, group in plan_model.group_by_label(entries):
-            parent = QTreeWidgetItem(
-                [label, f'{len(group)} candidate'
-                        f'{"s" if len(group) != 1 else ""}'])
+            parent = QTreeWidgetItem([label, ''])   # count set by _apply_filter
             parent.setFlags(Qt.ItemFlag.ItemIsEnabled)
             self._tree.addTopLevelItem(parent)
             for e in group:
@@ -229,6 +239,7 @@ class AnalysisWindow(QWidget):
                 self._items[(e['processor'], e['label'])] = item
             parent.setExpanded(True)
         self._tree.blockSignals(False)
+        self._apply_filter()
         self._set_have_plan(True)
 
     def _entry_of(self, item):
@@ -310,6 +321,33 @@ class AnalysisWindow(QWidget):
         else:
             item.setCheckState(0, Qt.CheckState.Unchecked)
 
+    def _apply_filter(self):
+        """Hide unchecked 'no' rows unless the operator asks to see them.
+
+        A real log is mostly 'no': an 18-behaviour inertia log builds 109 rows
+        of which 98 say no, and six processors repeat the same sentence once
+        per behaviour. Hiding them is what makes the handful of candidates
+        that matter findable.
+
+        Two rows are never hidden. A *checked* 'no' is a force the operator
+        (or a restored plan file) asked for, and it will run -- hiding it
+        would mean running something invisible. An 'error' row is a crashed
+        predicate (SOW 8.3); a processor vanishing with no trace is the exact
+        failure that entry exists to prevent.
+        """
+        show_no = self._show_no.isChecked()
+        for item in self._items.values():
+            e = self._entry_of(item)
+            item.setHidden(not show_no and e['verdict'] == 'no' and
+                           item.checkState(0) != Qt.CheckState.Checked)
+        for i in range(self._tree.topLevelItemCount()):
+            parent = self._tree.topLevelItem(i)
+            n = parent.childCount()
+            shown = sum(not parent.child(j).isHidden() for j in range(n))
+            parent.setHidden(shown == 0)
+            parent.setText(1, f'{shown} candidate{"s" if shown != 1 else ""}'
+                              + (f' ({n - shown} hidden)' if n > shown else ''))
+
     def _select(self, verdict):
         for item in self._items.values():
             e = self._entry_of(item)
@@ -318,6 +356,9 @@ class AnalysisWindow(QWidget):
             checked = verdict is not None and e['verdict'] == verdict
             item.setCheckState(0, Qt.CheckState.Checked if checked
                                else Qt.CheckState.Unchecked)
+        # These buttons restate the whole selection, so a 'no' row that was
+        # only visible because it was forced has no reason to stay.
+        self._apply_filter()
 
     def _show_reason(self, item, _prev=None):
         e = self._entry_of(item) if item else None

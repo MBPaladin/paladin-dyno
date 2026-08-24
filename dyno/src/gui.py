@@ -133,7 +133,17 @@ class Window(QWidget):
         # make a buffer for incoming telementry
         self.telemetry_samples = []
 
-        # log-flag transition tracking (for log folder naming + notes prompt)
+        # Default parent directory for the post-experiment "Save to" row.
+        # Blank/absent means the directory the run already recorded into, so a
+        # plain Save is a no-op rename.
+        _saved_parent = (self.master_params.get('saved_runs_directory') or '').strip()
+        self._saved_runs_parent = (os.path.expanduser(_saved_parent) if _saved_parent
+                                   else dyno_paths.dyno_logs_directory)
+
+        # log-flag transition tracking (for log folder naming + notes prompt).
+        # _active_log_dir is an ABSOLUTE path: the notes dialog can relocate a
+        # finished run anywhere, so a basename under dyno/logs no longer
+        # identifies it.
         self._log_active = False
         self._active_log_dir = None
         self._active_log_test = None
@@ -322,6 +332,15 @@ class Window(QWidget):
             # append that dictionary to a list of plots, and add the plot to the gui
             self.plots.append(entry)
             self.controls_layout.addWidget(selection_box)
+
+        self.clear_plots_button = QPushButton('Clear Plots')
+        self.clear_plots_button.setToolTip(
+            'Drop the history from every scope and start drawing again from the '
+            'newest sample.\nDisplay only — logging is unaffected. Use it when a '
+            'large past motion is\nholding the y-axis open and hiding small '
+            'recent detail.')
+        self.clear_plots_button.clicked.connect(self.__clear_plots)
+        self.controls_layout.addWidget(self.clear_plots_button)
 
         # --- Test Selection section: centered header, launcher button beneath
         # (same size as Start/Stop), then the Quick Select dropdown. ---
@@ -625,19 +644,52 @@ class Window(QWidget):
         no file is written in that case either. The 'Delete test log' button
         deletes the run's entire log folder instead.
 
+        The 'Save to' row names the folder the run ends up in. It is prefilled
+        with the timestamp the Logger already used and the configured default
+        parent, so leaving it alone reproduces the old behaviour exactly;
+        editing the name or browsing to another directory moves the run there
+        on save. It is a row rather than a fourth 'Save As' button because the
+        destination and what-happens-next are independent -- a button per
+        combination would need a 'Save As && Analyze' too.
+
         Shown non-modally via open() rather than exec(): exec() would suspend
         update_data() (this is called from the 30 ms timer), freezing the
         plots and telemetry drain until the dialog closes."""
-        log_dir = self._active_log_dir
-        if log_dir is None:
+        src_dir = self._active_log_dir
+        if src_dir is None:
             return
         test_name = self._active_log_test
         dialog = QDialog(self)
         dialog.setWindowTitle('Experiment Notes')
         layout = QVBoxLayout(dialog)
-        layout.addWidget(QLabel(f'Test finished: {test_name}\n'
-                                f'Log folder: {log_dir}\n\n'
+        layout.addWidget(QLabel(f'Test finished: {test_name}\n\n'
                                 'Anything worth remembering about this run?'))
+
+        dest_row = QHBoxLayout()
+        name_edit = QLineEdit(os.path.basename(src_dir))
+        name_edit.setToolTip('Folder name for this run. Defaults to the '
+                             'timestamp the log was recorded under.')
+        parent_edit = QLineEdit(self._saved_runs_parent)
+        parent_edit.setToolTip(
+            'Directory the run folder is saved into. Editable so a share path '
+            'can be pasted; it is created if it does not exist yet.')
+        browse_btn = QPushButton('Browse…')
+
+        def on_browse():
+            picked = QFileDialog.getExistingDirectory(
+                dialog, 'Save run in',
+                parent_edit.text() or self._saved_runs_parent)
+            if picked:
+                parent_edit.setText(picked)
+
+        browse_btn.clicked.connect(on_browse)
+        dest_row.addWidget(QLabel('Save to:'))
+        dest_row.addWidget(name_edit, 2)
+        dest_row.addWidget(QLabel('in'))
+        dest_row.addWidget(parent_edit, 3)
+        dest_row.addWidget(browse_btn)
+        layout.addLayout(dest_row)
+
         text_edit = QTextEdit()
         layout.addWidget(text_edit)
         buttons = QHBoxLayout()
@@ -682,18 +734,27 @@ class Window(QWidget):
         def on_finished(result):
             self._notes_dialog = None
             if result == DELETE_RESULT:
-                self.__delete_test_log(log_dir)
+                self.__delete_test_log(src_dir)
                 return
             notes = text_edit.toPlainText().strip() if result else ''
             # Empty notes write nothing: the Logger already wrote the setup
             # half of <test>.txt, and there is nothing to add to it. This is
             # exactly what the retired Skip button did.
             if notes:
-                self.__save_experiment_notes(log_dir, test_name, notes)
+                self.__save_experiment_notes(src_dir, test_name, notes)
+            # Relocate only when a Save button was pressed -- dismissing the
+            # dialog with Esc or the window X (result 0) must not act on a
+            # half-typed destination. Done AFTER the notes rewrite so the
+            # report travels with the folder, and BEFORE analysis so the
+            # window opens on the run's final home.
+            folder = src_dir
+            if result:
+                folder = self.__relocate_log(
+                    src_dir, parent_edit.text(), name_edit.text())
             if result == ANALYZE_RESULT:
                 # Notes are saved above, BEFORE the window opens, so the
                 # analysis never races the notes write.
-                self.__launch_analysis(log_dir)
+                self.__launch_analysis(folder)
 
         dialog.finished.connect(on_finished)
         # Center over the main window; some window managers (WSLg
@@ -705,13 +766,76 @@ class Window(QWidget):
             geo.moveCenter(self.frameGeometry().center())
             dialog.move(geo.topLeft())
         dialog.adjustSize()
+        # adjustSize() sizes to the layout's hint, which truncates the run
+        # name and the destination path in the 'Save to' row -- the two fields
+        # this dialog exists to let you read. Widen by half.
+        dialog.resize(int(dialog.width() * 1.5), dialog.height())
         center()
         dialog.open()
         pg.Qt.QtCore.QTimer.singleShot(0, center)
         pg.Qt.QtCore.QTimer.singleShot(100, center)
 
-    def __launch_analysis(self, log_dir):
-        """Open the analysis UI preselected on a just-finished log.
+    def __relocate_log(self, src, parent, name):
+        """Move a just-finished run to <parent>/<name>, per the notes dialog's
+        'Save to' row. Returns the folder the run actually ended up in — the
+        untouched source path if the move was refused or failed, so the caller
+        still has somewhere real to point analysis at.
+
+        Never overwrites an existing folder. The Logger rmtree's a same-second
+        collision (logger.start_logging), which is defensible for a name it
+        stamped itself; here the name came from a person, and clobbering it
+        would destroy a run nobody asked to delete."""
+        name = name.strip().strip('/')
+        if not name:
+            QMessageBox.warning(
+                self, 'Save run',
+                f'The folder name is empty, so the run was left at {src}.')
+            return src
+        seps = [s for s in (os.sep, os.altsep) if s]
+        if any(s in name for s in seps):
+            QMessageBox.warning(
+                self, 'Save run',
+                f'"{name}" contains a path separator. Use Browse to choose the '
+                f'directory instead; the run was left at {src}.')
+            return src
+        # A sim run stays labelled as one however it gets renamed: sim data in
+        # a folder that reads like a real run is the one mixup worth spending
+        # a prefix on.
+        if os.path.basename(src).startswith('sim_') and not name.startswith('sim_'):
+            name = 'sim_' + name
+
+        parent = os.path.expanduser(parent.strip()) or self._saved_runs_parent
+        dest = os.path.join(parent, name)
+        if os.path.abspath(dest) == os.path.abspath(src):
+            return src  # default destination: nothing to do
+        if os.path.exists(dest):
+            QMessageBox.warning(
+                self, 'Save run',
+                f'{dest} already exists, so the run was left at {src}.\n\n'
+                'Pick a different name and save again, or move the old folder '
+                'out of the way first.')
+            return src
+        try:
+            os.makedirs(parent, exist_ok=True)
+            # Crossing a filesystem (external drive, network share) turns this
+            # into a byte-for-byte copy of the whole hdf5, which is slow enough
+            # to look like a hang without the cursor.
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            try:
+                shutil.move(src, dest)
+            finally:
+                QApplication.restoreOverrideCursor()
+        except OSError as e:
+            QMessageBox.warning(
+                self, 'Save run',
+                f'Could not save the run to {dest}: {e}\n\nIt was left at {src}.')
+            return src
+        print(f'Saved run to {dest}')
+        return dest
+
+    def __launch_analysis(self, folder):
+        """Open the analysis UI preselected on a just-finished log, given the
+        absolute path to its folder.
 
         A separate process, not a shared in-process window: a crash in the
         analysis path must not take the rig GUI (and its EtherCAT child) down
@@ -725,7 +849,6 @@ class Window(QWidget):
                 'A test is logging right now. Analysis competes with the '
                 'real-time loop for CPU; run it after the test finishes.')
             return
-        folder = f"{dyno_paths.dyno_logs_directory}/{log_dir}"
         script = os.path.join(
             os.path.dirname(os.path.dirname(os.path.dirname(
                 os.path.abspath(__file__)))), 'launch', 'analysis.sh')
@@ -736,26 +859,26 @@ class Window(QWidget):
             QMessageBox.warning(self, 'Analysis',
                                 f'Could not launch the analysis UI: {e}')
 
-    def __delete_test_log(self, log_dir):
-        folder = f"{dyno_paths.dyno_logs_directory}/{log_dir}"
+    def __delete_test_log(self, folder):
         try:
             if os.path.isdir(folder):
                 shutil.rmtree(folder)
-                print(f'Deleted log folder {log_dir}')
+                print(f'Deleted log folder {folder}')
             else:
-                print(f'Log folder {log_dir} not found, nothing to delete')
+                print(f'Log folder {folder} not found, nothing to delete')
         except OSError as e:
-            print(f'Failed to delete log folder {log_dir}: {e}')
+            print(f'Failed to delete log folder {folder}: {e}')
 
-    def __save_experiment_notes(self, log_dir, test_name, notes):
+    def __save_experiment_notes(self, folder, test_name, notes):
         """Re-render the run's companion report with the operator's notes on
         top. The Logger already wrote the setup half when the test stopped;
         this rewrites the whole file rather than overwriting it, so the two
         writers never clobber each other. Falls back to a notes-only file if
-        the log has no resolved config to render (e.g. a pre-existing log)."""
+        the log has no resolved config to render (e.g. a pre-existing log).
+
+        'folder' is the absolute path to the run's folder."""
         from dyno.src import setup_summary
 
-        folder = f"{dyno_paths.dyno_logs_directory}/{log_dir}"
         base = os.path.splitext(os.path.basename(test_name or 'log'))[0] or 'log'
         path = setup_summary.report_path(folder, base)
         try:
@@ -766,7 +889,7 @@ class Window(QWidget):
                     f.write(notes + '\n')
             else:
                 setup_summary.write_report(path, resolved, meta, notes=notes)
-            print(f'Experiment notes saved to {log_dir}/{base}.txt')
+            print(f'Experiment notes saved to {folder}/{base}.txt')
         except OSError as e:
             print(f'Failed to save experiment notes: {e}')
 
@@ -1155,6 +1278,24 @@ class Window(QWidget):
             if plot_key != entry['key']:
                 self.__load_scope(entry, plot_key)
 
+    def __clear_plots(self):
+        # Wipe the displayed history so recent, small motions are readable again:
+        # a large past excursion holds the auto-ranged y-axis open for the whole
+        # 30 s window (there is no fixed setYRange), which is the thing being
+        # cleared here as much as the trace itself. NaN rather than zero, because
+        # pyqtgraph's default connect='auto' both breaks the curve at non-finite
+        # points and leaves them out of the auto-range; zeros would draw a flat
+        # line and still count as data.
+        #
+        # All scopes share self.gui_data, so this necessarily clears all of them.
+        # Two rows/columns are deliberately spared:
+        #   row 0        the time axis, so the window keeps scrolling normally
+        #   last column  the newest sample, so the safeties readout
+        #                (__update_safeties_panel reads [:, -1]) keeps a real
+        #                value instead of flashing 'nan' until the next tick
+        self.gui_data[1:, :-1] = np.nan
+        self.redraw()
+
     def trace(self, trace_key):
         if trace_key in self.log_keys:
             return self.gui_data[self.log_keys.index(trace_key), :]
@@ -1181,11 +1322,16 @@ class Window(QWidget):
                     self._run_started = time.time()
                     self._segment_started = None
                     self._segment_seen = None
-                    self._active_log_dir = logger.log_dir_name()
+                    # The Logger resolves 'log_dir' against dyno_logs_directory
+                    # itself, so it gets the bare name; we keep the absolute
+                    # path, which is what survives a later relocation.
+                    log_name = logger.log_dir_name()
+                    self._active_log_dir = os.path.join(
+                        dyno_paths.dyno_logs_directory, log_name)
                     # The armed plan, not the dropdown text — the two differ
                     # whenever a pick failed to load.
                     self._active_log_test = self._armed_test
-                    self.logging_queue.put_nowait({'log_dir': self._active_log_dir})
+                    self.logging_queue.put_nowait({'log_dir': log_name})
                 elif not log_flag and self._log_active:
                     self._log_active = False
                     self._notes_prompt_pending = True

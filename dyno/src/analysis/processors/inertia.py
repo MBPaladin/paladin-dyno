@@ -42,8 +42,13 @@ What the test shape has to deliver for that to hold:
    branch instead of assuming it, and drops the branches that fail.
 4. Each acceleration is repeated, and several accelerations are run. Repeats
    give the run-to-run spread; the disagreement BETWEEN accelerations is the
-   systematic floor, and it is the honest error bar -- see the pooling note in
-   `run`.
+   systematic floor, and it is quoted as-is -- not divided by sqrt(n), because
+   a systematic does not average down. See the pooling note in `run`.
+   The repeats are not only a spread to report, they are the sanity check on
+   whether the pooled mean means anything at all: two layers of averaging can
+   turn wildly scattered pairs into group means that agree by construction, so
+   `run` compares the within-acceleration scatter against the reported J and
+   warns when the pairs disagree at the level of the answer.
 
 Measured per-branch alpha is used throughout, because the drive does not always
 deliver symmetric up/down rates at the aggressive end.
@@ -77,6 +82,14 @@ _RC = {
 # to well under 1%, so anything in the middle of this range partitions them
 # identically -- it is not a tuned number.
 _ALPHA_CLUSTER_TOL = 0.05
+
+# Within-acceleration scatter, as a fraction of J, above which the per-pair
+# estimates are called too noisy to average. Set from the logs on hand: a
+# healthy string repeats to 0.5-2.3% of J, while a string small enough to sit
+# near the cell's noise floor scattered to 59%. Anything an order of magnitude
+# above the healthy case and well below the broken one separates them; 10% is
+# in the middle of that gap rather than tuned to either.
+_SCATTER_WARN_FRAC = 0.10
 
 
 def _runs_of(mask, min_len):
@@ -434,16 +447,22 @@ class Inertia(Processor):
         gmeans = np.array([r['mean'] for r in rows])
         J = float(gmeans.mean())
         Jsys = float(gmeans.std(ddof=1)) if len(gmeans) > 1 else float('nan')
+        # Reported for completeness, NOT quoted -- see the note below.
         Jse = float(Jsys / np.sqrt(len(gmeans))) if len(gmeans) > 1 else float('nan')
 
         if len(gmeans) > 1:
             res.add('info', 'systematic_floor',
                     f'The {len(gmeans)} accelerations disagree by '
-                    f'{Jsys * 1e3:.4f}e-3 kg.m^2 ({100 * Jsys / abs(J):.1f}% of J). '
-                    f'A real inertia does not depend on how fast it was accelerated, '
-                    f'so that spread is the systematic floor of this measurement and '
-                    f'it is what the quoted error bar is built from -- not the '
-                    f'much tighter run-to-run repeatability inside one acceleration.')
+                    f'{Jsys * 1e3:.4f}e-3 kg.m^2 ({100 * Jsys / abs(J):.1f}% of J), '
+                    f'and that standard deviation IS the quoted error bar. A real '
+                    f'inertia does not depend on how fast it was accelerated, so the '
+                    f'spread between accelerations is a systematic, and a systematic '
+                    f'does not shrink by averaging more accelerations -- dividing it '
+                    f'by sqrt({len(gmeans)}) would quote '
+                    f'+/-{Jse * 1e3:.4f}e-3 and claim {np.sqrt(len(gmeans)):.1f}x more '
+                    f'accuracy than this measurement has earned. That standard error '
+                    f'is still in the metrics as J_test_se_kgm2 for anyone who wants '
+                    f'it; it is not what this report stands behind.')
         else:
             res.add('warn', 'single_acceleration',
                     f'Every ramp pair ran at the same acceleration '
@@ -453,6 +472,49 @@ class Inertia(Processor):
                     f'e-3 kg.m^2, but that is repeatability only -- it cannot see a '
                     f'bias that is common to every ramp. Run at least two '
                     f'accelerations to get a real uncertainty.')
+
+        # -- is the scatter small enough for the mean to mean anything? --------
+        # The pooling above averages 4 pairs into a group mean and then 7 group
+        # means into J. Two layers of averaging pull badly scattered pairs into
+        # group means that agree with each other by construction, so a tight
+        # between-acceleration spread can sit on top of per-pair estimates that
+        # disagree by 30x. Jsys cannot see that -- it only ever sees the means.
+        # This check looks underneath them, at the scatter the pairs actually
+        # have, and is the one number that separates a real measurement from
+        # noise that happens to average well.
+        repeat = float(np.mean([r['sd'] for r in rows]))
+        n_neg = sum(1 for d in pairs if d['J'] - structure <= 0)
+        # Relative to the value actually REPORTED, not to the test-side total.
+        # The pairs scatter around J_test, but a fixed structure subtraction
+        # shrinks the number being quoted without shrinking the noise on it, so
+        # a 59%-of-J_test scatter is 86% of a J_motor half that size. The
+        # fraction only means anything against the figure the reader takes away.
+        J_report = J - structure
+        scatter_frac = repeat / abs(J_report) if J_report else float('inf')
+        if scatter_frac > _SCATTER_WARN_FRAC:
+            jv = np.array([d['J'] for d in pairs]) - structure
+            res.add('warn', 'pairs_disagree',
+                    f'The individual ramp pairs scatter by {repeat * 1e3:.4f}e-3 '
+                    f'kg.m^2 within a single acceleration -- '
+                    f'{100 * scatter_frac:.0f}% of the reported '
+                    f'{"J_motor" if structure else "J_test"}, spanning '
+                    f'{jv.min() * 1e3:.4f}e-3 to {jv.max() * 1e3:.4f}e-3 across the '
+                    f'{len(pairs)} pairs. Repeats of one acceleration are the same '
+                    f'measurement made twice, so they should agree to a few percent; '
+                    f'at this level the pooled J is an average of noise, and the '
+                    f'quoted error bar -- built from the group MEANS, which average '
+                    f'that noise away -- does not reflect it. Treat the headline '
+                    f'number as an order of magnitude, not a spec. The usual cause '
+                    f'is a string whose inertial torque J*alpha is down near the '
+                    f'cell noise: raise the ramp acceleration, or measure a larger '
+                    f'assembly and subtract.')
+        if n_neg:
+            res.add('warn', 'negative_pairs',
+                    f'{n_neg} of {len(pairs)} ramp pair(s) returned a non-physical '
+                    f'J <= 0 and were still averaged in. A single pair cannot have '
+                    f'negative inertia, so those are noise excursions and their '
+                    f'presence means the per-pair uncertainty is at least as large '
+                    f'as J itself.')
 
         if J <= 0:
             res.add('error', 'negative_inertia',
@@ -498,31 +560,46 @@ class Inertia(Processor):
                                    float(max(d['w_hi'] for d in pairs))],
             'worst_ramp_curvature': float(max(d['curvature'] for d in pairs)),
             'J_test_kgm2': J,
+            # The quoted bar is the between-acceleration standard deviation.
+            # *_se_kgm2 is that divided by sqrt(n_accelerations); it is kept
+            # because it is a real number some readers want, but a systematic
+            # does not average down, so nothing here quotes it.
+            'J_quoted_uncertainty_kgm2': Jsys,
             'J_test_se_kgm2': Jse,
             'J_test_systematic_kgm2': Jsys,
             'J_structure_kgm2': structure,
             'J_motor_kgm2': J_motor,
             'J_motor_se_kgm2': Jse,
-            'repeatability_kgm2': float(np.mean([r['sd'] for r in rows])),
+            'repeatability_kgm2': repeat,
+            'repeatability_frac_of_reported_J': scatter_frac,
+            'J_pair_min_kgm2': float(min(d['J'] for d in pairs)),
+            'J_pair_max_kgm2': float(max(d['J'] for d in pairs)),
+            'n_pairs_nonphysical': n_neg,
         })
         sym = 'J_motor' if structure else 'J_test'
         # With one acceleration there is no systematic estimate, and printing
         # "+/- nan" as the headline number is worse than saying so: a reader
         # skimming the report would take the nan for a formatting glitch rather
         # than for the missing uncertainty it actually is.
-        bar = (f'+/- {Jse * 1e3:.4f} e-3 kg.m^2' if np.isfinite(Jse)
+        bar = (f'+/- {Jsys * 1e3:.4f} e-3 kg.m^2' if np.isfinite(Jsys)
                else 'e-3 kg.m^2, uncertainty UNKNOWN (only one acceleration)')
-        tail = (f'Between-acceleration spread {Jsys * 1e3:.4f}e-3 '
-                f'({100 * Jsys / abs(J):.1f}%).' if np.isfinite(Jsys)
-                else f'Repeats agree to {float(np.mean([r["sd"] for r in rows])) * 1e3:.4f}'
+        tail = (f'The bar is the standard deviation across the {len(rows)} '
+                f'accelerations ({100 * Jsys / abs(J):.1f}% of J), not that spread '
+                f'divided by sqrt(n).' if np.isfinite(Jsys)
+                else f'Repeats agree to {repeat * 1e3:.4f}'
                      f'e-3, which is repeatability, not accuracy.')
+        if scatter_frac > _SCATTER_WARN_FRAC:
+            tail += (f' PAIRS DISAGREE by {100 * scatter_frac:.0f}% within one '
+                     f'acceleration -- see the pairs_disagree warning before '
+                     f'quoting this.')
         res.summary = (
             f'{sym} = {(J_motor if structure else J) * 1e3:.4f} {bar} from '
             f'{len(pairs)} constant-acceleration ramp pairs across {len(rows)} '
             f'acceleration(s), {alphas.min():.0f}-{alphas.max():.0f} rad/s^2. {tail}'
         )
 
-        res.figures.append(('inertia', self._fig_inertia(pairs, rows, J, Jse, structure)))
+        res.figures.append(('inertia',
+                            self._fig_inertia(pairs, rows, J, Jsys, structure)))
         res.tables.append(('ramp_pairs', self._csv_pairs(pairs)))
         return res
 
@@ -556,12 +633,21 @@ class Inertia(Processor):
 
     # -- figure ---------------------------------------------------------------
 
-    def _fig_inertia(self, pairs, rows, J, Jse, structure):
+    def _fig_inertia(self, pairs, rows, J, Jsys, structure):
         """J vs alpha. Everything measured here is the whole test-side string, so
         `structure` (couplers, adapter, cell rotor -- whatever is bolted between
         the absorber and the motor) is subtracted to leave the motor shaft alone.
         It is treated as an exact constant: it shifts every point by the same
-        amount and widens no uncertainty."""
+        amount and widens no uncertainty.
+
+        Two spreads are drawn, because they answer different questions and the
+        plot is misleading without both. The shaded band is the standard
+        deviation ACROSS accelerations -- the systematic, and the quoted bar.
+        The whisker on each acceleration is the standard deviation of the
+        repeats WITHIN it. A band much narrower than the whiskers is the
+        signature of noise averaging away into agreeable group means, and is
+        exactly the case the pairs_disagree warning fires on; drawing only the
+        band would hide it."""
         import matplotlib.pyplot as plt
 
         P = PALETTE
@@ -574,12 +660,12 @@ class Inertia(Processor):
             # No band when there is only one acceleration to compare: a
             # zero-width band would draw "+-0.000" and read as a perfectly known
             # answer, when in fact nothing here can estimate the uncertainty.
-            band = Jse if np.isfinite(Jse) else 0.0
+            band = Jsys if np.isfinite(Jsys) else 0.0
             if band:
                 ax.axhspan((Jm - band) * 1e3, (Jm + band) * 1e3,
                            color=P['blue'], alpha=.13, lw=0)
-                label = ('pooled  $%s=%.3f\\pm%.3f\\times10^{-3}$'
-                         % (sym, Jm * 1e3, band * 1e3))
+                label = ('pooled  $%s=%.3f\\pm%.3f\\times10^{-3}$  (s.d. across '
+                         '$\\alpha$)' % (sym, Jm * 1e3, band * 1e3))
             else:
                 label = ('pooled  $%s=%.3f\\times10^{-3}$  (one $\\alpha$, no '
                          'error bar)' % (sym, Jm * 1e3))
@@ -597,6 +683,19 @@ class Inertia(Processor):
                 sel = [d for d in pairs if d.get('group_alpha') == r['alpha']]
                 vals = (np.array([d['J'] for d in sel]) - structure) * 1e3
                 amags = np.array([d['alpha_mag'] for d in sel])
+                # The whisker is the within-alpha s.d. It is drawn UNDER the
+                # dots, not instead of them: at n=4 one number cannot say
+                # whether the spread is a clean cluster or one outlier, and the
+                # raw points still answer that. What the whisker adds is a
+                # readable comparison against the shaded band -- eyeballing the
+                # dot cloud against a faint axhspan does not work once the two
+                # differ by 30x.
+                if r['n'] > 1:
+                    ax.errorbar(amags.mean(), vals.mean(),
+                                yerr=r['sd'] * 1e3, fmt='none', ecolor=INK2,
+                                elinewidth=1.3, capsize=5, capthick=1.3, zorder=3,
+                                label='repeats within one $\\alpha$ (s.d.)'
+                                      if k == 0 else None)
                 ax.plot(amags, vals, 'o', ms=5, color=P['violet'], alpha=.75, zorder=4,
                         label='individual ramp pairs (n=%d)' % len(pairs) if k == 0 else None)
                 # A dash, not a bigger dot: within one group the repeats agree
@@ -606,6 +705,7 @@ class Inertia(Processor):
                 ax.plot(amags.mean(), vals.mean(), '_', ms=17, mew=2.2, color=INK,
                         zorder=5, label='per $\\alpha$ mean' if k == 0 else None)
                 allv.extend(vals)
+                allv.extend([vals.mean() - r['sd'] * 1e3, vals.mean() + r['sd'] * 1e3])
             if structure:
                 ax.plot([], [], ' ',
                         label='$J_{test}=%.3f$, structure$=%.3f\\times10^{-3}$'
@@ -624,8 +724,15 @@ class Inertia(Processor):
             # pooled value and its band stay on screen.
             lo = min(min(allv), (Jm - band) * 1e3)
             hi = max(max(allv), (Jm + band) * 1e3)
-            pad = max((hi - lo) * 0.35, abs(Jm * 1e3) * 0.02, 1e-3)
-            ax.set_ylim(lo - pad, hi + pad * 1.9)
+            # Asymmetric on purpose: the headroom is there to clear the legend,
+            # and the footroom is not. One symmetric pad big enough for the
+            # legend leaves a third of the axes empty below the data -- which
+            # was tolerable when the points were a tight cluster and is not now
+            # that the whiskers set the range.
+            span = hi - lo
+            pad_lo = max(span * 0.10, abs(Jm * 1e3) * 0.01, 5e-4)
+            pad_hi = max(span * 0.55, abs(Jm * 1e3) * 0.04, 2e-3)
+            ax.set_ylim(lo - pad_lo, hi + pad_hi)
             fig.tight_layout()
         return fig
 

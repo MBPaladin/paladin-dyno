@@ -1,2 +1,9 @@
 cycle_time_us: 1000 # overall ethercat cycle time. AKD / ELM have their cycle times hard coded in their setup functions
 interface: enp86s0
+
+# Default parent directory offered in the post-experiment "Save to" row. Blank
+# or absent means dyno/logs -- the directory the run already recorded into --
+# so a plain Save is a no-op rename and nothing about today's behaviour changes.
+# Point this at a share or an external drive to have finished runs land there
+# by default. A leading ~ is expanded.
+saved_runs_directory:

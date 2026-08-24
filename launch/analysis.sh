@@ -15,4 +15,5 @@ done
 
 cd "$(dirname "$0")/.."
 exec env PYTHONPATH="$PWD" PYTHONUNBUFFERED=1 \
+  QT_LOGGING_RULES='qt.qpa.theme.gnome=false' \
   .venv/bin/python -m dyno.src.analysis_ui "${args[@]}"

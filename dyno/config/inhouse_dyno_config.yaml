@@ -157,12 +157,12 @@ expected_slave_layout:
     params:
       flip_torque_sign: False
       gear_ratio: 1
-      motor_params: { kt: 0.183, k_tanh: 0.0326 }
-      spec_sheet: { kt: .424}
+      motor_params: { kt: 0.17, k_tanh: 0.027 }
+      spec_sheet: { kt: .424, km: 0.6}  # add `km: <Nm/sqrt(W)>` to overlay the datasheet Km
       motor_limits:
         torque: 5.4 
         continuous_torque: 3.4 
-        velocity: 100
+        velocity: 300
         acceleration: 1000
         rotatum: 500
       drive_params:
@@ -186,7 +186,7 @@ expected_slave_layout:
 safeties:
   output_torque: { source: devices.adc_1.load_torque, limit: 220 } # Nm, derated for bringup
   output_velocity: { source: devices.LOAD.velocity, limit: 200 } # rad/s, derated for bringup
-  input_velocity: { source: devices.DUT.velocity, limit: 100 } # rad/s, catches a back-driven DUT
+  input_velocity: { source: devices.DUT.velocity, limit: 300 } # rad/s, catches a back-driven DUT
   load_stator_temp: { source: devices.rtd_module.load_stator_temp, limit: 100 } # C
 
 # Torque cell tare: the GUI's Tare button averages each listed cell at rest and
