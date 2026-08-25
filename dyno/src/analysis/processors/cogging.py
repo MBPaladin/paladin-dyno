@@ -213,8 +213,9 @@ class Cogging(Processor):
 
     # -- ripple-order auto-detection -------------------------------------------
 
-    def _detect_ripple_order(self, pos, tq, max_order):
-        """Dominant spatial order of the torque-vs-angle signal.
+    def _dominant_spatial_order(self, pos, tq, max_order):
+        """Dominant spatial order of the torque-vs-angle signal, and its
+        single-sided amplitude in Nm. Returns (0, None) when undetectable.
 
         Resample torque onto a uniform angle grid (the dwell's speed ripple
         makes the raw samples non-uniform in angle), FFT over angle, and take
@@ -229,10 +230,12 @@ class Cogging(Processor):
         order against a second speed plateau -- angle-locked content holds its
         order, time-locked content does not -- before reading physics into it.
         """
+        if pos is None or tq is None or len(pos) < 4:
+            return 0, None
         theta = pos - pos[0]
         span = float(abs(theta[-1]))
         if span < _TWO_PI:
-            return 0
+            return 0, None
         n = len(theta)
         grid = np.linspace(0.0, theta[-1], n)
         # np.interp needs increasing x; a negative-direction dwell is mirrored.
@@ -240,12 +243,18 @@ class Cogging(Processor):
             theta, grid = -theta, -grid
         uni = np.interp(np.abs(grid), np.abs(theta), tq)
         uni = uni - uni.mean()
-        amp = np.abs(np.fft.rfft(uni * np.hanning(n)))
+        win = np.hanning(n)
+        amp = np.abs(np.fft.rfft(uni * win))
         orders = np.fft.rfftfreq(n, d=span / n) * _TWO_PI   # cycles per rev
         band = (orders >= 2.0) & (orders <= max_order)
         if not band.any():
-            return 0
-        return int(round(float(orders[band][np.argmax(amp[band])])))
+            return 0, None
+        i = int(np.argmax(amp[band]))
+        # Back out the window's coherent gain so the number is an amplitude in
+        # Nm rather than an FFT bin height, which is meaningless outside this
+        # function and would be quoted as if it were a torque.
+        amp_nm = float(2.0 * amp[band][i] / (n * win.mean()))
+        return int(round(float(orders[band][i]))), amp_nm
 
     # -- run --------------------------------------------------------------------
 
@@ -271,10 +280,17 @@ class Cogging(Processor):
         order = int(params['ripple_order'])
         order_source = 'specified'
         base_load = min(loads, key=abs)
+        # Detected unconditionally, even when an order was specified. A report
+        # that asserts the ripple "was primarily periodic at order 48" is making
+        # a claim about the data; if 48 arrived as a parameter, nothing in the
+        # results backs that claim up. Emitting the detection alongside the
+        # specified order lets the sentence be checked instead of trusted.
+        p0, q0 = trace(slow, base_load)
+        detected_order, detected_amp = self._dominant_spatial_order(
+            p0, q0, params['max_auto_order'])
         if order <= 0:
             order_source = 'detected'
-            p0, q0 = trace(slow, base_load)
-            order = self._detect_ripple_order(p0, q0, params['max_auto_order'])
+            order = detected_order
             if order <= 0:
                 res.add('warn', 'ripple_order_unknown',
                         'ripple_order could not be auto-detected (no dominant '
@@ -447,6 +463,16 @@ class Cogging(Processor):
 
         # -- metrics -----------------------------------------------------------
         slow_pkpk = {f'{ld:g}Nm': pkpk.get((slow, ld)) for ld in loads} if order else {}
+        if (order_source == 'specified' and detected_order > 0
+                and detected_order != order):
+            res.add('info', 'ripple_order_disagrees',
+                    f'The fold uses the specified order {order}, but the '
+                    f'dominant spatial order of the {slow:g} rad/s, '
+                    f'{base_load:g} Nm dwell is {detected_order} at '
+                    f'{detected_amp:.4f} Nm. Neither is wrong on its own -- a '
+                    f'peak pick cannot separate a fundamental from a harmonic '
+                    f'-- but a report claiming the ripple is periodic at '
+                    f'{order} is not supported by this dwell alone.')
         res.metrics.update({
             'velocity_motor': vmotor,
             'torque_motor': tmotor,
@@ -454,6 +480,13 @@ class Cogging(Processor):
             'torque_channel': tch,
             'ripple_order': order if order > 0 else None,
             'ripple_order_source': order_source if order > 0 else None,
+            # The measured dominant order, always, whatever the fold used. This
+            # is what makes "primarily periodic at order N" a finding rather
+            # than an assertion.
+            'detected_ripple_order': detected_order or None,
+            'detected_ripple_amplitude_Nm': detected_amp,
+            'detected_at_speed_rad_s': slow,
+            'detected_at_load_Nm': base_load,
             'speeds_rad_s': speeds,
             'loads_Nm': loads,
             'slowest_speed_rad_s': slow,

@@ -125,6 +125,101 @@ class Segment:
         attached = (port or {}).get('attached')
         return str(attached) if attached and attached != 'none' else ''
 
+    def current_units(self, device_name):
+        """How this drive reports current: ('peak'|'rms', declared?).
+
+        A bench can carry drives that disagree -- the Elmo reports the
+        quadrature-axis amplitude, the AKDs report A_rms -- and nothing in the
+        analysis path converts between them. This is therefore a *labelling*
+        fact: it decides which unit a report prints beside a kt, and nothing
+        else reads it. Unifying the convention means touching every processor's
+        current handling, which is a separate job from saying which one a given
+        number is in.
+
+        The second element says whether the config declared it or whether the
+        rms default was assumed, so a caller can warn once rather than printing
+        a confident unit it guessed.
+        """
+        declared = (self.device_params(device_name)
+                    .get('drive_params', {}).get('current_units'))
+        if declared is None:
+            return 'rms', False
+        return str(declared).strip().lower(), True
+
+    def command_channel(self, kind, prefer=None):
+        """The active `<prefix>_<kind>_command` channel on this span, or None.
+
+        Guessing the command channel from the channel a processor measured is
+        wrong whenever the two shafts differ, which on a two-motor bench is the
+        normal case rather than the exception: the inertia test measures
+        `dut_velocity` while the absorber is the motor actually holding the
+        velocity command, so `dut_velocity_command` is all-NaN and the
+        commanded speed appears not to exist.
+
+        `prefer` is a channel prefix to try first, so a processor that does know
+        which port it means still gets that one.
+        """
+        prefixes = [prefer] if prefer else []
+        prefixes += [p.get('prefix') for p in self.ports() if p.get('prefix')]
+        for prefix in prefixes:
+            channel = f'{prefix}_{kind}_command'
+            if self.is_active(channel):
+                return channel
+        return None
+
+    def cmd_span(self, channel, levels_cap=16):
+        """What was actually commanded on `channel` over this span.
+
+        The test YAML is not carried in the log -- resolved_config holds the
+        bench, not the trace -- so the commanded magnitudes a report quotes
+        ("a torque sawtooth of +/-5 Nm") have to come from the command channel
+        itself. That is the better source anyway: it is what went out on the
+        wire after limit clipping, not what someone asked for.
+
+        Returns None when the mode was never commanded (a command channel is
+        all-NaN whenever its mode is inactive). `max_rate` is the 95th
+        percentile of |d/dt|, not the maximum: the maximum is a single
+        differentiated sample and lands on whatever noise the channel has.
+        """
+        if not self.is_active(channel):
+            return None
+        v = self[channel]
+        finite = np.isfinite(v)
+        if not finite.any():
+            return None
+        vals = v[finite]
+        levels = np.unique(np.round(vals, 6))
+        rate, reversals = None, None
+        t = self['time'][finite]
+        if len(vals) > 2:
+            dv, dt = np.diff(vals), np.diff(t)
+            moving = dt > 0
+            if moving.any():
+                slope = np.abs(dv[moving] / dt[moving])
+                if slope.size:
+                    rate = float(np.percentile(slope, 95))
+            # Direction reversals of the command, which is how many times a
+            # sawtooth turned around. Counted on a sign sequence with the flat
+            # samples removed: a dwell at the peak is a run of zeros, and
+            # counting sign changes through it would score one reversal per
+            # sample of dwell.
+            sign = np.sign(dv[np.abs(dv) > 1e-12])
+            if sign.size > 1:
+                reversals = int(np.count_nonzero(np.diff(sign)))
+        return {
+            'min': float(vals.min()),
+            'max': float(vals.max()),
+            'amplitude': float(max(abs(vals.min()), abs(vals.max()))),
+            'n_levels': int(levels.size),
+            # A sawtooth visits thousands of distinct values; only a genuine
+            # setpoint grid is worth listing, so a long list is dropped rather
+            # than truncated into something that looks like a complete grid.
+            'levels': ([float(x) for x in levels]
+                       if levels.size <= levels_cap else None),
+            'max_rate': rate,
+            'n_reversals': reversals,
+        }
+
     def prefix(self, device_name):
         """Config device name -> log channel prefix.
 

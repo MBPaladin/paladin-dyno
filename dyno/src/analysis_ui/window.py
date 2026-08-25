@@ -146,6 +146,15 @@ class AnalysisWindow(QWidget):
             'Rows the predicate rejected are hidden by default. Tick to see '
             'them and their reasons -- a "no" can still be forced.')
         self._show_no.toggled.connect(self._apply_filter)
+        # Off by default and not remembered between launches: re-rendering
+        # rewrites every section of the report this log belongs to, and that
+        # should be something the operator asks for each time rather than
+        # something a stale tick box does behind them.
+        self._make_report = QCheckBox('Update report after run')
+        self._make_report.setToolTip(
+            'After the analysis finishes, re-render the LaTeX report sections '
+            'for whichever report.yaml this log sits under. Does nothing if it '
+            'sits under none.')
         self._run_btn = QPushButton('Run')
         self._run_btn.clicked.connect(self._run)
         self._cancel_btn = QPushButton('Cancel')
@@ -153,7 +162,8 @@ class AnalysisWindow(QWidget):
         self._cancel_btn.setEnabled(False)
         self._open_btn = QPushButton('Open analysis folder')
         self._open_btn.clicked.connect(self._open_folder)
-        for b in (self._all_yes_btn, self._none_btn, self._show_no):
+        for b in (self._all_yes_btn, self._none_btn, self._show_no,
+                  self._make_report):
             controls.addWidget(b)
         controls.addStretch(1)
         for b in (self._open_btn, self._cancel_btn, self._run_btn):
@@ -390,7 +400,10 @@ class AnalysisWindow(QWidget):
         self._run_btn.setEnabled(False)
         self._cancel_btn.setEnabled(True)
         self._running_item = None
-        self._proc.start(_ANALYZE_SH, [self._log_dir, '--plan', plan_path])
+        argv = [self._log_dir, '--plan', plan_path]
+        if self._make_report.isChecked():
+            argv.append('--report')
+        self._proc.start(_ANALYZE_SH, argv)
 
     def _read_output(self):
         text = bytes(self._proc.readAllStandardOutput()).decode(

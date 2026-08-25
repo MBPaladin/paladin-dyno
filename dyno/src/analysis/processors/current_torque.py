@@ -1489,6 +1489,7 @@ class CurrentTorque(Processor):
         cell = seg.tare.get(tch, {})
         if cell.get('full_scale'):
             frac = 100 * peak_t / cell['full_scale']
+            out['torque_cell_fs_Nm'] = cell['full_scale']
             out['torque_cell_fs_used_pct'] = frac
             if frac < 20:
                 res.add('info', code('low_cell_utilisation'),
@@ -1496,11 +1497,48 @@ class CurrentTorque(Processor):
                         f'({cell["full_scale"]} Nm); tare noise was '
                         f'{cell.get("stddev", float("nan")):.3f} Nm.')
 
+        # -- what was actually commanded ----------------------------------
+        # The report quotes the sweep's magnitude ("a torque sawtooth of
+        # +/-5 Nm") as part of its experimental description. That number is not
+        # in resolved_config -- the trace is not carried into the log -- so it
+        # comes from the command channel, which is what survived limit
+        # clipping rather than what the trace asked for.
+        cmd_ch = seg.command_channel('torque', prefer=seg.prefix(ramp_motor))
+        cmd = seg.cmd_span(cmd_ch) if cmd_ch else None
+        # A held-at-zero command is not a sweep description -- the absorber's
+        # torque command in a blocked-rotor run is a flat 0 Nm, and reporting
+        # "a sawtooth of +/-0 Nm" would be worse than reporting nothing.
+        if cmd and cmd['amplitude'] <= 0:
+            cmd = None
+        if cmd:
+            out.update({
+                'cmd_torque_channel': cmd_ch,
+                'cmd_torque_min_Nm': cmd['min'],
+                'cmd_torque_max_Nm': cmd['max'],
+                'cmd_torque_amplitude_Nm': cmd['amplitude'],
+                'cmd_rotatum_Nm_per_s': cmd['max_rate'],
+                # Two reversals per sawtooth cycle. Reported as a count of
+                # complete cycles because that is what a reader checking
+                # thermal drift against sweep repetitions wants.
+                'n_torque_cycles': (cmd['n_reversals'] // 2
+                                    if cmd['n_reversals'] is not None else None),
+            })
+
         # -- metrics ------------------------------------------------------
+        units, units_declared = seg.current_units(motor)
+        if not units_declared:
+            res.add('info', code('current_units_assumed'),
+                    f'{motor} does not declare drive_params.current_units, so '
+                    f'every current here is labelled {units} by default. This is '
+                    f'a label, not a conversion -- nothing was rescaled. Set '
+                    f'current_units to peak or rms on this drive so the report '
+                    f'stops guessing.')
         out.update({
             'motor': motor,
             'current_channel': cch,
             'torque_channel': tch,
+            'current_units': units,
+            'current_units_declared': units_declared,
             'n_samples': int(all_i.size),
             'n_park_angles': len(positions) if positions else 1,
             'park_angles_rad': positions,
@@ -1901,6 +1939,13 @@ class CurrentTorque(Processor):
             return None
         out = {'km_pct': 100 * (last - first) / first, 'span_s': span,
                'km_slope_per_s': float(slope), 'km_intercept': float(icept)}
+        # The same drift as a rate. Defined as km_pct / span_s rather than
+        # slope / km, so the total and the rate are exactly consistent: a
+        # reader who multiplies the rate by the span must land back on the
+        # total. Referencing the slope to the mean Km instead would give a
+        # slightly different number and no way to tell which one the report
+        # meant.
+        out['km_rate_pct_per_s'] = out['km_pct'] / span
 
         # One current both ends of the run reached. The 80th percentile of the
         # gated samples is high enough that the ratios are not noise-dominated

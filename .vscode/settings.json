@@ -20,6 +20,9 @@
   ],
   "latex-workshop.latex.recipe.default": "pdflatex x2",
   "latex-workshop.latex.autoBuild.run": "onSave",
+  "//clean": "clean.method defaults to 'command', which shells out to latexmk (not installed in this MiKTeX) and pops a package-install dialog mid-build. 'glob' makes clean.fileTypes below actually apply.",
+  "latex-workshop.latex.clean.method": "glob",
+  "latex-workshop.latex.autoBuild.cleanAndRetry.enabled": false,
   "latex-workshop.latex.clean.fileTypes": [
     "*.aux", "*.bbl", "*.blg", "*.idx", "*.ind", "*.lof", "*.lot",
     "*.out", "*.toc", "*.acn", "*.acr", "*.alg", "*.glg", "*.glo",

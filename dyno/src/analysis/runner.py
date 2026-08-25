@@ -316,6 +316,10 @@ def main(argv=None):
                          '--only/--segment/--set')
     ap.add_argument('--interactive', action='store_true',
                     help='Display figures as well as saving them')
+    ap.add_argument('--report', action='store_true',
+                    help='After analysing, re-render the LaTeX report sections '
+                         'for whichever report.yaml this log sits under '
+                         '(no-op if it sits under none)')
     args = ap.parse_args(argv)
 
     # --plan is a complete statement of what to run; combining it with the
@@ -392,9 +396,39 @@ def main(argv=None):
 
         print(f'\nWrote {out_dir}/')
         print(f'  results.json, analysis_report.txt')
+
+        if args.report:
+            _render_report(log.log_dir)
+
         if args.interactive:
             plt.show()
     return 0
+
+
+def _render_report(log_dir):
+    """Re-render the report this log belongs to, if it belongs to one.
+
+    Imported here rather than at module scope for two reasons: tex imports back
+    from runner, so a top-level import is a cycle; and the report path pulls in
+    yaml, which the analysis itself has no need of.
+
+    A log that is not part of any report is the normal case for a one-off run,
+    so that is a printed line, not an error -- and a report that fails to render
+    must never take an otherwise-good analysis down with it.
+    """
+    from . import tex
+
+    root = tex.find_root(log_dir)
+    if root is None:
+        print(f'\nNo {tex.MANIFEST_NAME} above {log_dir}; '
+              f'nothing to re-render.')
+        return
+    print()
+    try:
+        tex.render(root)
+    except Exception as exc:
+        print(f'  ! report render failed: {type(exc).__name__}: {exc}')
+        print(f'    The analysis above is written and intact.')
 
 
 if __name__ == '__main__':

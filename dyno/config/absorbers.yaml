@@ -1,3 +1,8 @@
+# Drives here report current in A_rms, which is what the analysis path and
+# setup_summary have always assumed. A drive that reports the quadrature-axis
+# amplitude instead declares `current_units: peak` under drive_params -- it is
+# a unit LABEL for reports, never a conversion (see dyno/src/analysis/texfmt.py).
+
 RA080-01:
   type: rotary
   flip_torque_sign: True

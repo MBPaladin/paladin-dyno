@@ -637,10 +637,22 @@ class RunningTorque(Processor):
             self._check_ratio(res, ospec, ratio, backdrive, top_orders)
 
         # -- metrics ---------------------------------------------------------
+        # The commanded sawtooth amplitude, for the report's experimental
+        # description, kept separate from the measured peak_speed_rad_s above.
+        cmd_v, cmd_ch = None, None
+        for s in segs:
+            channel = s.command_channel('velocity',
+                                        prefer=s.prefix(motor)) or vcmd_ch
+            span = s.cmd_span(channel)
+            if span:
+                cmd_ch = channel
+                cmd_v = max(cmd_v or 0.0, span['amplitude'])
         res.metrics.update({
             'motor': motor,
             'torque_channel': tch,
             'velocity_channel': vch,
+            'cmd_velocity_channel': cmd_ch,
+            'cmd_peak_velocity_rad_s': cmd_v,
             'drive_mode': 'back-drive' if backdrive else 'forward drive',
             'gear_ratio': ratio,
             'sample_rate_hz': fs,
@@ -652,6 +664,12 @@ class RunningTorque(Processor):
             'peak_speed_rad_s': vpeak,
             'coulomb_drag_Nm': coulomb,
             'viscous_drag_Nm_per_rad_s': viscous,
+            # Same slope per krpm. A report quoting "0.172 Nm + 0.140 Nm/krpm"
+            # should not have to know the conversion, and doing it here means
+            # one definition of krpm instead of one per consumer.
+            'viscous_drag_Nm_per_krpm': (viscous / _KRPM_PER_RAD_S
+                                         if viscous is not None
+                                         and np.isfinite(viscous) else None),
             'drag_at_peak_speed_Nm': drag_at_peak,
             'ripple_rms_max_Nm': (float(np.nanmax(bripple))
                                   if np.any(~np.isnan(bripple)) else float('nan')),

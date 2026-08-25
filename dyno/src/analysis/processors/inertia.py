@@ -547,9 +547,25 @@ class Inertia(Processor):
                         f'units -- this parameter wants kg.m^2, e.g. 1.2e-3.')
 
         # -- metrics ------------------------------------------------------------
+        # The commanded speed the ramps were run to, for the report's
+        # experimental description. Taken from the command channel rather than
+        # from the measured peak: the measured peak includes overshoot, and
+        # "driven up to X" is a statement about the command.
+        # The commanding shaft is routinely not the measured one -- this test
+        # measures the DUT's shaft while the absorber holds the velocity ramp --
+        # so the channel is looked up rather than derived from vch.
+        cmd_v, cmd_ch = None, None
+        for s in segs:
+            channel = s.command_channel('velocity', prefer=vch.rsplit('_', 1)[0])
+            span = s.cmd_span(channel) if channel else None
+            if span:
+                cmd_ch = channel
+                cmd_v = max(cmd_v or 0.0, span['amplitude'])
         res.metrics.update({
             'velocity_channel': vch,
             'torque_channel': tch,
+            'cmd_velocity_channel': cmd_ch,
+            'cmd_peak_velocity_rad_s': cmd_v,
             'torque_cell_sign': sign,
             'sample_rate_hz': fs,
             'n_ramp_pairs': len(pairs),

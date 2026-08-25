@@ -39,6 +39,7 @@ PARAM_INFO = {
     'motor_limits.acceleration': ('rad/s^2',     'Acceleration commands beyond this are clipped'),
     'motor_limits.rotatum':      ('Nm/s',        'Limit on how fast torque may change'),
     'drive_params.i_cont':       ('A_rms',       'Drive continuous current rating (must match drive setting)'),
+    'drive_params.current_units': ('peak|rms',  'Whether this drive reports current as peak or rms (labelling only - nothing converts)'),
     # --- sensor channel params ---
     'port':                      ('',            'Front panel connector the sensor plugs into'),
     'supply':                    ('',            'Excitation supply switched on for this sensor'),

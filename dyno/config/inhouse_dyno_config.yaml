@@ -168,6 +168,12 @@ expected_slave_layout:
       drive_params:
         i_cont: 21.21
         i_rated: 21.21      # torque -> per-mille scaling
+        # The Elmo reports the quadrature-axis AMPLITUDE, not an rms value, so
+        # every current logged for this drive -- and every kt derived from one
+        # -- is per peak amp. Read by the report generator to pick a unit
+        # label. Nothing converts on this key: it says what the numbers already
+        # are. The AKDs on this bench report rms and are left at the default.
+        current_units: peak
         counts_per_rev: 262144                 # 2^18
         position_counter_bits: 32              # 18 if 0x6064 wraps each rev
         pdo_profile: compact                  
