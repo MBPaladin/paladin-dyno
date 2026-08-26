@@ -257,7 +257,7 @@ def render(root, verbose=True):
 
     driver_path = os.path.join(root, 'report_generated.tex')
     with open(driver_path, 'w', encoding='utf-8') as f:
-        f.write(tex_sections.render_driver(man, list(man['sections'])))
+        f.write(tex_sections.render_driver(man, list(man['sections']), root))
     written.append(driver_path)
 
     retired = figures.commit()

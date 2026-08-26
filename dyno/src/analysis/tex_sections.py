@@ -16,6 +16,7 @@ where a person writes it and no generator overwrites it.
 """
 
 import math
+import os
 
 from . import texfmt as tf
 
@@ -455,13 +456,18 @@ class TorqueRipple(Section):
         primary = 'drive_on' if ctx.has('drive_on') else 'main'
         if not ctx.has(primary):
             return self.missing(ctx, primary, 'torque ripple')
+        # "with Servo Drive On" only earns its place when an Off figure follows
+        # it. Alone on the page it names a contrast the report does not draw,
+        # and the reader has to go looking for the comparison it implies.
+        paired = ctx.has('drive_off')
         out = [f'\\section{{{self.title}}}\\label{{sec:torque_ripple}}\n']
         out.append(self._setup(ctx, primary))
         out.append(self._table(ctx, primary))
         out.append(ctx.fig(primary, 'vs_mech_angle', 'torque_ripple_drive_on',
-                           'Torque Ripple with Servo Drive On',
+                           'Torque Ripple with Servo Drive On' if paired
+                           else 'Torque Ripple',
                            'fig:torque_ripple_elmo_on'))
-        if ctx.has('drive_off'):
+        if paired:
             out.append(ctx.fig('drive_off', 'vs_mech_angle',
                                'torque_ripple_drive_off',
                                'Torque Ripple with Servo Drive Off',
@@ -520,9 +526,11 @@ class TorqueRipple(Section):
             if k not in keys:
                 keys.append(k)
 
-        header = ['Load', 'On, order fold', 'On, mechanical']
         if ctx.has('drive_off'):
-            header += ['Off, order fold', 'Off, mechanical']
+            header = ['Load', 'On, order fold', 'On, mechanical',
+                      'Off, order fold', 'Off, mechanical']
+        else:
+            header = ['Load', 'Order fold', 'Mechanical']
         rows = []
         for k in keys:
             row = [tf.escape(k.replace('Nm', ' Nm')),
@@ -582,9 +590,13 @@ class RunningTorque(Section):
         return ''.join(s)
 
     def _table(self, ctx, primary):
-        cols = [('Servo drive on', primary)]
+        # One column needs no on/off label: there is nothing to contrast it
+        # with, and heading it "Servo drive on" implies a missing companion.
         if ctx.has('drive_off'):
-            cols.append(('Servo drive off', 'drive_off'))
+            cols = [('Servo drive on', primary), ('Servo drive off',
+                                                  'drive_off')]
+        else:
+            cols = [('Value', primary)]
 
         def row(label, key, unit, sig=3):
             cells = [label]
@@ -674,6 +686,17 @@ def render_summary(ctx, loaded):
         avail = loaded.get(section) or {}
         return preferred if preferred in avail else fallback
 
+    def ref(section, target):
+        r"""\ref to a section, but only if that section was rendered.
+
+        Every row is listed whether or not its test was run -- a summary table
+        that silently omits what is missing hides it -- but the cross-reference
+        has to be dropped along with the section. A \ref to a label that was
+        never emitted compiles to '??' and leaves LaTeX warning about undefined
+        references forever after.
+        """
+        return r'\ref{%s}' % target if loaded.get(section) else tf.MISSING
+
     rows = []
 
     tr = role_of('torque_response', 'main')
@@ -685,20 +708,20 @@ def render_summary(ctx, loaded):
     kt = pick('torque_response', tr, 'drive_kt_Nm_per_A')
     rows.append(['Torque constant $K_t$',
                  f'{tf.num(kt)} \\si{{{tf.kt_unit(units)}}}',
-                 r'\ref{sec:kt}'])
+                 ref('torque_response', 'sec:kt')])
     rows.append(['Peak torque $T_{peak}$',
                  tf.si(pick('torque_response', tr, 'usable_peak_torque_Nm'),
-                       r'\newton\meter'), r'\ref{sec:kt}'])
+                       r'\newton\meter'), ref('torque_response', 'sec:kt')])
     rows.append(['Motor constant $K_m$',
                  tf.num(pick('torque_response', tr, 'km_Nm_per_sqrtW'))
                  + r' \si{\newton\meter}$/\sqrt{\si{\watt}}$',
-                 r'\ref{sec:km}'])
+                 ref('torque_response', 'sec:km')])
 
     rows.append(['Motor inertia $J$',
                  tf.pm(pick('inertia', 'full', 'J_motor_kgm2'),
                        pick('inertia', 'full', 'J_quoted_uncertainty_kgm2'),
                        r'\kilo\gram\meter\squared'),
-                 r'\ref{sec:inertia}'])
+                 ref('inertia', 'sec:inertia')])
 
     # Which ripple log feeds the headline is a report decision, not a data one:
     # the drive-on and drive-off runs measure genuinely different things.
@@ -712,10 +735,13 @@ def render_summary(ctx, loaded):
     if tf.ok(order):
         label += f', order {tf.raw(order)}'
     label += ')'
-    if ripple_role != 'drive_on':
+    # Name the role only when it is a deliberate, non-obvious choice. 'drive_on'
+    # is the default and 'main' means the report supplied one log with no
+    # variants at all -- appending either to the row label just adds noise.
+    if ripple_role not in ('drive_on', 'main'):
         label += f', {tf.escape(ripple_role)}'
     rows.append([label, tf.si(pkpk, r'\newton\meter', 2),
-                 r'\ref{sec:torque_ripple}'])
+                 ref('torque_ripple', 'sec:torque_ripple')])
 
     run_role = role_of(
         'running_torque',
@@ -728,7 +754,7 @@ def render_summary(ctx, loaded):
                    f'\\si{{\\newton\\meter}}/krpm')
     else:
         running = tf.MISSING
-    rows.append(['Running torque', running, r'\ref{sec:running}'])
+    rows.append(['Running torque', running, ref('running_torque', 'sec:running')])
 
     return tf.table(
         "Summary of measured results.",
@@ -782,7 +808,7 @@ _SECTION_ORDER = ('torque_response', 'inertia', 'torque_ripple',
                   'running_torque')
 
 
-def render_driver(man, section_keys):
+def render_driver(man, section_keys, root=None):
     """A compilable report that \\inputs every generated section.
 
     Written as `report_generated.tex` rather than over any hand-maintained
@@ -819,7 +845,21 @@ def render_driver(man, section_keys):
         intro.append(f' The drive was powered by a '
                      f'{tf.si(dut["supply_V"], VOLT)} DC supply.')
 
+    # A logo that is not on disk is a *fatal* pdflatex error, not a missing
+    # image, so a brand-new report root with nothing in pics/ yet would fail to
+    # build for a reason that has nothing to do with the data. Omit the
+    # \includegraphics when the file is not there and let the report compile;
+    # dropping the logo in later needs no regeneration of anything else.
     logo = man.get('logo', 'pics/paladinLogo.png')
+    if root is not None and logo:
+        have_logo = os.path.isfile(os.path.join(root, logo))
+    else:
+        have_logo = bool(logo)
+    author = tf.escape(man.get('author', 'Paladin Engineering'))
+    byline = (f'{author}\\hspace{{0.6em}}%\n'
+              f'  \\raisebox{{-0.4\\height}}{{\\includegraphics[height=2.2em]'
+              f'{{{logo}}}}}' if have_logo else author)
+
     body = [
         '% report_generated.tex -- generated by dyno.src.analysis.tex',
         '% Regenerated on every render. To keep commentary, put it in its own',
@@ -829,10 +869,7 @@ def render_driver(man, section_keys):
         _PREAMBLE,
         '',
         f'\\title{{\\textbf{{{tf.escape(title)}: Dynamometer Test Report}}}}',
-        f'\\author{{{tf.escape(man.get("author", "Paladin Engineering"))}'
-        f'\\hspace{{0.6em}}%',
-        f'  \\raisebox{{-0.4\\height}}{{\\includegraphics[height=2.2em]'
-        f'{{{logo}}}}}}}',
+        f'\\author{{{byline}}}',
         '\\date{\\today}',
         '',
         '\\begin{document}',
