@@ -157,17 +157,17 @@ expected_slave_layout:
     params:
       flip_torque_sign: False
       gear_ratio: 1
-      motor_params: { kt: 0.17, k_tanh: 0.027 }
-      spec_sheet: { kt: .424, km: 0.6}  # add `km: <Nm/sqrt(W)>` to overlay the datasheet Km
+      motor_params: { kt: 0.316, k_tanh: 0.001 }
+      spec_sheet: { kt: .316, km: 1.31}  # add `km: <Nm/sqrt(W)>` to overlay the datasheet Km
       motor_limits:
-        torque: 5.4 
-        continuous_torque: 3.4 
-        velocity: 300
+        torque: 50 
+        continuous_torque: 40 
+        velocity: 100
         acceleration: 1000
         rotatum: 500
       drive_params:
-        i_cont: 21.21
-        i_rated: 21.21      # torque -> per-mille scaling
+        i_cont: 42.430
+        i_rated: 42.430      # torque -> per-mille scaling
         # The Elmo reports the quadrature-axis AMPLITUDE, not an rms value, so
         # every current logged for this drive -- and every kt derived from one
         # -- is per peak amp. Read by the report generator to pick a unit
