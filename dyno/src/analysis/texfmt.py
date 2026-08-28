@@ -196,3 +196,22 @@ def table(caption, header, rows, label=None, spec=None):
     out += ['    ' + ' & '.join(r) + '\\\\' for r in rows]
     out += ['    \\bottomrule', '  \\end{tabular}', '\\end{table}', '']
     return '\n'.join(out)
+
+
+def pmnum(value, err, unit, sig=4, esig=2):
+    r"""value \pm error, spelled out, with the unit named once.
+
+    `pm` above is the right form for inertias and nothing else: its compact
+    bracket syntax always carries an exponent, so a number that reads naturally
+    in fixed point comes out as '7.229(500)e0'. Backlash, stiffness and
+    efficiency are all near unity in their own units, so they take this form
+    instead.
+
+    A missing uncertainty degrades to the bare value rather than to
+    '+/- nan' -- backlash from a single usable sweep has no spread to quote.
+    """
+    if not ok(value):
+        return MISSING
+    if not ok(err):
+        return si(value, unit, sig)
+    return r'$%s \pm %s$~\si{%s}' % (raw(value, sig), raw(err, esig), unit)

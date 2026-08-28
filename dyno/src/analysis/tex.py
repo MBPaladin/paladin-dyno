@@ -97,7 +97,9 @@ def load_manifest(root):
                 f'{MANIFEST_NAME}: section {key!r} must be a log path or a '
                 f'mapping of role -> log path, got {type(value).__name__}')
     man['sections'] = sections
+    man.setdefault('type', 'motor')
     man.setdefault('dut', {})
+    man.setdefault('drivetrain', {})
     man.setdefault('summary', {})
     man.setdefault('current_units', {})
     return man

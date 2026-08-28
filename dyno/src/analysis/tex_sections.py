@@ -23,9 +23,14 @@ from . import texfmt as tf
 # siunitx unit strings used often enough that spelling them inline inside an
 # f-string means escaping backslashes by hand and getting it wrong once.
 NM = r'\newton\meter'
+RAD = r'\radian'
 RAD_S = r'\radian\per\second'
 RAD_S2 = r'\radian\per\second\squared'
 NM_PER_S = r'\newton\meter\per\second'
+NM_PER_RAD = r'\newton\meter\per\radian'
+ARCMIN = r'\arcmin'
+ARCMIN_PER_NM = r'\arcmin\per\newton\meter'
+PERCENT = r'\percent'
 VOLT = r'\volt'
 RPM = r'\rpm'
 
@@ -70,6 +75,74 @@ def _levels(values, unit, sig=3):
     return r'\SIlist{%s}{%s}' % (body.replace(', ', ';'), unit)
 
 
+def _magnitudes(values):
+    """The distinct magnitudes of a signed setpoint grid, ascending.
+
+    Both signs of speed and of torque are commanded, and a grid described as
+    "ten speeds from -300 to 300" reads as ten distinct operating points when
+    it is five, each run in both directions.
+    """
+    seen = sorted({round(abs(float(v)), 6) for v in values or ()
+                   if tf.ok(v)})
+    return seen
+
+
+def _spacing(values):
+    """'logarithmically', 'linearly', or None for an irregular grid.
+
+    The dyno's grid sweeps are log-spaced by convention, but a report that
+    says so about a grid that was not is an error nobody re-reads the prose to
+    catch. Cheaper to measure it than to assume it.
+    """
+    v = [float(x) for x in values or () if tf.ok(x)]
+    if len(v) < 3:
+        return None
+
+    def regular(seq):
+        steps = [b - a for a, b in zip(seq, seq[1:])]
+        mean = sum(steps) / len(steps)
+        if mean <= 0:
+            return False
+        return (max(steps) - min(steps)) <= 0.05 * mean
+
+    if all(x > 0 for x in v) and regular([math.log(x) for x in v]):
+        return 'logarithmically'
+    return 'linearly' if regular(v) else None
+
+
+def _both(unit_phrase, spacing, n, lo, hi, unit, rpm=False):
+    """"n values spaced <how> from <lo> to <hi>", with the count spelled out."""
+    how = f' spaced {spacing}' if spacing else ''
+    span = f'{tf.si(lo, unit)} to {tf.si(hi, unit)}'
+    if rpm:
+        # Four figures on the rpm conversion, not three: 300 rad/s is 2865 rpm,
+        # and three figures round it to 2.86e3, which reads as a different kind
+        # of quantity from the 95.5 beside it.
+        span = (f'{tf.si(lo, unit)} ({tf.si(_rpm(lo), RPM, 4)}) to '
+                f'{tf.si(hi, unit)} ({tf.si(_rpm(hi), RPM, 4)})')
+    return f'{tf.num(n)} {unit_phrase}{how} from {span}'
+
+
+def _ratio(v):
+    """A gear ratio as '26:1'.
+
+    %g rather than tf.raw: a ratio that came back from JSON as 26.0 must not
+    print as '26.0:1', and one that is genuinely fractional must keep its
+    digits.
+    """
+    return tf.MISSING if not tf.ok(v) else f'{float(v):g}:1'
+
+
+def _report_type(man):
+    """'gearbox' or 'motor'. Chooses prose, section order and summary rows.
+
+    Defaults to motor because every report that predates the gearbox work is
+    one, and none of them carries the key.
+    """
+    return 'gearbox' if str((man or {}).get('type', '')).lower() in (
+        'gearbox', 'gear', 'reducer', 'transmission') else 'motor'
+
+
 class Context:
     """What a section renderer is handed.
 
@@ -84,6 +157,10 @@ class Context:
         self.man = manifest
         self.figures = figures
         self.notes = []
+
+    @property
+    def type(self):
+        return _report_type(self.man)
 
     def has(self, role):
         return role in self.roles
@@ -628,6 +705,366 @@ class RunningTorque(Section):
             label='tab:running', spec='l' + 'r' * len(cols) + 'l')
 
 
+class Backlash(Section):
+    key = 'backlash'
+    title = 'Backlash and Torsional Stiffness'
+    processor = 'backlash'
+
+    def render(self, ctx):
+        if not ctx.has('main'):
+            return self.missing(ctx, 'main', 'backlash')
+        out = [f'\\section{{{self.title}}}\\label{{sec:backlash}}\n']
+        out.append(self._setup(ctx))
+        out.append(self._method(ctx))
+        out.append(self._table(ctx))
+        out.append(ctx.fig('main', 'overlay', 'all_backlash_runs',
+                           'Torque--deflection loops from every mesh position '
+                           'measured, coloured by output hold position.',
+                           'fig:backlash_overlay'))
+        out.append(self._example(ctx))
+        return '\n'.join(out)
+
+    # -- helpers ------------------------------------------------------------
+
+    @staticmethod
+    def _mesh(ctx):
+        """(distinct hold positions, schedule word) from the per-sweep list.
+
+        The schedule is read back from the data rather than declared, because
+        it is not fixed: this run stepped up and then back down, and the next
+        one need not. Positions are clustered at the same tolerance the
+        processor used to pair up-visits with down-visits, so the two agree on
+        what 'the same position' means.
+        """
+        sweeps = ctx.m('main', 'sweeps') or []
+        tol = ctx.p('main', 'position_tol_rad', 0.05) or 0.05
+        distinct = []
+        for pos in sorted(s.get('output_position_rad') for s in sweeps
+                          if tf.ok(s.get('output_position_rad'))):
+            if not distinct or abs(pos - distinct[-1]) > tol:
+                distinct.append(pos)
+        steps = {s.get('step_direction') for s in sweeps}
+        if {'up', 'down'} <= steps:
+            # Not "every position twice": the two legs of an up-and-down
+            # schedule need not land on the same set, and this one does not --
+            # the down leg reaches one position the up leg never visits.
+            n_rep = ctx.m('main', 'n_repeated_positions')
+            schedule = 'stepped up through the range and then back down'
+            if tf.ok(n_rep) and n_rep:
+                schedule += (f', which visits {tf.num(n_rep)} of them in both '
+                             f'directions')
+        elif steps == {'down'}:
+            schedule = 'stepped down through the range'
+        elif steps == {'up'}:
+            schedule = 'stepped up through the range'
+        else:
+            schedule = None
+        return distinct, schedule
+
+    def _setup(self, ctx):
+        cmd = _signed_span(ctx.m('main', 'cmd_torque_min_Nm'),
+                           ctx.m('main', 'cmd_torque_max_Nm'), NM)
+        ratio = ctx.m('main', 'gear_ratio')
+        lo = ctx.m('main', 'output_position_min_rad')
+        hi = ctx.m('main', 'output_position_max_rad')
+        used = ctx.m('main', 'n_sweeps_used')
+        found = ctx.m('main', 'n_sweeps_found')
+        distinct, schedule = self._mesh(ctx)
+
+        s = ['The gearbox output was held at a fixed position while the input '
+             'was commanded a torque sawtooth']
+        s.append(f' of {cmd}' if cmd != tf.MISSING else ' of both signs')
+        s.append(', winding the train up against one tooth flank and then the '
+                 'other. The output was then stepped to a new hold position '
+                 'and the sweep repeated, sampling the mesh at ')
+        s.append(f'{tf.num(len(distinct))} positions' if distinct
+                 else 'a series of positions')
+        if tf.all_ok(lo, hi):
+            s.append(f' spanning {tf.si(hi - lo, RAD)} of output travel')
+        if schedule:
+            s.append(f', {schedule}')
+        s.append('. Between sweeps the input torque command returns to zero, '
+                 'which both separates the sweeps and gives a rest window to '
+                 'tare the torque cell against.\n')
+        if tf.all_ok(found, used):
+            if used < found:
+                s.append(f'Of the {tf.num(found)} sweeps recorded, '
+                         f'{tf.num(used)} were usable.')
+            else:
+                s.append(f'All {tf.num(used)} sweeps were usable.')
+            s.append('\n')
+        if tf.ok(ratio):
+            s.append(f'Deflection and stiffness are reported in the output '
+                     f'frame at {_ratio(ratio)}; the torque axis is the '
+                     f'input cell.\n')
+        return ''.join(s)
+
+    def _method(self, ctx):
+        frac = ctx.p('main', 'edge_frac')
+        band = (f'above {tf.pct(100 * frac, 2, signed=False)} of the sweep '
+                f'peak' if tf.ok(frac) else 'above a fixed fraction of the '
+                                            'sweep peak')
+        return (
+            '\\subsection{Method}\\label{sec:backlash_fit}\n'
+            'Within each sweep the two engaged tooth flanks are the portions '
+            f'of the loop where the input torque magnitude sits {band}. A '
+            'straight line is fitted to each flank in the '
+            'deflection--torque plane. Backlash is the gap between the two '
+            'fits at zero torque,\n'
+            '\\begin{equation}\n'
+            '  \\theta_{bl} = \\theta^{+}(0) - \\theta^{-}(0),\n'
+            '\\end{equation}\n'
+            'so the loop is modelled as a parallelogram and the number is '
+            'total lost motion rather than the geometric tooth gap alone. '
+            'Torsional stiffness is taken from the flank slopes, referred to '
+            'the output shaft,\n'
+            '\\begin{equation}\n'
+            '  K_{\\theta} = \\frac{N\\,T_{in}}{\\theta_{out}},\n'
+            '\\end{equation}\n'
+            'where $N$ is the gear ratio. Deflection itself is the input '
+            'encoder referred through the ratio less the output encoder, so '
+            'it is positive when the input leads.\n\n')
+
+    def _table(self, ctx):
+        mean = ctx.m('main', 'backlash_arcmin_mean')
+        if not tf.ok(mean):
+            return tf.placeholder(
+                'No sweep produced a usable pair of flank fits, so no '
+                'backlash or stiffness was measured.')
+
+        lo = ctx.m('main', 'backlash_arcmin_min')
+        hi = ctx.m('main', 'backlash_arcmin_max')
+        rows = [['Backlash',
+                 tf.pmnum(mean, ctx.m('main', 'backlash_arcmin_std'), ARCMIN,
+                          esig=3)]]
+        if tf.all_ok(lo, hi):
+            rows.append(['Backlash, range across mesh positions',
+                         r'%s to %s' % (tf.si(lo, ARCMIN),
+                                        tf.si(hi, ARCMIN))])
+        rep = ctx.m('main', 'updown_repeatability_arcmin')
+        n_rep = ctx.m('main', 'n_repeated_positions')
+        if tf.ok(rep):
+            rows.append([f'Repeatability, up vs.\\ down at the same position '
+                         f'({tf.num(n_rep)} pairs)', tf.si(rep, ARCMIN)])
+        # Stiffnesses land in the thousands of Nm/rad, where three significant
+        # figures is '8.32e+03' -- exponential notation for a number that reads
+        # perfectly well as 8319.
+        rows.append(['Torsional stiffness, output frame',
+                     tf.pmnum(ctx.m('main', 'stiffness_Nm_per_rad_mean'),
+                              ctx.m('main', 'stiffness_Nm_per_rad_std'),
+                              NM_PER_RAD, sig=4, esig=3)])
+        sp = ctx.m('main', 'stiffness_pos_flank_Nm_per_rad')
+        sn = ctx.m('main', 'stiffness_neg_flank_Nm_per_rad')
+        if tf.all_ok(sp, sn):
+            rows.append(['Stiffness, $+$ flank / $-$ flank',
+                         f'{tf.si(sp, NM_PER_RAD, 4)} / '
+                         f'{tf.si(sn, NM_PER_RAD, 4)}'])
+            rows.append(['Flank asymmetry',
+                         tf.pct(ctx.m('main', 'flank_stiffness_asymmetry_pct'),
+                                3, signed=False)])
+        rows.append(['Compliance',
+                     tf.si(ctx.m('main', 'compliance_arcmin_per_Nm_mean'),
+                           ARCMIN_PER_NM)])
+
+        body = tf.table(
+            'Backlash and torsional stiffness, pooled over every usable '
+            'sweep. The tolerance on the first row is the spread across mesh '
+            'positions, not an instrument uncertainty.',
+            ['Quantity', 'Measured'], rows, label='tab:backlash', spec='lr')
+
+        # The fit band is a modelling choice, and how far the answer moves when
+        # it changes is the one number that says whether the parallelogram
+        # model is carrying the result. Stated, not interpreted.
+        half = ctx.m('main', 'backlash_arcmin_at_half_band')
+        double = ctx.m('main', 'backlash_arcmin_at_double_band')
+        if tf.all_ok(half, double):
+            body += ('\\noindent Refitting the flanks over half and double the '
+                     f'band gives {tf.si(half, ARCMIN)} and '
+                     f'{tf.si(double, ARCMIN)}, a spread of '
+                     f'{tf.pct(ctx.m("main", "edges_band_sensitivity_pct"), 3, signed=False)} '
+                     'about the quoted value.\n\n')
+        return body
+
+    def _example(self, ctx):
+        """One sweep, full size, as the worked example of the fit above.
+
+        The sweep index is read from the results rather than hard-coded: the
+        processor numbers its plots by raw sweep index, and the first one is
+        routinely dropped as settling, so `sweep_01` is not reliably a file
+        that exists.
+        """
+        sweeps = ctx.m('main', 'sweeps') or []
+        idx = next((s.get('index') for s in sweeps
+                    if isinstance(s.get('index'), int)), None)
+        if idx is None:
+            return ''
+        pos = next((s.get('output_position_rad') for s in sweeps
+                    if s.get('index') == idx), None)
+        cap = 'A single sweep, showing the two flank fits and the intercept ' \
+              'gap they are differenced over'
+        if tf.ok(pos):
+            cap += f' (output held at {tf.si(pos, RAD)})'
+        return ctx.fig('main', f'sweep_{idx:02d}', 'backlash_example_sweep',
+                       cap + '.', 'fig:backlash_sweep')
+
+
+class Efficiency(Section):
+    key = 'efficiency'
+    title = 'Efficiency'
+    processor = 'efficiency'
+
+    def render(self, ctx):
+        if not ctx.has('main'):
+            return self.missing(ctx, 'main', 'efficiency')
+        out = [f'\\section{{{self.title}}}\\label{{sec:efficiency}}\n']
+        out.append(self._setup(ctx))
+        out.append(self._directions(ctx))
+        out.append(_EFFICIENCY_METHOD)
+        out.append(self._table(ctx))
+        out.append(ctx.fig('main', 'map', 'efficiency_map',
+                           'Efficiency over the speed--torque grid, forward '
+                           'and backdriven. Rotation directions are averaged '
+                           'within each cell.', 'fig:efficiency_map',
+                           width='1.0'))
+        return '\n'.join(out)
+
+    def _setup(self, ctx):
+        speeds = _magnitudes(ctx.m('main', 'speed_setpoints_rad_s'))
+        torques = _magnitudes(ctx.m('main', 'torque_setpoints_Nm'))
+        ratio = ctx.m('main', 'gear_ratio')
+        n_dwells = ctx.m('main', 'n_dwells')
+        n_cells = ctx.m('main', 'n_grid_cells')
+
+        s = ['Efficiency was mapped by a grid search over shaft speed and '
+             'output load. The input motor was commanded to hold ']
+        if speeds:
+            s.append(_both('input speeds', _spacing(speeds), len(speeds),
+                           speeds[0], speeds[-1], RAD_S, rpm=True))
+            s.append(', in both directions of rotation')
+        else:
+            s.append('a series of input speeds in both directions of rotation')
+        s.append(', while the output motor was commanded to hold ')
+        if torques:
+            s.append(_both('output torques', _spacing(torques), len(torques),
+                           torques[0], torques[-1], NM))
+            s.append(', of both signs')
+        else:
+            s.append('a series of output torques of both signs')
+        s.append('. Each combination is one dwell, held until the shafts '
+                 'settle, and every quantity below is the steady-state mean '
+                 'over that dwell.')
+        if tf.all_ok(n_dwells, n_cells):
+            s.append(f' {tf.num(n_dwells)} dwells covered '
+                     f'{tf.num(n_cells)} grid cells')
+            if tf.ok(ratio):
+                s.append(f' at {_ratio(ratio)}')
+            s.append('.')
+        s.append('\n\nSpeeds are quoted at the input shaft and torques at the '
+                 'output shaft, which is how each was commanded and '
+                 'measured.\n')
+        return ''.join(s)
+
+    def _directions(self, ctx):
+        fwd = ctx.m('main', 'n_forward')
+        back = ctx.m('main', 'n_backdrive')
+        s = ['\\subsection{Forward and Backdriven Operation}'
+             '\\label{sec:efficiency_modes}\n'
+             'The sign of the output torque relative to the direction of '
+             'rotation decides which way mechanical power flows through the '
+             'gearbox, and the grid covers both at every operating point. '
+             'When the load opposes the motion, the input motor drives the '
+             'output through the reduction: this is \\emph{forward} '
+             'operation. When the load assists the motion it overhauls the '
+             'gearbox and drives the input instead: this is '
+             '\\emph{backdriven} operation. The two are separate '
+             'measurements of the same hardware -- the losses sit on '
+             'opposite sides of the power ratio -- so they are mapped and '
+             'reported separately and never pooled.\n']
+        if tf.all_ok(fwd, back):
+            s.append(f'Of the dwells recorded, {tf.num(fwd)} ran forward and '
+                     f'{tf.num(back)} backdriven.')
+            diss = ctx.m('main', 'n_dissipative')
+            if tf.ok(diss) and diss:
+                one = diss == 1
+                s.append(f' {tf.num(diss)} further dwell{"" if one else "s"} '
+                         f'had both shafts feeding power into the gearbox and '
+                         f'none coming out -- the load could not backdrive it '
+                         f'at that operating point -- and '
+                         f'{"is" if one else "are"} reported as zero '
+                         f'efficiency.')
+            s.append('\n')
+        return ''.join(s)
+
+    def _table(self, ctx):
+        fwd = ctx.m('main', 'efficiency_forward_mean')
+        back = ctx.m('main', 'efficiency_backdrive_mean')
+        # A grid that never backdrove is a real outcome, not a failed run, so
+        # only the total absence of both directions collapses the block.
+        if not tf.ok(fwd) and not tf.ok(back):
+            return tf.placeholder(
+                'No dwell produced a usable power ratio, so no efficiency was '
+                'measured.')
+
+        floor = ctx.m('main', 'headline_min_load_Nm')
+        pk_v = ctx.m('main', 'efficiency_forward_peak_at_input_rad_s')
+        pk_t = ctx.m('main', 'efficiency_forward_peak_at_output_Nm')
+
+        # The processor reports efficiency as a fraction; the report quotes
+        # percent. Scaling has to happen before formatting, and the None/NaN
+        # guard has to happen before the scaling.
+        as_pct = lambda v: 100 * v if tf.ok(v) else None
+
+        def pm100(mean, std):
+            return tf.pmnum(as_pct(mean), as_pct(std), PERCENT,
+                            sig=3, esig=2)
+
+        rows = [
+            ['Forward, mean', pm100(fwd, ctx.m('main', 'efficiency_forward_std'))],
+            ['Forward, peak',
+             tf.si(as_pct(ctx.m('main', 'efficiency_forward_peak')), PERCENT)],
+            ['Backdriven, mean',
+             pm100(back, ctx.m('main', 'efficiency_backdrive_std'))],
+            ['Backdriven, peak',
+             tf.si(as_pct(ctx.m('main', 'efficiency_backdrive_peak')), PERCENT)],
+        ]
+        if tf.all_ok(pk_v, pk_t):
+            rows.insert(2, ['Forward peak, operating point',
+                            f'{tf.si(pk_v, RAD_S)} in, {tf.si(pk_t, NM)} out'])
+
+        cap = 'Efficiency headlines'
+        if tf.ok(floor):
+            cap += (f', pooled over every dwell at or above {tf.si(floor, NM)} '
+                    f'of output torque')
+        cap += ('. The tolerance is the spread across those operating points, '
+                'not an instrument uncertainty.')
+        return tf.table(cap, ['Quantity', 'Measured'], rows,
+                        label='tab:efficiency', spec='lr')
+
+
+_EFFICIENCY_METHOD = r"""
+\subsection{Calculation}\label{sec:efficiency_calc}
+Mechanical power is taken independently at each shaft, from that shaft's own
+torque cell and encoder:
+
+\begin{equation}
+  P_{in} = T_{in}\,\omega_{in}, \qquad P_{out} = T_{out}\,\omega_{out}
+\end{equation}
+
+Efficiency is then the ratio of the power leaving the gearbox to the power
+entering it, which swaps numerator and denominator with the direction of power
+flow:
+
+\begin{align}
+  \eta_{fwd}  &= P_{out} / P_{in}\\
+  \eta_{back} &= P_{in}  / P_{out}
+\end{align}
+
+Because efficiency is a ratio of two measured powers, its uncertainty grows as
+those powers shrink: the light-load, low-speed corner of the map is less
+accurate than the rest of it.
+"""
+
+
 _INERTIA_METHOD = r"""
 With $T^+$ and $T^-$ representing the measured torque during acceleration and
 deceleration, respectively, and $\alpha$ as the magnitude of the angular
@@ -663,7 +1100,8 @@ velocity, effectively cancelling the inertia term and isolating losses:
 
 
 SECTIONS = {s.key: s() for s in
-            (TorqueResponse, Inertia, TorqueRipple, RunningTorque)}
+            (TorqueResponse, Inertia, TorqueRipple, RunningTorque,
+             Backlash, Efficiency)}
 
 
 # ------------------------------------------------------------ summary table
@@ -675,6 +1113,12 @@ def render_summary(ctx, loaded):
     cannot live on a processor: no single results.json holds more than one of
     these rows.
     """
+    return (_summary_gearbox if ctx.type == 'gearbox' else _summary_motor)(
+        ctx, loaded, *_summary_helpers(loaded))
+
+
+def _summary_helpers(loaded):
+    """(pick, role_of, ref) -- the three lookups both summary tables share."""
     def pick(section, role, key, default=None):
         got = (loaded.get(section) or {}).get(role)
         if not got:
@@ -689,14 +1133,124 @@ def render_summary(ctx, loaded):
     def ref(section, target):
         r"""\ref to a section, but only if that section was rendered.
 
-        Every row is listed whether or not its test was run -- a summary table
-        that silently omits what is missing hides it -- but the cross-reference
-        has to be dropped along with the section. A \ref to a label that was
-        never emitted compiles to '??' and leaves LaTeX warning about undefined
-        references forever after.
+        A \ref to a label that was never emitted compiles to '??' and leaves
+        LaTeX warning about undefined references forever after, so a row whose
+        section is absent has to lose its cross-reference along with it.
         """
         return r'\ref{%s}' % target if loaded.get(section) else tf.MISSING
 
+    return pick, role_of, ref
+
+
+def _summary_gearbox(ctx, loaded, pick, role_of, ref):
+    """Headlines for a gearbox report.
+
+    Unlike the motor table below, rows appear only for sections the manifest
+    actually names. The two differ because the reports differ: a motor report
+    covers a fixed battery, so a missing row is a test that has yet to be run
+    and hiding it hides that. A gearbox report is assembled per job -- this one
+    is backlash and efficiency, the next may add cogging -- and there is no
+    fixed battery for an em-dash to be measured against. A row of em-dashes
+    there would read as a failed measurement rather than as a test nobody
+    ordered.
+    """
+    rows = []
+
+    # Ratio is a property of the DUT rather than of any one test, so it is
+    # taken from the manifest first and only then from whichever processor
+    # happened to record it.
+    ratio = ((ctx.man.get('dut') or {}).get('gear_ratio')
+             or pick('backlash', 'main', 'gear_ratio')
+             or pick('efficiency', 'main', 'gear_ratio'))
+    if tf.ok(ratio):
+        rows.append(['Gear ratio', _ratio(ratio), tf.MISSING])
+
+    if loaded.get('backlash'):
+        rows.append(['Backlash',
+                     tf.pmnum(pick('backlash', 'main', 'backlash_arcmin_mean'),
+                              pick('backlash', 'main', 'backlash_arcmin_std'),
+                              ARCMIN, esig=3),
+                     ref('backlash', 'sec:backlash')])
+        rows.append(['Torsional stiffness (output frame)',
+                     tf.pmnum(pick('backlash', 'main',
+                                   'stiffness_Nm_per_rad_mean'),
+                              pick('backlash', 'main',
+                                   'stiffness_Nm_per_rad_std'),
+                              NM_PER_RAD, sig=4, esig=3),
+                     ref('backlash', 'sec:backlash')])
+
+    if loaded.get('efficiency'):
+        floor = pick('efficiency', 'main', 'headline_min_load_Nm')
+        qual = (f' (at or above {tf.si(floor, NM)} out)' if tf.ok(floor)
+                else '')
+        for label, mkey, skey in (
+                ('Efficiency, forward', 'efficiency_forward_mean',
+                 'efficiency_forward_std'),
+                ('Efficiency, backdriven', 'efficiency_backdrive_mean',
+                 'efficiency_backdrive_std')):
+            mean = pick('efficiency', 'main', mkey)
+            std = pick('efficiency', 'main', skey)
+            rows.append([label + qual,
+                         tf.pmnum(100 * mean if tf.ok(mean) else None,
+                                  100 * std if tf.ok(std) else None,
+                                  PERCENT, sig=3, esig=2),
+                         ref('efficiency', 'sec:efficiency')])
+
+    if loaded.get('torque_ripple'):
+        rows.append(_ripple_row(ctx, loaded, pick, role_of, ref))
+
+    if loaded.get('running_torque'):
+        rows.append(_running_row(ctx, loaded, pick, role_of, ref))
+
+    if not rows:
+        return tf.placeholder(
+            'No section in this report produced a headline number yet. Run '
+            'the analysis on the logs the manifest names, then re-render.')
+
+    return tf.table(
+        'Summary of measured results.',
+        ['Quantity', 'Measured', 'Section'], rows,
+        label='tab:summary', spec='llc')
+
+
+def _ripple_row(ctx, loaded, pick, role_of, ref):
+    # Which ripple log feeds the headline is a report decision, not a data one:
+    # the drive-on and drive-off runs measure genuinely different things.
+    ripple_role = role_of(
+        'torque_ripple',
+        str((ctx.man.get('summary') or {}).get('ripple_from', 'drive_on')))
+    order = pick('torque_ripple', ripple_role, 'ripple_order')
+    pkpk = (pick('torque_ripple', ripple_role,
+                 'ripple_pkpk_at_slowest_Nm') or {}).get('0Nm')
+    label = 'Torque ripple (p-p @ \\SI{0}{\\newton\\meter}'
+    if tf.ok(order):
+        label += f', order {tf.raw(order)}'
+    label += ')'
+    # Name the role only when it is a deliberate, non-obvious choice. 'drive_on'
+    # is the default and 'main' means the report supplied one log with no
+    # variants at all -- appending either to the row label just adds noise.
+    if ripple_role not in ('drive_on', 'main'):
+        label += f', {tf.escape(ripple_role)}'
+    return [label, tf.si(pkpk, r'\newton\meter', 2),
+            ref('torque_ripple', 'sec:torque_ripple')]
+
+
+def _running_row(ctx, loaded, pick, role_of, ref):
+    run_role = role_of(
+        'running_torque',
+        str((ctx.man.get('summary') or {}).get('running_from', 'drive_on')))
+    coulomb = pick('running_torque', run_role, 'coulomb_drag_Nm')
+    viscous = pick('running_torque', run_role, 'viscous_drag_Nm_per_krpm')
+    if tf.all_ok(coulomb, viscous):
+        running = (f'{tf.si(coulomb, NM)} '
+                   f'$+$ {tf.num(viscous)} '
+                   f'\\si{{\\newton\\meter}}/krpm')
+    else:
+        running = tf.MISSING
+    return ['Running torque', running, ref('running_torque', 'sec:running')]
+
+
+def _summary_motor(ctx, loaded, pick, role_of, ref):
     rows = []
 
     tr = role_of('torque_response', 'main')
@@ -723,38 +1277,26 @@ def render_summary(ctx, loaded):
                        r'\kilo\gram\meter\squared'),
                  ref('inertia', 'sec:inertia')])
 
-    # Which ripple log feeds the headline is a report decision, not a data one:
-    # the drive-on and drive-off runs measure genuinely different things.
-    ripple_role = role_of(
-        'torque_ripple',
-        str((ctx.man.get('summary') or {}).get('ripple_from', 'drive_on')))
-    order = pick('torque_ripple', ripple_role, 'ripple_order')
-    pkpk = (pick('torque_ripple', ripple_role,
-                 'ripple_pkpk_at_slowest_Nm') or {}).get('0Nm')
-    label = 'Torque ripple (p-p @ \\SI{0}{\\newton\\meter}'
-    if tf.ok(order):
-        label += f', order {tf.raw(order)}'
-    label += ')'
-    # Name the role only when it is a deliberate, non-obvious choice. 'drive_on'
-    # is the default and 'main' means the report supplied one log with no
-    # variants at all -- appending either to the row label just adds noise.
-    if ripple_role not in ('drive_on', 'main'):
-        label += f', {tf.escape(ripple_role)}'
-    rows.append([label, tf.si(pkpk, r'\newton\meter', 2),
-                 ref('torque_ripple', 'sec:torque_ripple')])
+    rows.append(_ripple_row(ctx, loaded, pick, role_of, ref))
+    rows.append(_running_row(ctx, loaded, pick, role_of, ref))
 
-    run_role = role_of(
-        'running_torque',
-        str((ctx.man.get('summary') or {}).get('running_from', 'drive_on')))
-    coulomb = pick('running_torque', run_role, 'coulomb_drag_Nm')
-    viscous = pick('running_torque', run_role, 'viscous_drag_Nm_per_krpm')
-    if tf.all_ok(coulomb, viscous):
-        running = (f'{tf.si(coulomb, NM)} '
-                   f'$+$ {tf.num(viscous)} '
-                   f'\\si{{\\newton\\meter}}/krpm')
-    else:
-        running = tf.MISSING
-    rows.append(['Running torque', running, ref('running_torque', 'sec:running')])
+    # A motor report that also carried a gearbox test still wants its rows;
+    # they are appended rather than interleaved because the fixed motor battery
+    # above is what the table's shape is for.
+    if loaded.get('backlash'):
+        rows.append(['Backlash',
+                     tf.pmnum(pick('backlash', 'main', 'backlash_arcmin_mean'),
+                              pick('backlash', 'main', 'backlash_arcmin_std'),
+                              ARCMIN, esig=3),
+                     ref('backlash', 'sec:backlash')])
+    if loaded.get('efficiency'):
+        mean = pick('efficiency', 'main', 'efficiency_forward_mean')
+        std = pick('efficiency', 'main', 'efficiency_forward_std')
+        rows.append(['Efficiency, forward',
+                     tf.pmnum(100 * mean if tf.ok(mean) else None,
+                              100 * std if tf.ok(std) else None,
+                              PERCENT, sig=3, esig=2),
+                     ref('efficiency', 'sec:efficiency')])
 
     return tf.table(
         "Summary of measured results.",
@@ -804,29 +1346,19 @@ _PREAMBLE = r"""\documentclass[11pt]{article}
 \newcommand{\abs}[1]{\left\lvert#1\right\rvert}
 """
 
-_SECTION_ORDER = ('torque_response', 'inertia', 'torque_ripple',
-                  'running_torque')
+# Reading order per report type. A key missing from the manifest is simply
+# skipped, and a key the manifest names that is absent here still renders --
+# it lands after the ordered ones rather than being dropped.
+_SECTION_ORDER = {
+    'motor': ('torque_response', 'inertia', 'torque_ripple', 'running_torque',
+              'backlash', 'efficiency'),
+    'gearbox': ('backlash', 'efficiency', 'torque_ripple', 'running_torque',
+                'inertia', 'torque_response'),
+}
 
 
-def render_driver(man, section_keys, root=None):
-    """A compilable report that \\inputs every generated section.
-
-    Written as `report_generated.tex` rather than over any hand-maintained
-    master: the generated sections are meant to be \\input, and a report whose
-    commentary someone spent an afternoon on must not be the thing this
-    overwrites to prove the point.
-    """
-    dut = man.get('dut') or {}
-    title = man.get('title') or 'Dynamometer Test Report'
-    ordered = ([k for k in _SECTION_ORDER if k in section_keys]
-               + [k for k in section_keys if k not in _SECTION_ORDER])
-
-    intro = []
-    intro.append(f'This report summarizes dynamometer testing on the '
-                 f'{tf.escape(title)}')
-    if dut.get('supplier'):
-        intro.append(f' provided to {tf.escape(dut["supplier"])}')
-    intro.append('. The device under test (DUT) is a')
+def _intro_motor(dut):
+    intro = ['. The device under test (DUT) is a']
     if dut.get('topology'):
         intro.append(f' {tf.escape(dut["topology"])}')
     intro.append(' motor')
@@ -844,6 +1376,76 @@ def render_driver(man, section_keys, root=None):
     if dut.get('supply_V'):
         intro.append(f' The drive was powered by a '
                      f'{tf.si(dut["supply_V"], VOLT)} DC supply.')
+    return intro
+
+
+def _intro_gearbox(man, dut):
+    r"""The same opening paragraph, for a report whose DUT is a reduction.
+
+    A gearbox sits between two machines rather than against one, and which end
+    is which decides how every number in the report should be read -- so the
+    chain is spelled out here rather than left to the reader to infer from a
+    torque-cell rating.
+    """
+    chain = man.get('drivetrain') or {}
+    intro = ['. The device under test (DUT) is a']
+    if dut.get('gear_ratio'):
+        intro.append(f' {tf.raw(dut["gear_ratio"])}:1')
+    if dut.get('topology'):
+        intro.append(f' {tf.escape(dut["topology"])}')
+    intro.append(' gearbox, installed on the Paladin dynamometer between two '
+                 'absorber motors.')
+
+    def side(role, verb):
+        spec = chain.get(role) or {}
+        if not spec:
+            return ''
+        s = [f' The {role} shaft is {verb}']
+        if spec.get('motor'):
+            s.append(f' {_article(spec["motor"])} {tf.escape(spec["motor"])}')
+        else:
+            s.append(' an absorber motor')
+        if spec.get('drive'):
+            s.append(f' on {_article(spec["drive"])} '
+                     f'{tf.escape(spec["drive"])} servo drive')
+        if spec.get('torque_cell_Nm'):
+            s.append(f' through an in-line '
+                     f'$\\pm{tf.raw(spec["torque_cell_Nm"])}$ Nm torque cell')
+        s.append('.')
+        return ''.join(s)
+
+    intro.append(side('input', 'driven by'))
+    intro.append(side('output', 'loaded by'))
+    if chain:
+        intro.append(' Input-side quantities are measured on the input cell '
+                     'and encoder and output-side quantities on the output '
+                     'cell and encoder; anything referred through the '
+                     'reduction is labelled as such.')
+    return intro
+
+
+def render_driver(man, section_keys, root=None):
+    """A compilable report that \\inputs every generated section.
+
+    Written as `report_generated.tex` rather than over any hand-maintained
+    master: the generated sections are meant to be \\input, and a report whose
+    commentary someone spent an afternoon on must not be the thing this
+    overwrites to prove the point.
+    """
+    dut = man.get('dut') or {}
+    kind = _report_type(man)
+    title = man.get('title') or 'Dynamometer Test Report'
+    order = _SECTION_ORDER[kind]
+    ordered = ([k for k in order if k in section_keys]
+               + [k for k in section_keys if k not in order])
+
+    intro = []
+    intro.append(f'This report summarizes dynamometer testing on the '
+                 f'{tf.escape(title)}')
+    if dut.get('supplier'):
+        intro.append(f' provided to {tf.escape(dut["supplier"])}')
+    intro.extend(_intro_gearbox(man, dut) if kind == 'gearbox'
+                 else _intro_motor(dut))
 
     # A logo that is not on disk is a *fatal* pdflatex error, not a missing
     # image, so a brand-new report root with nothing in pics/ yet would fail to
