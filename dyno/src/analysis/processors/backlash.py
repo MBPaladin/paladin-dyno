@@ -607,6 +607,11 @@ class Backlash(Processor):
             'input_position_channel': in_pos_ch,
             'output_position_channel': out_pos_ch,
             'input_torque_zero_Nm': zero_ref,
+            # The commanded sawtooth amplitude. Recorded because the report
+            # states it in prose and the alternative is parsing it back out of
+            # `selection_reason`, which is a sentence and not an interface.
+            'cmd_torque_min_Nm': float(np.nanmin(tcmd)),
+            'cmd_torque_max_Nm': float(np.nanmax(tcmd)),
             'n_sweeps_found': len(rests) - 1,
             'n_sweeps_used': len(sweeps),
             'n_sweeps_dropped': len(dropped),

@@ -48,6 +48,11 @@ if [[ ! -f "$manifest" ]]; then
 # pics/ are written beside it, and every path below is relative to it, at any
 # depth. Render with:  dyno/utilities/report.sh <this directory>
 
+# What kind of device this report is about. Chooses the wording of the
+# introduction, the reading order of the sections, and which rows the summary
+# table carries. One of: motor (the default), gearbox.
+# type: gearbox
+
 # The logs this report covers. Available sections, with their roles:
 #
 #   torque_response: <log>          from the current_torque processor
@@ -60,12 +65,19 @@ if [[ ! -f "$manifest" ]]; then
 #   running_torque:                 from the running_torque processor
 #     drive_on: <log>
 #     drive_off: <log>              optional
+#   backlash: <log>                 from the backlash processor
+#   efficiency: <log>               from the efficiency processor
+#
+# List only the sections this report covers. Nothing is required and nothing
+# has to be listed in order: a gearbox report that is backlash and efficiency
+# alone renders as exactly those two sections, and the summary table carries
+# exactly their rows.
 #
 # A section with no variants can be written as a bare path instead of a
 # mapping, and drive_off may always be left out -- the tables and figures drop
 # the on/off distinction rather than leaving a hole.
 #
-# Example:
+# Example (motor):
 #
 #   sections:
 #     torque_response: blocked_rotor
@@ -75,6 +87,12 @@ if [[ ! -f "$manifest" ]]; then
 #     torque_ripple:
 #       drive_on: torque_ripple/basic
 #     running_torque: running_torque/backdriven
+#
+# Example (gearbox):
+#
+#   sections:
+#     backlash: backlash
+#     efficiency: efficiency
 
 sections: {}
 
@@ -92,6 +110,24 @@ sections: {}
 #   drive: Elmo Gold Drum 100A/100V
 #   supply_V: 52.2
 #   torque_cell_Nm: 20
+
+# For type: gearbox, the DUT block takes a ratio and a topology instead, and
+# the chain either side of it is described here. A gearbox sits between two
+# machines rather than against one, and which end is which is what says how to
+# read every torque in the report -- so it is stated rather than inferred.
+# Both sides are optional; whatever is given is written into the introduction.
+#
+# dut:
+#   supplier: Paladin Engineering
+#   topology: cycloidal
+#   gear_ratio: 26
+# drivetrain:
+#   input:                          # the high-speed side
+#     motor: 1 kW absorber motor
+#     torque_cell_Nm: 20
+#   output:                         # the low-speed side
+#     motor: 5 kW absorber motor
+#     torque_cell_Nm: 100
 
 # Which log feeds each cross-log row of the summary table. Report decisions,
 # not data ones -- the drive-on and drive-off runs measure different things.

@@ -537,8 +537,7 @@ class Efficiency(Processor):
             im = self._heatmap(ax, rows, cols, grid, ratio, 'viridis', vmin, vmax)
             fig.colorbar(im, ax=ax, label='Efficiency (%)')
         fig.suptitle(f'{labels["title"]} -- efficiency map at {ratio:g}:1 '
-                     '(rotations averaged; anything over 100% is a '
-                     'measurement error, not a machine)')
+                     '(rotations averaged)')
         fig.tight_layout()
         return fig
 
