@@ -1019,6 +1019,35 @@ class Efficiency(Processor):
                 'peak_at': (max(sel, key=lambda d: d['eff']) if sel else None),
             }
 
+        # The map's peak, which is a different question from the headline peak
+        # above and needs its own number. The headline is the best single dwell
+        # at or above the load floor; the map draws rotation-POOLED cells over
+        # EVERY load. Both differences move the answer, and in opposite
+        # directions -- a light-load cell the headline excludes can be the
+        # brightest square on the figure, while a single good dwell the
+        # headline reports gets averaged down against its counter-rotation
+        # partner before it is ever drawn. A reader skimming the figure and a
+        # reader reading the table then find numbers neither can locate in the
+        # other, so this is computed from _pool with the same key `_mode_grid`
+        # uses: whatever the figure shows, this is that cell.
+        map_peak = {}
+        for mode in _MODES:
+            pooled = self._pool([d for d in live if d['mode'] == mode],
+                                lambda d: (abs(d['v_cmd']), abs(d['t_cmd'])),
+                                lambda d: d['eff'])
+            usable = {k: v for k, v in pooled.items() if np.isfinite(v)}
+            if not usable:
+                map_peak[mode] = {'peak': float('nan'), 'w_out': None,
+                                  't': None}
+                continue
+            (v_cmd, t_cmd), best = max(usable.items(), key=lambda kv: kv[1])
+            # Reported in the output frame, because that is how the map is
+            # labelled: its y ticks are |v_cmd| / ratio and its x ticks are
+            # |t_cmd|. Quoting the input speed here would send a reader looking
+            # for a row that is not on the axis.
+            map_peak[mode] = {'peak': best, 'w_out': v_cmd / ratio,
+                              't': t_cmd}
+
         # Direction asymmetry, restricted to the loads the headline trusts.
         asym = {}
         for mode in _MODES:
@@ -1123,6 +1152,19 @@ class Efficiency(Processor):
             'efficiency_backdrive_mean': head['backdrive']['mean'],
             'efficiency_backdrive_std': head['backdrive']['std'],
             'efficiency_backdrive_peak': head['backdrive']['peak'],
+            # Map-consistent peaks: rotation-pooled, every load, output frame.
+            # These are the numbers a reader can find on the efficiency map;
+            # the '_peak' pair above are per-dwell and load-gated.
+            'efficiency_forward_map_peak': map_peak['forward']['peak'],
+            'efficiency_forward_map_peak_at_output_rad_s':
+                map_peak['forward']['w_out'],
+            'efficiency_forward_map_peak_at_output_Nm':
+                map_peak['forward']['t'],
+            'efficiency_backdrive_map_peak': map_peak['backdrive']['peak'],
+            'efficiency_backdrive_map_peak_at_output_rad_s':
+                map_peak['backdrive']['w_out'],
+            'efficiency_backdrive_map_peak_at_output_Nm':
+                map_peak['backdrive']['t'],
             'asymmetry_forward_ccw_minus_cw': asym['forward'],
             'asymmetry_backdrive_ccw_minus_cw': asym['backdrive'],
             'loss_no_load_forward_Nm': fits['forward']['intercept'],
