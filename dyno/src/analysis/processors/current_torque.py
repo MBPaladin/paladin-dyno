@@ -285,9 +285,9 @@ class CurrentTorque(Processor):
         # not three ways of computing a constant. The whole-run estimate stays
         # the headline while it is enabled; whichever is first still enabled
         # takes over when it is not.
-        'km_scope_run':          (True, bool, 'Km over the whole run (the '
+        'km_scope_run':          (False, bool, 'Km over the whole run (the '
                                               'headline estimate)'),
-        'km_scope_first_cycle':  (True, bool, 'Km over the first '
+        'km_scope_first_cycle':  (False, bool, 'Km over the first '
                                               'positive/negative torque cycle '
                                               'only -- coldest winding'),
         'km_scope_torque_window': (True, bool, 'Km over a band of torque around '
