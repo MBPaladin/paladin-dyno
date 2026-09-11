@@ -299,31 +299,22 @@ class Cogging(Processor):
                         'explicitly to get them.')
             else:
                 res.add('info', 'ripple_order_detected',
-                        f'ripple_order auto-detected as {order}: the dominant '
-                        f'spatial order of {tch} vs angle in the {slow:g} '
-                        f'rad/s, {base_load:g} Nm dwell. This is a fold period, '
-                        f'not a motor property -- it may be a harmonic of the '
-                        f'true fundamental, and a single peak pick cannot rule '
-                        f'out time-locked content that only looks angle-locked '
-                        f'at this speed. Confirm against another speed plateau '
-                        f'before quoting it. Set ripple_order to override.')
+                        f'ripple_order auto-detected as {order}, the dominant '
+                        f'spatial order of {tch} vs angle in the {slow:g} rad/s, '
+                        f'{base_load:g} Nm dwell. It is a fold period, possibly a '
+                        f'harmonic of the true fundamental; confirm against '
+                        f'another plateau.')
 
         own = self._position_channel(segs[0], tmotor)
         if pch != own:
             res.add('warn', 'borrowed_angle_reference',
-                    f'The fold is referenced to {pch}, not the {tmotor} '
-                    f'encoder ({own or "none active"}). That is only sound if '
-                    f'the two shafts are rigidly coupled at 1:1 -- any lash or '
-                    f'wind-up between them shifts the angle by a varying '
-                    f'amount and smears the folded shape. Angles here are '
-                    f'{pch} angles; do not quote a feature at a mechanical '
-                    f'angle as if it were located on the {tmotor} rotor.')
+                    f'The fold is referenced to {pch}, not the {tmotor} encoder '
+                    f'({own or "none active"}), so it is only sound if the shafts '
+                    f'are rigidly coupled at 1:1. Angles here are {pch} angles.')
 
         res.add('info', 'slow_fold_only',
-                f'Angle-folded views use the {slow:g} rad/s plateau only: the '
-                f'torque path low-passes angle-locked ripple harder as speed '
-                f'(and hence its temporal frequency) rises, so faster dwells '
-                f'understate the pattern rather than re-measure it.')
+                f'Angle-folded views use the {slow:g} rad/s plateau only; faster '
+                f'dwells understate the pattern rather than re-measure it.')
 
         # -- 1) cogging vs mechanical angle @ slowest speed --------------------
         fig, ax = plt.subplots(figsize=(13, 7))
@@ -419,13 +410,10 @@ class Cogging(Processor):
         if not used_loads:
             res.add('warn', 'no_load_axis',
                     f'No load level reaches ratio_min_cmd '
-                    f'({params["ratio_min_cmd"]:g} Nm) -- commanded torque is '
-                    f'{loads[0]:g} Nm across the whole log, so there is no load '
-                    f'axis. The torque-ratio view is skipped and the '
-                    f'ripple-vs-load view carries a single point per speed. '
-                    f'The angle fold is unaffected: it is a valid no-load '
-                    f'cogging measurement, just not the speed x load grid this '
-                    f'processor is named for.')
+                    f'({params["ratio_min_cmd"]:g} Nm; commanded torque is '
+                    f'{loads[0]:g} Nm throughout), so the torque-ratio view is '
+                    f'skipped. The angle fold is still a valid no-load '
+                    f'measurement.')
         else:
             fig, ax = plt.subplots(figsize=(11, 7))
             for i, load in enumerate(used_loads):
@@ -455,24 +443,17 @@ class Cogging(Processor):
         if ratios:
             worst = min(ratios, key=lambda k: ratios[k])
             res.add('info', 'torque_tracking',
-                    f'Worst torque tracking is {ratios[worst]:.3f} of the '
-                    f'command at {worst[0]:g} rad/s, {worst[1]:g} Nm. A ratio '
-                    f'falling with speed is back-EMF eating voltage headroom '
-                    f'plus speed-dependent drag; a constant offset from 1.0 is '
-                    f'a kt or cell-scale error instead.')
+                    f'Worst torque tracking is {ratios[worst]:.3f} of the command '
+                    f'at {worst[0]:g} rad/s, {worst[1]:g} Nm.')
 
         # -- metrics -----------------------------------------------------------
         slow_pkpk = {f'{ld:g}Nm': pkpk.get((slow, ld)) for ld in loads} if order else {}
         if (order_source == 'specified' and detected_order > 0
                 and detected_order != order):
             res.add('info', 'ripple_order_disagrees',
-                    f'The fold uses the specified order {order}, but the '
-                    f'dominant spatial order of the {slow:g} rad/s, '
-                    f'{base_load:g} Nm dwell is {detected_order} at '
-                    f'{detected_amp:.4f} Nm. Neither is wrong on its own -- a '
-                    f'peak pick cannot separate a fundamental from a harmonic '
-                    f'-- but a report claiming the ripple is periodic at '
-                    f'{order} is not supported by this dwell alone.')
+                    f'The fold uses the specified order {order}, but the dominant '
+                    f'spatial order of the {slow:g} rad/s, {base_load:g} Nm dwell '
+                    f'is {detected_order} at {detected_amp:.4f} Nm.')
         res.metrics.update({
             'velocity_motor': vmotor,
             'torque_motor': tmotor,

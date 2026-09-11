@@ -254,26 +254,6 @@ class ELM3002(ScaledChannels):
             self._slave.sdo_write(index=0x1C13, subindex=ui+1, data=(obj).to_bytes(2, 'little'))  
         self._slave.sdo_write(index=0x1C13, subindex=0, data=(0x0004).to_bytes(2, 'little'))
 
-    def decode_status(self, status_word):
-        sw_bits = bin(status_word)[2:]
-        if len(sw_bits) < 8:
-            sw_bits = '0'*(8 - len(sw_bits))+sw_bits
-
-        status_codes = []
-
-        if sw_bits[-1] == '1':
-            status_codes.append('General Error')
-        if sw_bits[-2] == '1':
-            status_codes.append('Underrange')
-        if sw_bits[-3] == '1':
-            status_codes.append('Overrange')
-        if sw_bits[-5] == '1':
-            status_codes.append('Diagnostic message availible')
-        if sw_bits[-6] == '1':
-            status_codes.append('TxPDO Invalid state')
-
-        return status_codes
-
     def process_txpdo(self):
         '''Reads the latest input bytes from the slave and populates the TxPDO structure.'''
         if len(self._slave.input) == ctypes.sizeof(self._tx_pdo):
@@ -370,24 +350,6 @@ class EL3208:
         
         # Set Sync Manager count to 8 mapped PDOs
         self._slave.sdo_write(index=0x1C13, subindex=0, data=(0x08).to_bytes(1, 'little'))
-
-    def decode_status(self, status_word):
-        sw_bits = bin(status_word)[2:]
-        if len(sw_bits) < 16:
-            sw_bits = '0'*(16 - len(sw_bits))+sw_bits
-
-        status_codes = []
-
-        if sw_bits[-1] == '1':
-            status_codes.append('Underrange')
-        if sw_bits[-2] == '1':
-            status_codes.append('Overrange')
-        if sw_bits[-7] == '1':
-            status_codes.append('Error')
-        if sw_bits[-15] == '1':
-            status_codes.append('TxPDO Invalid Data')
-
-        return status_codes
 
     def is_sensor_valid(self, status_word):
         """Helper to quickly check if a sensor is plugged in and reading valid data."""
@@ -497,26 +459,6 @@ class ELM3004(ScaledChannels):
             
         # Set Sync Manager count to 4 mapped PDOs
         self._slave.sdo_write(index=0x1C13, subindex=0, data=(0x0008).to_bytes(2, 'little'))
-
-    def decode_status(self, status_word):
-        sw_bits = bin(status_word)[2:]
-        if len(sw_bits) < 8:
-            sw_bits = '0'*(8 - len(sw_bits))+sw_bits
-
-        status_codes = []
-
-        if sw_bits[-1] == '1':
-            status_codes.append('General Error')
-        if sw_bits[-2] == '1':
-            status_codes.append('Underrange')
-        if sw_bits[-3] == '1':
-            status_codes.append('Overrange')
-        if sw_bits[-5] == '1':
-            status_codes.append('Diagnostic message available')
-        if sw_bits[-6] == '1':
-            status_codes.append('TxPDO Invalid state')
-
-        return status_codes
 
     def process_txpdo(self):
         '''Reads the latest input bytes from the slave and populates the TxPDO structure.'''

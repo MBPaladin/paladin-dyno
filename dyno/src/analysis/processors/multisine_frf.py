@@ -228,10 +228,8 @@ class MultisineFRF(Processor):
         if not seg0.has('preamble_sample'):
             res.add('warn', 'no_sample_index',
                     "'preamble_sample' is not logged on this bench, so period "
-                    'boundaries were taken from raw sample counts. A single '
-                    'dropped frame shifts every later period and decoheres the '
-                    'average; add the preamble_sample log key to the bench '
-                    'config.')
+                    'boundaries came from raw sample counts; a dropped frame '
+                    'decoheres the average.')
 
         attached = seg0.attached_label(params['role'])
         tag = f" [{attached}]" if attached else ''
@@ -295,22 +293,17 @@ class MultisineFRF(Processor):
             med_noise = float(np.median(noise))
             if med_odd > 5.0 * med_noise:
                 res.add('info', 'distortion_dominated',
-                        f'block {block_i}{tag}: odd-order distortion on the '
-                        f'detection lines is {med_odd / max(med_noise, 1e-15):.0f}x '
-                        f'the noise floor ({med_odd * 1e3:.2f} mNm vs '
-                        f'{med_noise * 1e3:.3f} mNm) -- the excitation is '
-                        f'traversing backlash/friction and the FRF is a '
-                        f'describing function, not a linear measurement. '
-                        f'Compare a gentle-level run: if resonances move, the '
-                        f'deadband is being crossed.')
+                        f'block {block_i}{tag}: odd-order distortion is '
+                        f'{med_odd / max(med_noise, 1e-15):.0f}x the noise floor '
+                        f'({med_odd * 1e3:.2f} vs {med_noise * 1e3:.3f} mNm), so '
+                        f'the FRF is a describing function, not a linear '
+                        f'measurement.')
             else:
                 res.add('info', 'near_linear',
-                        f'block {block_i}{tag}: distortion lines sit near the '
-                        f'noise floor, so the response is effectively linear -- '
-                        f'which at standstill usually means the excitation '
-                        f'stayed inside the backlash deadband and the FRF '
-                        f'describes the exciter rotor, cell, and fixture with '
-                        f'the far side disconnected.')
+                        f'block {block_i}{tag}: distortion sits near the noise '
+                        f'floor, so the response is effectively linear -- at '
+                        f'standstill, usually the excitation staying inside the '
+                        f'backlash deadband.')
 
             # Resonances: |H| local maxima over the sparse line grid, gated on
             # coherence and prominence.
@@ -372,8 +365,7 @@ class MultisineFRF(Processor):
             res.add('info', 'resonances',
                     'Structural resonances at '
                     + ', '.join(f'{f:g} Hz' for f in resonances)
-                    + ' -- these are the horizontal lines worth overlaying on '
-                      "running_torque's spectrograms (resonance_overlay_hz).")
+                    + " (running_torque's resonance_overlay_hz).")
         return res
 
     # -- figures --------------------------------------------------------------

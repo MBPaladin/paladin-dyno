@@ -996,20 +996,6 @@ def _validate_breakaway(segment, limits=None):
     return issues
 
 
-def validate_recipe(recipe, limits=None, roles=None):
-    issues = []
-    if not recipe.get('segments'):
-        issues.append('Recipe has no segments')
-    issues.extend(validate_preamble(recipe.get('preamble'), roles))
-    seen = set()
-    for seg in recipe.get('segments', []):
-        if seg['id'] in seen:
-            issues.append(f"Duplicate segment id: {seg['id']}")
-        seen.add(seg['id'])
-        issues.extend(f"[{seg['id']}] {msg}" for msg in validate_segment(seg, limits))
-    return issues
-
-
 # --- serialization ----------------------------------------------------------
 
 def _csv_text(cols, rows):

@@ -492,10 +492,8 @@ class CurrentTorque(Processor):
                 'maybe',
                 f'only {100 * frac:.1f}% of samples are stationary (below the '
                 f'{100 * d["min_stationary_frac"]:.0f}% preferred), but the '
-                f'{n_still} that are still span {span:.2f} A of {cch} and '
-                f'correlate {corr:.4f} with {tch}, so the sweep is covered. '
-                f'Motion is intermittent rather than a steady rotation: '
-                f'{peaks}', params)
+                f'{n_still} that are span {span:.2f} A of {cch} and correlate '
+                f'{corr:.4f} with {tch}: {peaks}', params)
         return Applicability(
             'yes',
             f'{100 * frac:.1f}% of samples stationary{moving_note}; {cch} spans '
@@ -780,27 +778,17 @@ class CurrentTorque(Processor):
         peak_p = float(np.max(power[ok]))
         spec_km = self._spec_sheet_km(seg.device_params(motor), params)
         res.add('info', 'motor_constant',
-                f'{motor} motor constant Km = {km_hi:.4f} Nm/sqrt(W), the median '
-                f'of T/sqrt(P) over {scopes[0]["detail"]} '
-                f'({scopes[0]["n"]} samples).'
-                + (f' Independently, kt/sqrt(R_eff) = {km_fit:.4f} Nm/sqrt(W) from '
-                   f'the fitted kt and the R_eff below'
-                   f' ({100 * (km_fit - km_hi) / km_hi:+.1f}% vs the pointwise '
-                   f'median).' if km_fit else '')
-                + f' Electrical power is {v_supply:g} V x {ch}, peaking at '
-                  f'{peak_p:.0f} W. Valid because the rotor is blocked: with no '
-                  f'mechanical output every watt is loss, which is the quantity '
-                  f'Km is defined against.'
-                + (f' Km peaks at {km_plateau:.4f} Nm/sqrt(W) around '
-                   f'{km_plateau_t:.2f} Nm, between the low-torque rolloff and '
-                   f'the onset of saturation; the headline median is lower '
-                   f'because the gate includes the saturating end on purpose.'
+                f'{motor} Km = {km_hi:.4f} Nm/sqrt(W), median of T/sqrt(P) over '
+                f'{scopes[0]["detail"]} ({scopes[0]["n"]} samples). '
+                f'P = {v_supply:g} V x {ch}, peak {peak_p:.0f} W.'
+                + (f' kt/sqrt(R_eff) = {km_fit:.4f} '
+                   f'({100 * (km_fit - km_hi) / km_hi:+.1f}%).' if km_fit else '')
+                + (f' Plateau {km_plateau:.4f} at {km_plateau_t:.2f} Nm.'
                    if km_plateau else ''))
 
         # The other windows the same T/sqrt(P) can be read over. Reported
         # together, as one finding: the individual numbers matter less than
-        # whether they agree, and a reader comparing them across three separate
-        # findings would have to do that arithmetic themselves.
+        # whether they agree.
         if len(scopes) > 1:
             rows = '\n'.join(
                 f'      {sc["label"]:<22} Km = {sc["km"]:.4f} Nm/sqrt(W)  '
@@ -810,64 +798,36 @@ class CurrentTorque(Processor):
                 + ')'
                 for sc in scopes)
             res.add('info', 'motor_constant_scopes',
-                    f'Km read over {len(scopes)} different sample sets, headline '
-                    f'first:\n\n{rows}\n\n'
-                    f'They come from the same T/sqrt(P), so the spread between '
-                    f'them is not method: it is the winding heating through the '
-                    f'run and Km varying with operating point. The first cycle '
-                    f'is the coldest data available and reads highest; a fixed '
-                    f'torque window removes the operating-point term so what is '
-                    f'left of its gap to the run median is thermal. Each is '
-                    f'switched by its own km_scope_* parameter.')
+                    f'Km by sample set, headline first:\n\n{rows}')
 
-        # Measured vs datasheet, quoted against the plateau as well as the
-        # headline: a datasheet Km is kt/sqrt(R) at one temperature with no
-        # standstill overhead in it, which is what the plateau approximates and
-        # what the headline median deliberately does not.
         km_delta_pct = None
         if spec_km:
             km_delta_pct = 100 * (km_hi - spec_km) / spec_km
             res.add('info', 'km_vs_spec_sheet',
-                    f'Measured Km = {km_hi:.4f} Nm/sqrt(W) vs the {spec_km:g} '
-                    f'Nm/sqrt(W) spec-sheet value for {motor}: '
+                    f'Km {km_hi:.4f} vs spec {spec_km:g} Nm/sqrt(W) for {motor}: '
                     f'{km_delta_pct:+.2f}%.'
-                    + (f' The plateau ({km_plateau:.4f}) is '
-                       f'{100 * (km_plateau - spec_km) / spec_km:+.2f}% of spec, '
-                       f'and is the fairer comparison: the datasheet number '
-                       f'carries no standstill overhead.' if km_plateau else '')
-                    + (f' The first torque cycle, the coldest data in the run '
-                       f'and the closest to a datasheet condition, gives '
+                    + (f' Plateau {100 * (km_plateau - spec_km) / spec_km:+.2f}%.'
+                       if km_plateau else '')
+                    + (f' First cycle '
                        f'{100 * (by_key["first_cycle"]["km"] - spec_km) / spec_km:+.2f}%.'
                        if 'first_cycle' in by_key
                        and by_key['first_cycle'] is not scopes[0] else '')
-                    + (f' kt/sqrt(R_eff) gives '
+                    + (f' kt/sqrt(R_eff) '
                        f'{100 * (km_fit - spec_km) / spec_km:+.2f}%.'
                        if km_fit else ''))
 
         res.add('info', 'motor_constant_power_fit',
                 f'Bus power fits P = {p0_fit:.2f} + {r_eff:.4f}*I^2 W against '
-                f'{cch} (R2 = {p_r2:.5f}). R_eff = {r_eff:.4f} ohm is not a phase '
-                f'resistance -- the drive reports one scalar current for a '
-                f'three-phase machine, so it absorbs the phase count and the '
-                f'drive\'s amplitude convention. It is the constant that converts '
-                f'that reported current into watts, which is what Km needs.')
+                f'{cch} (R2 = {p_r2:.5f}).')
 
         if p0 is not None:
             res.add('info', 'motor_constant_standstill_power',
-                    f'The drive draws {p0:.2f} W with the motor commanded to '
-                    f'nothing ({100 * p0 / peak_p:.1f}% of the {peak_p:.0f} W '
-                    f'peak). That overhead is inside the clamp reading, so every '
-                    f'pointwise Km above charges it to the motor -- which is why '
-                    f'Km rolls off toward zero torque in the figures rather than '
-                    f'flattening. Netting it out gives '
-                    + (f'Km = {km_net_hi:.4f} Nm/sqrt(W) '
-                       f'({100 * (km_net_hi - km_hi) / km_hi:+.1f}%), reported '
-                       f'as km_net_of_standstill_Nm_per_sqrtW.' if km_net_hi else
-                       'no usable samples.')
-                    + f' The fit\'s own intercept is {p0_fit:.2f} W; it differs '
-                      f'because the parabola is fitted across the full sweep, '
-                      f'including the saturating end where the loss stops being '
-                      f'purely resistive.')
+                    f'Standstill draw {p0:.2f} W ({100 * p0 / peak_p:.1f}% of the '
+                    f'{peak_p:.0f} W peak; fit intercept {p0_fit:.2f} W). '
+                    + (f'Net of it, Km = {km_net_hi:.4f} Nm/sqrt(W) '
+                       f'({100 * (km_net_hi - km_hi) / km_hi:+.1f}%) as '
+                       f'km_net_of_standstill_Nm_per_sqrtW.' if km_net_hi else
+                       'No usable samples net of it.'))
 
         # Always the run-wide gate, never the headline scope: the drift check
         # asks whether Km walks between torques revisited minutes apart, so
@@ -877,36 +837,24 @@ class CurrentTorque(Processor):
         if drift:
             level = 'warn' if abs(drift['km_pct']) > 5.0 else 'info'
             res.add(level, 'motor_constant_drift',
-                    f'Km drifts {drift["km_pct"]:+.1f}% across the '
-                    f'{drift["span_s"]:.0f} s of this run, so the single number '
-                    f'above is a run average and not a property of the motor at '
-                    f'any one temperature.'
-                    + (f' Between the first and last fifth of the run, at a '
-                       f'matched {drift["ref_current_A"]:.1f} A '
-                       f'({drift["ref_current_early_A"]:.2f} vs '
-                       f'{drift["ref_current_late_A"]:.2f} A actual), torque moves '
+                    f'Km drifts {drift["km_pct"]:+.1f}% across {drift["span_s"]:.0f} s, '
+                    f'so the headline is a run average.'
+                    + (f' First vs last fifth at a matched '
+                       f'{drift["ref_current_A"]:.1f} A: torque '
                        f'{drift["torque_pct"]:+.1f}% '
                        f'({drift["torque_first_Nm"]:.3f} -> '
-                       f'{drift["torque_last_Nm"]:.3f} Nm) while bus power moves '
+                       f'{drift["torque_last_Nm"]:.3f} Nm), power '
                        f'{drift["power_pct"]:+.1f}% ({drift["power_first_W"]:.0f} -> '
-                       f'{drift["power_last_W"]:.0f} W). Since Km = kt/sqrt(R), and '
-                       f'at fixed current torque tracks kt while power tracks R, '
-                       f'those two predict {drift["km_predicted_pct"]:+.1f}% -- '
-                       f'against the {drift["km_pct"]:+.1f}% measured. The '
-                       f'agreement is the evidence that this is a heating winding '
-                       f'rather than a drifting cell tare or a sagging bus, and '
-                       f'that the resistance rise, not lost remanence, is doing '
-                       f'most of it.'
-                       if drift.get('ref_current_A') else '')
-                    + ' To measure Km rather than an average of it, sweep from '
-                      'cold and shorten the run, or dwell between sweeps.')
+                       f'{drift["power_last_W"]:.0f} W), which predict '
+                       f'{drift["km_predicted_pct"]:+.1f}% against the '
+                       f'{drift["km_pct"]:+.1f}% measured -- consistent with a '
+                       f'heating winding.'
+                       if drift.get('ref_current_A') else ''))
 
         if n_neg:
             res.add('info', 'motor_constant_negative_power',
                     f'{n_neg} samples ({100 * n_neg / int(ok.sum()):.1f}%) read '
-                    f'non-positive bus power and were dropped. At standstill there '
-                    f'is nothing to regenerate, so this is the clamp\'s offset and '
-                    f'noise about a near-zero reading, not power flowing backward.')
+                    f'non-positive bus power and were dropped.')
 
         res.metrics.update({
             'km_channel': ch,
@@ -1022,25 +970,18 @@ class CurrentTorque(Processor):
         if declared and declared != tch:
             if by_ch.get(declared, 0.0) >= 0.5:
                 res.add('info', 'absorber_cell_declared',
-                        f'Using {declared} for {dev} because the bench\'s ports: '
-                        f'block bolts that cell to its shaft, though {tch} '
+                        f'Using {declared} for {dev} (declared in ports:); {tch} '
                         f'correlates slightly better ({corr:.4f} vs '
-                        f'{by_ch[declared]:.4f}). On a single-shaft rig both read '
-                        f'the same torque.')
+                        f'{by_ch[declared]:.4f}).')
                 tch, corr = declared, by_ch[declared]
             else:
                 # Not a silent substitution: the operator would otherwise have to
                 # work out for themselves why this motor's kt came off the other
                 # shaft's sensor.
                 res.add('info', 'absorber_cell_substituted',
-                        f'{declared} is the cell the bench\'s ports: block bolts to '
-                        f'{dev}, but it correlates only '
-                        f'{by_ch.get(declared, float("nan")):.4f} with {cch} -- too '
-                        f'poorly to fit against. Using {tch} instead ({corr:.4f}), '
-                        f'which is valid while the two motors share a shaft with no '
-                        f'gearing between them and the cells. A cell whose full '
-                        f'scale dwarfs this sweep reads mostly noise, which is the '
-                        f'usual cause.')
+                        f'{declared} is declared for {dev} but correlates only '
+                        f'{by_ch.get(declared, float("nan")):.4f} with {cch}; '
+                        f'using {tch} instead ({corr:.4f}).')
 
         if corr < 0.5:
             res.add('warn', 'absorber_pairing_doubtful',
@@ -1059,20 +1000,14 @@ class CurrentTorque(Processor):
             ratio = 1.0
         if ratio != 1.0:
             res.add('warn', 'absorber_geared',
-                    f'{dev} is configured gear_ratio={ratio:g}, but this fit maps '
-                    f'{tch} to {cch} with no gear term. If that reduction is real '
-                    f'the kt below is the shaft-side value, larger than the '
-                    f'motor-side {seg.device_params(dev).get("motor_params", {}).get("kt")} '
-                    f'it is compared against by roughly that factor, and the '
-                    f'kt_vs_config delta is meaningless.')
+                    f'{dev} is configured gear_ratio={ratio:g} but this fit has no '
+                    f'gear term: kt below is shaft-side and kt_vs_config is '
+                    f'meaningless.')
 
         res.add('info', 'absorber_characterized',
-                f'{dev} held position while {motor} was swept, so its current is '
-                f'the reaction to the sweep rather than an independent excitation. '
-                f'Fitting {tch} against {cch} ({corr:.4f} correlation) gives {dev} '
-                f'its own kt from the same data. Ramp direction is taken from '
-                f'{motor}, so "up" and "down" mean the same physical sweep '
-                f'direction in both characterizations.')
+                f'{dev} reacted while {motor} was swept; fitting {tch} against '
+                f'{cch} ({corr:.4f} correlation) gives {dev} its own kt. Ramp '
+                f'direction is taken from {motor}.')
 
         metrics, summary = self._characterize(
             segs, dev, cch, tch, params, res,
@@ -1118,13 +1053,9 @@ class CurrentTorque(Processor):
                         f'continuous rating'
                         + (f', while its shaft still moved {err:.3f} rad'
                            if err else '')
-                        + f'. It is not strong enough to block the rotor at '
-                          f'this torque: {100 * n_moving / n_total:.0f}% of '
-                          f'samples were dropped as moving. The kt fitted from '
-                          f'what survived is usable, but reduce the sweep '
-                          f'amplitude or fit a stiffer fixture before trusting '
-                          f'the hysteresis and saturation numbers, which are '
-                          f'the ones a slipping fixture distorts.')
+                        + f'. {100 * n_moving / n_total:.0f}% of samples were '
+                          f'dropped as moving; hysteresis and saturation '
+                          f'numbers are unreliable.')
 
     def _spec_sheet_value(self, motor_params, params, key):
         """The datasheet `key` for this motor, or None.
@@ -1246,10 +1177,8 @@ class CurrentTorque(Processor):
             else:
                 res.add('warn', code('sign_unexpected'),
                         f'Measured kt is negative but {because} predicts positive '
-                        f'for {motor}. Torque negated so the numbers below are '
-                        f'usable, but check the torque-cell wiring and the '
-                        f'absorbers.yaml entry -- a mounting convention and a '
-                        f'wiring fault look identical here.')
+                        f'for {motor}. Torque negated; check the cell wiring and '
+                        f'the absorbers.yaml entry.')
             for b in blocks:
                 b['torque'] = -b['torque']
             all_t = -all_t
@@ -1258,10 +1187,8 @@ class CurrentTorque(Processor):
             # the same disagreement and stays just as worth knowing.
             res.add('warn', code('sign_unexpected_positive'),
                     f'Measured kt is positive but {because} predicts negative for '
-                    f'{motor}. The numbers below are unaffected, but the config '
-                    f'and the rig disagree about this motor\'s mounting -- check '
-                    f'the absorbers.yaml entry against how it is actually bolted '
-                    f'in.')
+                    f'{motor}. Numbers below are unaffected; check the '
+                    f'absorbers.yaml entry.')
 
         # -- fits ---------------------------------------------------------
         branches = []
@@ -1306,22 +1233,17 @@ class CurrentTorque(Processor):
             noise = seg.tare.get(tch, {}).get('stddev')
             noise_txt = (f' ({hysteresis / noise:.1f}x the {tch} tare noise of '
                          f'{noise:.3f} Nm)') if noise else ''
-            agree_txt = (
-                f' Measured about the tanh trend instead it is '
-                f'{hysteresis_tanh:.3f} Nm, so the loop is not an artifact of '
-                f'detrending a curved characteristic with a straight line.'
-                if hysteresis_tanh is not None else '')
+            agree_txt = (f' About the tanh trend, {hysteresis_tanh:.3f} Nm.'
+                         if hysteresis_tanh is not None else '')
             res.add('info', code('hysteresis'),
                     f'Up/down ramp offsets differ by {hysteresis:.3f} Nm'
-                    f'{noise_txt}.{agree_txt} kt differs by only {kt_dir_pct:.3f}% between '
-                    f'directions, so the slope is unaffected. Candidate sources: '
-                    f'magnetic hysteresis, fixture friction as windup reverses, '
-                    f'torque-cell hysteresis. Not attributed here.')
+                    f'{noise_txt}.{agree_txt} kt differs {kt_dir_pct:.3f}% between '
+                    f'directions.')
             if abs(pooled['linear']['offset_Nm']) < hysteresis / 4:
                 res.add('info', code('pooled_offset_cancels'),
-                        f'The pooled offset ({pooled["linear"]["offset_Nm"]:+.3f} Nm) '
-                        f'is much smaller than the branch gap because the two '
-                        f'branches cancel. Do not read it as an absence of bias.')
+                        f'Pooled offset ({pooled["linear"]["offset_Nm"]:+.3f} Nm) is '
+                        f'much smaller than the branch gap: the branches cancel, '
+                        f'so it is not an absence of bias.')
         else:
             res.add('warn', code('single_direction'),
                     'Only one ramp direction was fitted, so hysteresis could not '
@@ -1340,14 +1262,13 @@ class CurrentTorque(Processor):
             kt_spread = float(np.max(per_level) - np.min(per_level))
             res.add('info', code('park_angle_spread'),
                     f'kt across {len(positions)} park angles spans '
-                    f'{kt_spread:.4f} Nm/A ({100 * kt_spread / kt:.2f}%). This '
-                    f'spread is the cogging contribution to kt and is a more '
-                    f'honest error bar than the fit standard error.')
+                    f'{kt_spread:.4f} Nm/A ({100 * kt_spread / kt:.2f}%) -- the '
+                    f'cogging contribution to kt.')
         else:
             res.add('warn', code('single_park_angle'),
-                    'Only one rotor position was measured, so the cogging '
-                    'contribution to kt is unquantified. kt here is specific to '
-                    'this electrical angle.')
+                    'Only one rotor position was measured: kt is specific to this '
+                    'electrical angle and the cogging contribution is '
+                    'unquantified.')
 
         # -- saturation ---------------------------------------------------
         max_i = float(np.max(np.abs(all_i)))
@@ -1357,21 +1278,19 @@ class CurrentTorque(Processor):
         if not sat_ok and tanh_A:
             reach = abs(tanh_A) / max(float(np.max(np.abs(all_t))), 1e-9)
             res.add('warn', code('saturation_not_exercised'),
-                    f'Peak current is {max_i:.2f} A, '
-                    f'{100 * util:.0f}% of i_cont ({i_cont} A). '
-                    f'The tanh saturation torque A = {tanh_A:.1f} Nm is '
-                    f'extrapolated {reach:.1f}x beyond the measured range and '
-                    f'must not be quoted. A and B are near-degenerate here '
-                    f'(correlation {pooled["tanh"].get("AB_correlation", float("nan")):.4f}); '
-                    f'only their product, the small-signal kt, is constrained.')
+                    f'Peak current is {max_i:.2f} A, {100 * util:.0f}% of i_cont '
+                    f'({i_cont} A). Tanh A = {tanh_A:.1f} Nm is extrapolated '
+                    f'{reach:.1f}x beyond the data and must not be quoted; A and B '
+                    f'are near-degenerate (correlation '
+                    f'{pooled["tanh"].get("AB_correlation", float("nan")):.4f}), so '
+                    f'only the small-signal kt is constrained.')
 
         lin_r2 = pooled['linear']['r_squared']
         tanh_r2 = pooled['tanh'].get('r_squared')
         if tanh_r2 is not None and not sat_ok:
             res.add('info', code('model_choice'),
                     f'Linear R2 = {lin_r2:.5f} vs tanh R2 = {tanh_r2:.5f} '
-                    f'(delta {tanh_r2 - lin_r2:+.2e}). The tanh does not earn its '
-                    f'extra parameter on this data; use the linear kt.')
+                    f'(delta {tanh_r2 - lin_r2:+.2e}); use the linear kt.')
 
         # -- kt vs config: the headline ----------------------------------
         kt_delta_pct = None
@@ -1405,38 +1324,27 @@ class CurrentTorque(Processor):
             t_limit = mp.get('motor_limits', {}).get('torque')
             res.add('info', code('drive_params'),
                     f'Drive-ready constants for {motor}, from the pooled tanh '
-                    f'fit (kt = A*B, k_tanh = B -- the drive solves '
-                    f'I = arctanh(T*k_tanh/kt)/k_tanh, which is this same '
-                    f'curve):\n\n'
+                    f'fit:\n\n'
                     f'      motor_params: {{ kt: {drive["kt"]:.4f}, '
                     f'k_tanh: {drive["k_tanh"]:.6f} }}\n')
             if not sat_ok:
                 res.add('warn', code('drive_params_extrapolated'),
-                        f'Those constants are only as good as the saturation '
-                        f'they were fitted through, and this sweep did not '
-                        f'reach it. k_tanh is the extrapolated curvature; A and '
-                        f'B trade off almost perfectly here (correlation '
-                        f'{pooled["tanh"].get("AB_correlation", float("nan")):.4f}), '
-                        f'so their product kt is trustworthy but the split '
-                        f'between them is not. Prefer the linear kt with '
-                        f'k_tanh left near zero until a sweep drives this motor '
-                        f'into saturation.')
+                        f'This sweep did not reach saturation, so k_tanh is '
+                        f'extrapolated curvature (A/B correlation '
+                        f'{pooled["tanh"].get("AB_correlation", float("nan")):.4f}). '
+                        f'Prefer the linear kt with k_tanh near zero.')
             if t_limit and t_limit >= drive['asymptote_Nm']:
                 res.add('error', code('torque_limit_above_asymptote'),
                         f'Do not apply these constants as-is: '
-                        f'motor_limits.torque = {t_limit} Nm meets or exceeds '
-                        f'the tanh asymptote kt/k_tanh = '
-                        f'{drive["asymptote_Nm"]:.2f} Nm. The drive computes '
-                        f'arctanh(T*k_tanh/kt), which diverges there -- a '
-                        f'command at the limit would demand infinite or NaN '
-                        f'current. Raise the asymptote or lower the limit.')
+                        f'motor_limits.torque = {t_limit} Nm meets or exceeds the '
+                        f'tanh asymptote {drive["asymptote_Nm"]:.2f} Nm, where the '
+                        f'drive\'s arctanh diverges. Raise the asymptote or lower '
+                        f'the limit.')
             elif t_limit:
                 res.add('info', code('torque_limit_headroom'),
                         f'motor_limits.torque = {t_limit} Nm sits at '
                         f'{100 * t_limit / drive["asymptote_Nm"]:.0f}% of the '
-                        f'{drive["asymptote_Nm"]:.2f} Nm asymptote, so the '
-                        f'drive\'s arctanh stays in range across the commandable '
-                        f'span.')
+                        f'{drive["asymptote_Nm"]:.2f} Nm asymptote.')
 
         # -- usable peak torque -------------------------------------------
         # The end of the range where the motor still behaves like kt*I, which
@@ -1449,14 +1357,12 @@ class CurrentTorque(Processor):
             res.add('info', code('peak_torque'),
                     f'{motor} holds within '
                     f'{params["peak_torque_droop_pct"]:.0f}% of its '
-                    f'small-perturbation line up to '
-                    f'{peak["torque_Nm"]:.3f} Nm at '
+                    f'small-perturbation line up to {peak["torque_Nm"]:.3f} Nm at '
                     f'{peak["current_A"]:.2f} A'
-                    + (f', which is past the {float(np.max(np.abs(all_i))):.2f} A '
-                       f'this sweep reached -- the number is extrapolated from '
-                       f'the fitted curvature, not measured.' if beyond else
-                       f', inside the {float(np.max(np.abs(all_i))):.2f} A '
-                       f'measured here.'))
+                    + (f', extrapolated past the '
+                       f'{float(np.max(np.abs(all_i))):.2f} A measured.' if beyond
+                       else f', inside the {float(np.max(np.abs(all_i))):.2f} A '
+                            f'measured.'))
 
         # -- thermal ------------------------------------------------------
         # This motor's own sensor when the bench has one. The fallback to any
@@ -1480,10 +1386,8 @@ class CurrentTorque(Processor):
                     f'Peak torque {peak_t:.1f} Nm is {peak_t / t_cont:.1f}x the '
                     f'{t_cont} Nm continuous rating for {motor}, and '
                     f'{temp_ch or "no stator temperature channel"} is '
-                    f'{"all NaN" if temp_ch else "absent"}. Magnet remanence falls '
-                    f'with temperature, so kt drifts downward as the motor heats. '
-                    f'The trace path has no cooldown logic. Thermal drift cannot '
-                    f'be separated from cogging spread until this channel works.')
+                    f'{"all NaN" if temp_ch else "absent"}: thermal drift cannot '
+                    f'be separated from cogging spread.')
 
         # -- torque cell headroom ----------------------------------------
         cell = seg.tare.get(tch, {})
@@ -1528,11 +1432,9 @@ class CurrentTorque(Processor):
         units, units_declared = seg.current_units(motor)
         if not units_declared:
             res.add('info', code('current_units_assumed'),
-                    f'{motor} does not declare drive_params.current_units, so '
-                    f'every current here is labelled {units} by default. This is '
-                    f'a label, not a conversion -- nothing was rescaled. Set '
-                    f'current_units to peak or rms on this drive so the report '
-                    f'stops guessing.')
+                    f'{motor} does not declare drive_params.current_units; '
+                    f'currents are labelled {units} by default (a label, not a '
+                    f'conversion).')
         out.update({
             'motor': motor,
             'current_channel': cch,
@@ -1813,10 +1715,8 @@ class CurrentTorque(Processor):
             cyc = self._first_torque_cycle(tq_signed, peak_t, seg.dt, params)
             if cyc is None:
                 res.add('info', 'km_scope_first_cycle_absent',
-                        'km_scope_first_cycle is set, but the torque trace never '
-                        'reverses polarity above the deadband, so there is no '
-                        'positive/negative cycle to isolate. The other estimates '
-                        'are unaffected.')
+                        'km_scope_first_cycle is set but the torque trace never '
+                        'reverses above the deadband; no cycle to isolate.')
             else:
                 mask, lo, hi, s0 = cyc
                 first, second = ('positive', 'negative') if s0 > 0 else \
@@ -1826,9 +1726,8 @@ class CurrentTorque(Processor):
                     'color': 'tab:green', 'mask': mask & gated,
                     'detail': f'the first {first}/{second} torque cycle alone '
                               f'({hi - lo} samples spanning '
-                              f'{(hi - lo) * seg.dt:.1f} s of the run), with the '
-                              f'same {t_gate:.2f} Nm gate applied so it is '
-                              f'comparable to the run-wide number',
+                              f'{(hi - lo) * seg.dt:.1f} s), same {t_gate:.2f} Nm '
+                              f'gate',
                 })
 
         if params['km_scope_torque_window']:
@@ -1842,8 +1741,7 @@ class CurrentTorque(Processor):
                 'window': (centre - half, centre + half),
                 'centre_Nm': centre,
                 'detail': f'the samples within +/-{half:.2f} Nm of '
-                          f'{centre:.2f} Nm ({source}), which fixes the '
-                          f'operating point instead of the time window',
+                          f'{centre:.2f} Nm ({source})',
             })
 
         def measure(sc):
@@ -1863,8 +1761,7 @@ class CurrentTorque(Processor):
                 res.add('info', f'km_scope_{sc["key"]}_too_few',
                         f'The {sc["label"]} estimate covers only '
                         f'{int(sc["mask"].sum())} usable samples (under '
-                        f'{self.KM_MIN_SAMPLES}), so no Km was read from it. It '
-                        f'would have been the median over {sc["detail"]}.')
+                        f'{self.KM_MIN_SAMPLES}); no Km read from it.')
                 continue
             scopes.append(measure(sc))
 
@@ -1874,10 +1771,8 @@ class CurrentTorque(Processor):
             # returns the run-wide estimate rather than nothing and says that it
             # did. A km of 0 from an empty gate is caught by the caller.
             res.add('warn', 'km_scope_none',
-                    'Every Km estimator is disabled or came up empty, so the '
-                    'whole-run estimate was computed anyway -- the drift check, '
-                    'the spec-sheet comparison and the figures below are all '
-                    'quoted against it.')
+                    'Every Km estimator is disabled or came up empty; the '
+                    'whole-run estimate was used instead.')
             scopes.append(measure(run_scope))
         return scopes
 

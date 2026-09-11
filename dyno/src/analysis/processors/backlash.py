@@ -418,11 +418,10 @@ class Backlash(Processor):
                    if span_out > 1e-6 else float('nan'))
         if np.isfinite(implied) and abs(implied - ratio) / ratio > p['ratio_tol_pct'] / 100:
             res.add('warn', 'gear_ratio_mismatch',
-                    f'The travel in {in_pos_ch} vs {out_pos_ch} implies '
-                    f'{implied:.3f}:1, but the analysis is using {ratio:g}:1 from '
-                    f'the {ratio_source}. Every deflection, backlash and stiffness '
-                    f'number below scales with this ratio -- reconcile it before '
-                    f'quoting them.')
+                    f'Travel in {in_pos_ch} vs {out_pos_ch} implies {implied:.3f}:1 '
+                    f'but the analysis uses {ratio:g}:1 from the {ratio_source}; '
+                    f'every deflection, backlash and stiffness number scales with '
+                    f'it.')
         else:
             res.add('info', 'gear_ratio_confirmed',
                     f'Using {ratio:g}:1 from the {ratio_source}; the logged '

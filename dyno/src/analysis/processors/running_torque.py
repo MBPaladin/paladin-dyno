@@ -347,7 +347,6 @@ class RunningTorque(Processor):
         backdrive = str(params['driven_shaft']).lower().startswith('out')
 
         fs = sample_rate(np.concatenate([s['time'] for s in segs]))
-        naive_fs = 1.0 / seg.dt
 
         smooth_n = max(3, int(round(params['smooth_s'] * fs)))
 
@@ -366,11 +365,9 @@ class RunningTorque(Processor):
         if float(params['fmax_hz']) >= 0.49 * fs:
             res.add('warn', 'aliasing_possible',
                     f'fmax_hz={params["fmax_hz"]:g} is essentially Nyquist '
-                    f'({fs / 2:.0f} Hz) and there is no analog anti-alias '
-                    f'filter ahead of the cell: real content above '
-                    f'{fs / 2:.0f} Hz folds down and is indistinguishable from '
-                    f'a genuine line. Treat unexplained lines near the top of '
-                    f'the band with suspicion.')
+                    f'({fs / 2:.0f} Hz) with no analog anti-alias filter: '
+                    f'content above {fs / 2:.0f} Hz folds down as genuine '
+                    f'lines.')
 
         # -- gather, tare -------------------------------------------------
         v = np.concatenate([np.nan_to_num(s[vch], nan=0.0) for s in segs])
@@ -382,20 +379,16 @@ class RunningTorque(Processor):
         if params['tare_from_leadin'] and tare:
             tq = tq_raw - tare
             res.add('info', 'tared',
-                    f'{tch} read {tare:+.4f} Nm during the {lead_s:.1f} s stationary '
-                    f'lead-in with nothing commanded, so that is cell offset, not '
-                    f'drag, and it has been subtracted. It is '
-                    f'{100 * abs(tare) / max(float(np.std(tq_raw)), 1e-9):.0f}% of the '
-                    f'running signal RMS -- large enough to bias the Coulomb term '
-                    f'if left in.')
+                    f'{tch} read {tare:+.4f} Nm over the {lead_s:.1f} s stationary '
+                    f'lead-in ('
+                    f'{100 * abs(tare) / max(float(np.std(tq_raw)), 1e-9):.0f}% of '
+                    f'the running RMS); subtracted as cell offset.')
         else:
             tq = tq_raw
             if n_lead <= smooth_n:
                 res.add('warn', 'no_lead_in',
-                        f'No stationary lead-in found at the start of this log, so '
-                        f'{tch} could not be tared and there is no ambient noise '
-                        f'floor to reference the spectra against. Add a lead-in '
-                        f'(the builder\'s `lead_in_s`) to get both.')
+                        f'No stationary lead-in, so {tch} could not be tared and '
+                        f'the spectra have no noise floor to reference.')
 
         # Applied AFTER the tare, and to the drag path only. The tare is a cell
         # offset in the cell's own units, so it has to come off before the
@@ -406,11 +399,9 @@ class RunningTorque(Processor):
         if invert:
             tq = -tq
             res.add('info', 'torque_sign_inverted',
-                    f'invert_torque_sign is set, so {tch} has been negated after '
-                    f'taring: drag now reads negative while turning positive. The '
-                    f'Coulomb and viscous magnitudes are unchanged -- this flips '
-                    f'the signed per-direction intercepts and slopes, and the drag '
-                    f'curve\'s quadrants, nothing else.')
+                    f'invert_torque_sign is set, so {tch} was negated after '
+                    f'taring. Magnitudes are unchanged; signed intercepts, slopes '
+                    f'and the drag curve quadrants flip.')
 
         # -- drag curve ----------------------------------------------------
         bw = params['vel_bin_rad_s']
@@ -419,10 +410,8 @@ class RunningTorque(Processor):
             # wrong for both a 20 s and a 200 s run.
             bw = _nice_bin(float(v.max() - v.min()))
             res.add('info', 'derived_vel_bin',
-                    f'vel_bin_rad_s derived as {bw:g} rad/s: the sweep spans '
-                    f'{float(v.max() - v.min()):.2f} rad/s and ~50 bins keeps '
-                    f'each one above min_bin_samples while resolving the drag '
-                    f'curve. Set vel_bin_rad_s explicitly to override.')
+                    f'vel_bin_rad_s derived as {bw:g} rad/s (~50 bins over the '
+                    f'{float(v.max() - v.min()):.2f} rad/s sweep).')
         edges = np.arange(np.floor(v.min() / bw) * bw,
                           np.ceil(v.max() / bw) * bw + bw, bw)
         centers = 0.5 * (edges[:-1] + edges[1:])
@@ -456,20 +445,18 @@ class RunningTorque(Processor):
             # Coulomb number from the difference.
             if np.sign(fit['pos'][1]) == np.sign(fit['neg'][1]):
                 res.add('warn', 'drag_does_not_oppose',
-                        f'The two branch intercepts have the same sign '
-                        f'({fit["pos"][1]:+.3f} and {fit["neg"][1]:+.3f} Nm). Drag '
-                        f'reverses with direction, so this is a residual bias in '
-                        f'{tch}, not friction. The Coulomb figure below is not '
-                        f'trustworthy.')
+                        f'Branch intercepts have the same sign '
+                        f'({fit["pos"][1]:+.3f} and {fit["neg"][1]:+.3f} Nm): '
+                        f'residual bias in {tch}, not friction. Coulomb below is '
+                        f'not trustworthy.')
             elif np.sign(fit['pos'][1]) > 0:
                 res.add('info', 'cell_sign',
-                        f'{tch} reads positive while turning positive, i.e. it '
-                        f'reports the torque the motor applies rather than the '
-                        f'drag reacting to it. Magnitudes are unaffected; set '
-                        f'invert_torque_sign=true to flip the drag curve into the '
-                        f'drag-opposes-motion convention.'
-                        + (' (invert_torque_sign is already set, so the cell\'s raw '
-                           'convention was the opposite of this.)' if invert else ''))
+                        f'{tch} reads positive while turning positive (applied '
+                        f'torque, not reacting drag). Magnitudes unaffected; set '
+                        f'invert_torque_sign=true for the drag-opposes-motion '
+                        f'convention.'
+                        + (' (already set, so the raw convention was the '
+                           'opposite.)' if invert else ''))
         else:
             res.add('warn', 'single_direction',
                     f'Only one rotation direction cleared |w| >= {fmin_v} rad/s, so '
@@ -502,21 +489,17 @@ class RunningTorque(Processor):
             fit = {tag: (slope, intercept - cell_bias)
                    for tag, (slope, intercept) in fit.items()}
             res.add('info', 'symmetric_bias_removed',
-                    f'symmetric_drag is set, so the {cell_bias:+.4f} Nm common-mode '
-                    f'offset between the two flank intercepts is read as {tch} bias, '
-                    f'not as direction-dependent friction, and has been subtracted. '
-                    f'The origin now sits midway between the flanks and they read '
-                    f'{fit["pos"][1]:+.3f} / {fit["neg"][1]:+.3f} Nm. That bias is '
-                    f'{100 * abs(cell_bias) / max(coulomb, 1e-9):.0f}% of the '
-                    f'{coulomb:.3f} Nm Coulomb term; Coulomb and viscous drag are '
-                    f'unchanged by it. If the drag really is asymmetric, this has '
-                    f'hidden that asymmetry -- clear symmetric_drag to see it.')
+                    f'symmetric_drag: the {cell_bias:+.4f} Nm common-mode offset '
+                    f'between the flank intercepts was subtracted as {tch} bias '
+                    f'({100 * abs(cell_bias) / max(coulomb, 1e-9):.0f}% of the '
+                    f'{coulomb:.3f} Nm Coulomb term). Flanks now read '
+                    f'{fit["pos"][1]:+.3f} / {fit["neg"][1]:+.3f} Nm; any real '
+                    f'asymmetry is hidden with it.')
         elif symmetric:
             res.add('warn', 'symmetric_bias_unavailable',
                     f'symmetric_drag is set but only one direction cleared '
-                    f'|w| >= {fmin_v} rad/s, so there is no second flank to centre '
-                    f'against and no bias could be removed. The drag curve is '
-                    f'uncorrected.')
+                    f'|w| >= {fmin_v} rad/s: no second flank to centre against, '
+                    f'drag curve uncorrected.')
 
         vpeak = float(np.max(np.abs(v)))
         drag_at_peak = coulomb + viscous * vpeak
@@ -532,10 +515,9 @@ class RunningTorque(Processor):
             worst = float(np.nanmax(bripple[fitted] / np.abs(bmean[fitted])))
             if worst > 1.0:
                 res.add('warn', 'ripple_limited_bins',
-                        f'In the worst velocity bin the ripple RMS is {worst:.1f}x '
-                        f'the mean torque there. Quote the fitted Coulomb and '
-                        f'viscous terms, which pool every bin; do not read a drag '
-                        f'number off a single bin at the top of the sweep.')
+                        f'Worst velocity bin has ripple RMS {worst:.1f}x its mean '
+                        f'torque; quote the pooled Coulomb and viscous terms, not '
+                        f'a single bin.')
 
         # -- spectra --------------------------------------------------------
         win_n = int(params['stft_win'])
@@ -553,11 +535,9 @@ class RunningTorque(Processor):
             t_win = 1.0 / np.sqrt(dfdt) if dfdt > 0 else 1.0
             win_n = int(2 ** np.clip(np.round(np.log2(t_win * fs)), 7, 11))
             res.add('info', 'derived_stft_win',
-                    f'stft_win derived as {win_n} samples ({win_n / fs:.2f} s): '
-                    f'the sweep moves |w| at ~{sweep_rate:.2f} rad/s^2, so the '
-                    f'{o_max:g}x order drifts at {dfdt:.2f} Hz/s and a window '
-                    f'longer than 1/sqrt(df/dt) = {t_win:.2f} s would smear it '
-                    f'past one bin width. Set stft_win explicitly to override.')
+                    f'stft_win derived as {win_n} samples ({win_n / fs:.2f} s): the '
+                    f'{o_max:g}x order drifts at {dfdt:.2f} Hz/s, so a window past '
+                    f'1/sqrt(df/dt) = {t_win:.2f} s would smear it.')
         hop = max(1, int(round(win_n * (1.0 - float(params['stft_overlap'])))))
         spec = self._spectra(segs, tch, vch, vcmd_ch, tare, fs, win_n, hop, params)
 
@@ -579,19 +559,16 @@ class RunningTorque(Processor):
 
         if floor is None:
             res.add('warn', 'no_noise_floor',
-                    f'The stationary lead-in held fewer than '
-                    f'{params["min_static_frames"]} whole STFT windows '
-                    f'({lead_s:.1f} s at a {win_n / fs:.2f} s window), so no ambient '
-                    f'floor could be measured and the floor-referenced figures are '
-                    f'skipped. Either lengthen the lead-in or shorten stft_win.')
+                    f'The lead-in held fewer than {params["min_static_frames"]} '
+                    f'whole STFT windows ({lead_s:.1f} s at {win_n / fs:.2f} s), so '
+                    f'floor-referenced figures are skipped.')
         else:
             snr = dom_amp / max(float(floor[dom_i]), 1e-12)
             res.add('info', 'dominant_line',
-                    f'The strongest ripple line while turning is {dom_hz:.1f} Hz at '
-                    f'{dom_amp:.3f} Nm, {snr:.0f}x the ambient floor at that '
-                    f'frequency ({float(floor[dom_i]):.4f} Nm). At peak speed '
-                    f'({vpeak:.2f} rad/s) that is order {dom_hz / (vpeak / _TWO_PI):.1f} '
-                    f'of the driven shaft'
+                    f'Strongest ripple line is {dom_hz:.1f} Hz at {dom_amp:.3f} Nm, '
+                    f'{snr:.0f}x the ambient floor ({float(floor[dom_i]):.4f} Nm). '
+                    f'At peak speed ({vpeak:.2f} rad/s) that is order '
+                    f'{dom_hz / (vpeak / _TWO_PI):.1f} of the driven shaft'
                     + (f', order {dom_hz / (ratio * vpeak / _TWO_PI):.1f} of the '
                        f'{"input" if backdrive else "output"} shaft at {ratio:g}:1.'
                        if ratio != 1 else '.'))
@@ -602,9 +579,8 @@ class RunningTorque(Processor):
         if not sbw:
             sbw = _nice_bin(vpeak)
             res.add('info', 'derived_speed_bin',
-                    f'speed_bin_rad_s derived as {sbw:g} rad/s (~50 bins over '
-                    f'the {vpeak:.2f} rad/s sweep). Set speed_bin_rad_s '
-                    f'explicitly to override.')
+                    f'speed_bin_rad_s derived as {sbw:g} rad/s (~50 bins over the '
+                    f'{vpeak:.2f} rad/s sweep).')
         s_edges = np.arange(0.0, np.ceil(vpeak / sbw) * sbw + sbw, sbw)
         s_centers = 0.5 * (s_edges[:-1] + s_edges[1:])
         s_bin = np.clip(np.digitize(f_speed, s_edges) - 1, 0, len(s_centers) - 1)
@@ -623,9 +599,8 @@ class RunningTorque(Processor):
         if ospec is None:
             res.add('warn', 'no_order_spectrum',
                     f'Fewer than 3 STFT frames ran above '
-                    f'{params["order_min_speed_frac"]:.0%} of peak speed, so the '
-                    f'order spectrum was skipped. Lengthen the dwell at speed, or '
-                    f'lower order_min_speed_frac and accept coarser order bins.')
+                    f'{params["order_min_speed_frac"]:.0%} of peak speed; order '
+                    f'spectrum skipped.')
         else:
             peaks = self._order_peaks(ospec['orders'], ospec['amp'],
                                       int(params['n_order_peaks']))
@@ -889,23 +864,19 @@ class RunningTorque(Processor):
 
         if not present:
             res.add('warn', 'ratio_no_harmonics',
-                    f'No harmonic of the configured {ratio:g}:1 ratio carries more '
-                    f'than 2x the background of the order spectrum. Either the '
-                    f'ratio is wrong or the ripple is not coming from the far '
-                    f'shaft. Compare the peaks in the RIPPLE ORDERS table against '
-                    f'candidate ratios before trusting any per-shaft number here.')
+                    f'No harmonic of the configured {ratio:g}:1 ratio clears 2x the '
+                    f'order-spectrum background: the ratio is wrong or the ripple '
+                    f'is not from the far shaft.')
             return
 
         odd = [n for n in present if n % 2]
         shown = ', '.join(f'{n}x={a:.3f}' for n, a in table if a > 2.0 * background)
-        weak_first = table[0][1] <= 2.0 * background
 
         if not odd:
             res.add('warn', 'ratio_ambiguous',
-                    f'Only even harmonics of {ratio:g}:1 carry energy ({shown} Nm). '
-                    f'That is equally consistent with {2 * ratio:g}:1, where the same '
-                    f'peaks would be 1x, 2x, 3x. This test cannot separate the two; '
-                    f'confirm the ratio from the gearbox itself.')
+                    f'Only even harmonics of {ratio:g}:1 carry energy ({shown} Nm), '
+                    f'equally consistent with {2 * ratio:g}:1. Confirm the ratio '
+                    f'from the gearbox itself.')
 
         # Coverage. The harmonic-presence test above only rules out doubling; it
         # says nothing about peaks the ratio leaves stranded, and a ratio that
@@ -926,21 +897,15 @@ class RunningTorque(Processor):
         half_on, _ = self._split_on_grid(top_orders, ratio, step, offset=0.5)
         if off > 0 and half_on > 0.6 * off and half_on > 0.25 * total:
             res.add('warn', 'ratio_may_be_halved',
-                    f'{ratio:g}:1 leaves {100 * off / total:.0f}% of the detected '
-                    f'ripple-order amplitude unexplained, and '
-                    f'{100 * half_on / off:.0f}% of that lands on HALF-integer '
-                    f'multiples of {ratio:g}. A single rotating shaft has no '
-                    f'half-integer orders, so the far shaft is probably turning at '
-                    f'{ratio / 2:g}x the driven shaft, not {ratio:g}x -- with its 1x '
-                    f'weak and 2x dominating, which is what made {ratio:g} look '
-                    f'right. Try gear_ratio={ratio / 2:g}.')
+                    f'{ratio:g}:1 leaves {100 * off / total:.0f}% of the ripple-order '
+                    f'amplitude unexplained and {100 * half_on / off:.0f}% of that '
+                    f'lands on half-integer multiples, which a single shaft cannot '
+                    f'produce. Try gear_ratio={ratio / 2:g}.')
         elif on / total < 0.6:
             res.add('warn', 'ratio_poor_coverage',
                     f'{ratio:g}:1 accounts for only {100 * on / total:.0f}% of the '
-                    f'detected ripple-order amplitude, and the remainder is not at '
-                    f'half-integers either, so halving would not help. Read the '
-                    f'orders off the RIPPLE ORDERS table directly rather than '
-                    f'trusting the per-shaft column.')
+                    f'ripple-order amplitude, and the rest is not at half-integers '
+                    f'either. Read the RIPPLE ORDERS table directly.')
 
     def _order_peaks(self, orders, amp, n, min_order=1.0):
         """Tallest local maxima, one per resolution-limited neighbourhood.
@@ -1030,12 +995,10 @@ class RunningTorque(Processor):
         got = f_fast / f_slow
         if abs(got - 1.0) < 0.15 * abs(expected - 1.0) + 0.05:
             res.add('info', 'dominant_is_resonance',
-                    f'The strongest line barely moves with speed ({f_slow:.1f} Hz '
-                    f'at {v_slow:.1f} rad/s vs {f_fast:.1f} Hz at {v_fast:.1f} rad/s, '
-                    f'a {got:.2f}x shift where an order would give {expected:.2f}x). '
-                    f'That is a fixed structural resonance being excited, not a '
-                    f'gearbox order. Its amplitude vs speed therefore says where '
-                    f'an order crosses it, not how bad the mesh is.')
+                    f'The strongest line barely moves with speed ({f_slow:.1f} Hz at '
+                    f'{v_slow:.1f} rad/s vs {f_fast:.1f} Hz at {v_fast:.1f} rad/s, a '
+                    f'{got:.2f}x shift where an order would give {expected:.2f}x): a '
+                    f'fixed resonance, not a gearbox order.')
         elif abs(got - expected) < 0.15 * expected:
             res.add('info', 'dominant_is_order',
                     f'The strongest line tracks speed ({f_slow:.1f} Hz at '
@@ -1046,10 +1009,9 @@ class RunningTorque(Processor):
         else:
             res.add('info', 'dominant_ambiguous',
                     f'The strongest line moves {got:.2f}x between the slow and fast '
-                    f'halves of the sweep where a pure order would move {expected:.2f}x '
-                    f'and a pure resonance 1.00x ({dom_hz:.1f} Hz overall). Most '
-                    f'likely an order sweeping through a resonance; read it off the '
-                    f'speed-folded figures rather than from this number.')
+                    f'halves where an order would move {expected:.2f}x and a '
+                    f'resonance 1.00x ({dom_hz:.1f} Hz overall): likely an order '
+                    f'sweeping through a resonance.')
 
     # -- figures -------------------------------------------------------------
 

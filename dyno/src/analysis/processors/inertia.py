@@ -375,9 +375,7 @@ class Inertia(Processor):
             return Applicability(
                 'no', f'no span contained a usable up-ramp/down-ramp pair '
                       f'({n_br} constant-alpha branch(es) found, {rejected} more '
-                      f'rejected as not constant-acceleration). This analysis wants '
-                      f'each repeat to ramp up and back down within one span, both '
-                      f'at a steady alpha')
+                      f'rejected as not constant-acceleration)')
 
         alphas = np.array([d['alpha_mag'] for d in pairs])
         n_groups = len(_cluster(alphas))
@@ -404,9 +402,7 @@ class Inertia(Processor):
         sign, why_sign = self._sign(C, w, acc, params)
         res.add('info', 'channels',
                 f'Shaft speed from {vch}, torque from {tch} with sign {sign:+.0f} '
-                f'({why_sign}). The sign only has to make forward driving read '
-                f'positive; the estimator below is a difference, so a cell offset '
-                f'does not enter at all.')
+                f'({why_sign}).')
 
         by_span, rejected = self._branches(segs, vch, tch, params, fs, sign)
         pairs = self._pairs(by_span, params)
@@ -465,13 +461,12 @@ class Inertia(Processor):
                     f'it; it is not what this report stands behind.')
         else:
             res.add('warn', 'single_acceleration',
-                    f'Every ramp pair ran at the same acceleration '
-                    f'({alphas.mean():.0f} rad/s^2), so there is no '
-                    f'between-acceleration spread and no systematic error bar. The '
-                    f'repeats agree to {np.std([d["J"] for d in pairs], ddof=1) * 1e3:.4f}'
-                    f'e-3 kg.m^2, but that is repeatability only -- it cannot see a '
-                    f'bias that is common to every ramp. Run at least two '
-                    f'accelerations to get a real uncertainty.')
+                    f'Every ramp pair ran at {alphas.mean():.0f} rad/s^2, so there '
+                    f'is no between-acceleration spread and no systematic error '
+                    f'bar. Repeats agree to '
+                    f'{np.std([d["J"] for d in pairs], ddof=1) * 1e3:.4f}e-3 '
+                    f'kg.m^2 -- repeatability only. Run at least two '
+                    f'accelerations.')
 
         # -- is the scatter small enough for the mean to mean anything? --------
         # The pooling above averages 4 pairs into a group mean and then 7 group
@@ -494,35 +489,24 @@ class Inertia(Processor):
         if scatter_frac > _SCATTER_WARN_FRAC:
             jv = np.array([d['J'] for d in pairs]) - structure
             res.add('warn', 'pairs_disagree',
-                    f'The individual ramp pairs scatter by {repeat * 1e3:.4f}e-3 '
-                    f'kg.m^2 within a single acceleration -- '
-                    f'{100 * scatter_frac:.0f}% of the reported '
-                    f'{"J_motor" if structure else "J_test"}, spanning '
-                    f'{jv.min() * 1e3:.4f}e-3 to {jv.max() * 1e3:.4f}e-3 across the '
-                    f'{len(pairs)} pairs. Repeats of one acceleration are the same '
-                    f'measurement made twice, so they should agree to a few percent; '
-                    f'at this level the pooled J is an average of noise, and the '
-                    f'quoted error bar -- built from the group MEANS, which average '
-                    f'that noise away -- does not reflect it. Treat the headline '
-                    f'number as an order of magnitude, not a spec. The usual cause '
-                    f'is a string whose inertial torque J*alpha is down near the '
-                    f'cell noise: raise the ramp acceleration, or measure a larger '
-                    f'assembly and subtract.')
+                    f'Ramp pairs scatter by {repeat * 1e3:.4f}e-3 kg.m^2 within a '
+                    f'single acceleration -- {100 * scatter_frac:.0f}% of the '
+                    f'reported {"J_motor" if structure else "J_test"}, spanning '
+                    f'{jv.min() * 1e3:.4f}e-3 to {jv.max() * 1e3:.4f}e-3 across '
+                    f'{len(pairs)} pairs. The quoted error bar is built from the '
+                    f'group means and does not reflect this. Treat the headline as '
+                    f'an order of magnitude; raise the ramp acceleration.')
         if n_neg:
             res.add('warn', 'negative_pairs',
                     f'{n_neg} of {len(pairs)} ramp pair(s) returned a non-physical '
-                    f'J <= 0 and were still averaged in. A single pair cannot have '
-                    f'negative inertia, so those are noise excursions and their '
-                    f'presence means the per-pair uncertainty is at least as large '
-                    f'as J itself.')
+                    f'J <= 0 and were still averaged in: the per-pair uncertainty '
+                    f'is at least as large as J itself.')
 
         if J <= 0:
             res.add('error', 'negative_inertia',
-                    f'The pooled J came out NEGATIVE ({J * 1e3:.4f}e-3 kg.m^2), which '
-                    f'is not physical. The usual cause is the torque cell sign: '
-                    f'{tch} is being read with sign {sign:+.0f}, and the estimator '
-                    f'inverts with it. Force the other one with '
-                    f'torque_sign={-sign:+.0f} and check that the result is positive.')
+                    f'Pooled J is negative ({J * 1e3:.4f}e-3 kg.m^2). {tch} is read '
+                    f'with sign {sign:+.0f} and the estimator inverts with it; try '
+                    f'torque_sign={-sign:+.0f}.')
 
         # -- structure subtraction ---------------------------------------------
         # Every number above sees the whole test-side string. Removing the known
@@ -533,18 +517,15 @@ class Inertia(Processor):
         J_motor = J - structure
         if structure:
             res.add('info', 'structure_removed',
-                    f'structure_inertia={structure * 1e3:.4f}e-3 kg.m^2 has been '
-                    f'subtracted from the {J * 1e3:.4f}e-3 measured for the whole '
-                    f'test-side string, leaving J_motor = {J_motor * 1e3:.4f}e-3 '
-                    f'kg.m^2. It is treated as an exact constant: it shifts every '
-                    f'point by the same amount and widens no uncertainty, so the '
-                    f'error bar quoted here does not include how well the structure '
-                    f'figure itself is known.')
+                    f'structure_inertia={structure * 1e3:.4f}e-3 kg.m^2 subtracted '
+                    f'from the {J * 1e3:.4f}e-3 test-side total, leaving J_motor = '
+                    f'{J_motor * 1e3:.4f}e-3 kg.m^2. Treated as an exact constant, '
+                    f'so the error bar excludes how well it is known.')
             if J_motor <= 0:
                 res.add('error', 'structure_too_large',
-                        f'The structure inertia is at or above the measured '
-                        f'test-side total, so J_motor is non-physical. Check its '
-                        f'units -- this parameter wants kg.m^2, e.g. 1.2e-3.')
+                        'The structure inertia is at or above the measured '
+                        'test-side total, so J_motor is non-physical. Check its '
+                        'units -- this parameter wants kg.m^2, e.g. 1.2e-3.')
 
         # -- metrics ------------------------------------------------------------
         # The commanded speed the ramps were run to, for the report's
