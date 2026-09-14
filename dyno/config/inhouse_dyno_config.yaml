@@ -58,12 +58,26 @@ sensors:
     offset: 0
     supply: NA
 
-  current_clamp:
-    port: ADC1
-    fs_v: 5
-    fs_pos: 50 
-    offset: 0
-    supply: NA
+  # No clamp fitted on this bench: ADC1/ch3 carries nothing, and the 2026-09-03
+  # logs have no current_clamp dataset. Re-enable when one goes back on.
+  # current_clamp:
+  #   port: ADC1
+  #   fs_v: 5
+  #   fs_pos: 50
+  #   offset: 0
+  #   supply: NA
+
+  # The two RTDs actually fitted to the absorber. These are the only working
+  # temperature readings on this bench -- load_stator_temp below is on the
+  # unfitted RESERVED_RTD (ch8) and reads NaN, which means its safety entry can
+  # never fire. Do not rely on it alone.
+  pt100_rtd_top:
+    port: RTD1
+    sensor_type: PT100
+
+  pt100_rtd_bottom:
+    port: RTD2
+    sensor_type: PT100
 
   load_stator_temp:
     port: RESERVED_RTD

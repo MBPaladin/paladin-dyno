@@ -143,6 +143,12 @@ class Plant:
             return self.tau_dut_out + self.tau_endstop
         if sensor_name == 'input_torque':
             return self.tau_dut_motor
-        if sensor_name == 'load_stator_temp':
+        # The two RTDs actually fitted to the absorber on the in-house bench.
+        # They carry the real over-temperature safety there, since the
+        # load_stator_temp channel is on an unfitted terminal input and reads
+        # NaN. Mapped to the same plant temperature so the sim exercises those
+        # safeties instead of feeding them a flat 0 C.
+        if sensor_name in ('load_stator_temp', 'pt100_rtd_top',
+                           'pt100_rtd_bottom'):
             return self.stator_temp_c
         return 0.0

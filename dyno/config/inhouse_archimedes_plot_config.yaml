@@ -1,5 +1,10 @@
 # Scope layout for inhouse_archimedes_dyno_config.yaml. Every data_key must
 # exist in that config's resolved log_keys.
+#
+# ORDER MATTERS: the GUI draws the first `num_plots` entries (gui.py:97, 3 at
+# present) and puts the rest behind the per-scope dropdown. Both position
+# channels are first because the pair of them is what nearly every check on
+# this rig reads -- ratio sign, centre, window, position persistence.
 Output Position:
   title: Output Position
   unit: Rad
@@ -14,6 +19,21 @@ Output Position:
     - LOAD Position Command
   pens:
     - g
+    - c
+Input Position:
+  title: Input Position
+  unit: Rad
+  range:
+    - -150
+    - 150
+  data_keys:
+    - dut_output_position
+    - dut_position_command
+  legends:
+    - DUT Position
+    - DUT Position Command
+  pens:
+    - r
     - c
 Torque:
   title: Torque
@@ -57,48 +77,41 @@ Velocity:
     - g
     - c
     - c
-Input Position:
-  title: Input Position
-  unit: Rad
-  range:
-    - -150
-    - 150
-  data_keys:
-    - dut_output_position
-    - dut_position_command
-  legends:
-    - DUT Position
-    - DUT Position Command
-  pens:
-    - r
-    - c
-Current Clamp:
+Current:
   title: Current
   unit: A
   range:
     - -50
     - 50
+  # current_clamp dropped: no clamp is fitted, so the sensor is commented out
+  # in inhouse_archimedes_dyno_config.yaml and the trace would be a flat line.
   data_keys:
-    - current_clamp
     - dut_current
     - load_current
   legends:
-    - Clamp Current
     - DUT Drive Current
     - Load Drive Current
   pens:
-    - m
     - r
     - g
-EtherCAT:
-  title: WKC error
-  unit: frames
+Temperature:
+  title: Temperature
+  unit: C
   range:
-    - -1
-    - 3
+    - 0
+    - 120
+  # Top and bottom are the fitted absorber RTDs and carry the real safety.
+  # load_stator_temp is on the unfitted RESERVED_RTD and draws as NaN; it is
+  # kept here so it appears the moment that channel gets a sensor.
   data_keys:
-    - wkc_error
+    - pt100_rtd_top
+    - pt100_rtd_bottom
+    - load_stator_temp
   legends:
-    - WKC Error
+    - Top RTD
+    - Bottom RTD
+    - Load Winding Temp
   pens:
     - r
+    - b
+    - y

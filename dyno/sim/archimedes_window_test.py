@@ -1,6 +1,6 @@
 """Validation of the output position window for the Archimedes setup: safety
-logic, declare centre, jog, touch-off, the arming gate, the window trip, and
-the wkc_error safety, against the fake bus with rubber endstops in the plant.
+logic, declare centre, jog, touch-off, the arming gate and the window trip,
+against the fake bus with rubber endstops in the plant.
 
 Run from repo root:
   PYTHONPATH=. .venv/bin/python dyno/sim/archimedes_window_test.py [mode]
@@ -8,9 +8,11 @@ Run from repo root:
 
 Two controller runs:
   A. Bumpers where the config expects them: touch-off passes, Start is gated,
-     a test that leaves the window trips, a lost frame trips.
+     a test that leaves the window trips, and dropped EtherCAT frames do NOT
+     stop a running test.
   B. No bumpers: touch-off fails at max excursion, jog stops there.
 """
+import copy
 import json
 import math
 import multiprocessing
@@ -21,8 +23,14 @@ import types
 
 MODE = sys.argv[1] if len(sys.argv) > 1 else 'inhouse_archimedes'
 os.environ['DYNO_SIM'] = MODE
-# Lose a frame every second from 150 s of sim time on (run A only; see step A9).
-WKC_DROP_FROM_S = 150
+# Frame-loss schedule for run A, step A9. Both regimes are injected -- isolated
+# single-cycle drops and one dense burst -- and NEITHER may stop the test: this
+# config carries no wkc_error safety, so the check here is against a nuisance
+# stop, not for a trip.
+WKC_DROP_FROM_S = 150       # isolated drops, 1 s apart
+WKC_ISOLATED_N = 15
+WKC_BURST_S = 166.0         # start of the dense burst
+WKC_BURST_CYCLES = 100      # 100 ms at 1 kHz
 
 import yaml  # noqa: E402
 
@@ -47,8 +55,29 @@ def check(cond, msg):
 
 with open(f'{dyno_paths.dyno_config_directory}/{MODE}_dyno_config.yaml') as f:
     CFG = yaml.safe_load(f)
-LOG_KEYS = augment_log_keys(yaml.safe_load(yaml.safe_dump(CFG)))
+# deepcopy, NOT a yaml round-trip: augment_log_keys mutates what it is given, so
+# it needs a copy -- but safe_dump sorts dict keys, which reorders `sensors:` and
+# so reorders every auto-appended sensor column. The declared log_keys list is
+# unaffected (it is a list), which is why this hid for so long: positions 0-20
+# stay correct and only the sensor channels at the tail silently swap places.
+LOG_KEYS = augment_log_keys(copy.deepcopy(CFG))
 IDX = {k: i for i, k in enumerate(LOG_KEYS)}
+
+# What load_position should read at power-up, derived rather than hardcoded so
+# this tracks both the sim's starting angle and the config's encoder handedness.
+# The sim plant starts the shaft at initial_theta_rad and its encoder behavior
+# presents it negated on the LOAD channel; flip_direction_sign then negates it
+# back (devices.py:1129). Getting this from the config is the point: the flag is
+# a real bench decision (log finding 16), not a sim detail.
+with open(f'{os.path.dirname(os.path.abspath(__file__))}/sim_params.yaml') as f:
+    _SIM_PARAMS = yaml.safe_load(f)
+_MODE_PARAMS = (_SIM_PARAMS.get('modes') or {}).get(MODE, {})
+_LOAD_PARAMS = next(e.get('params', {}) for e in CFG['expected_slave_layout']
+                    if e.get('name') == 'LOAD')
+EXPECTED_POWER_UP = -float(_MODE_PARAMS.get(
+    'initial_theta_rad', _SIM_PARAMS.get('initial_theta_rad', 0.0)))
+if _LOAD_PARAMS.get('flip_direction_sign'):
+    EXPECTED_POWER_UP = -EXPECTED_POWER_UP
 
 
 # --- 1. Logic, no bus --------------------------------------------------------
@@ -64,7 +93,11 @@ def stub(window_cfg=None, safeties=()):
     c.devices = types.SimpleNamespace(
         LOAD=types.SimpleNamespace(position=0.0, velocity=0.0, fault=False),
         DUT=types.SimpleNamespace(position=0.0, fault=False))
-    c._safety_checks = list(safeties)
+    # Entries may be given as 4-tuples (no trip_samples); default to 1, which
+    # is the instantaneous behaviour every check had before debounce existed.
+    c._safety_checks = [tuple(s) if len(s) == 5 else tuple(s) + (1,)
+                        for s in safeties]
+    c._safety_streaks = {}
     c._window = c._compile_window(window_cfg)
     c._window_centre = None
     c._touch_off = None
@@ -78,6 +111,21 @@ check(c._safety_trigger() is not None, 'nan_trips=True did not trip on NaN')
 c = stub(safeties=[('t', lambda s: nan_value[0], 10.0, False)])
 check(c._safety_trigger() is None, 'nan_trips=False tripped on NaN (should keep old behaviour)')
 print('  NaN trips only where nan_trips is set')
+
+# trip_samples: N consecutive breaches required, and any in-range read resets.
+val = [0.0]
+c = stub(safeties=[('t', lambda s: val[0], 0.0, False, 3)])
+val[0] = 2.0
+check(c._safety_trigger() is None and c._safety_trigger() is None,
+      'trip_samples=3 tripped before 3 consecutive breaches')
+check(c._safety_trigger() is not None, 'trip_samples=3 did not trip on the 3rd')
+c = stub(safeties=[('t', lambda s: val[0], 0.0, False, 3)])
+for _ in range(20):  # breach, clear, breach, clear ... never 3 in a row
+    val[0] = 2.0
+    c._safety_trigger()
+    val[0] = 0.0
+    check(c._safety_trigger() is None, 'isolated breaches accumulated across resets')
+print('  trip_samples needs N in a row and resets on any good sample')
 
 c = stub(CFG['position_window'])
 c._window_centre = 0.2
@@ -190,7 +238,9 @@ def arm(rig, test):
 
 
 print('\n--- 2A. Bumpers in place ---')
-rig = Rig({'DYNO_SIM_WKC_DROP': ','.join(str(WKC_DROP_FROM_S + i) for i in range(300))})
+rig = Rig({'DYNO_SIM_WKC_DROP': ','.join(
+    [str(WKC_DROP_FROM_S + i) for i in range(WKC_ISOLATED_N)] +
+    [f'{WKC_BURST_S + i * 0.001:.3f}' for i in range(WKC_BURST_CYCLES)])})
 try:
     print('  bring-up...')
     rig.pump(6)
@@ -198,8 +248,8 @@ try:
     rig.pump(2, until=lambda r: positions.append(r.value('load_position')) and False)
     step = max(positions) - min(positions)
     print(f'  A1 load_position over 2 s: {min(positions):+.4f}..{max(positions):+.4f} '
-          f'(sim power-up angle gives -0.3)')
-    check(step < 1e-3 and abs(positions[-1] + 0.3) < 0.01,
+          f'(expected {EXPECTED_POWER_UP:+.1f})')
+    check(step < 1e-3 and abs(positions[-1] - EXPECTED_POWER_UP) < 0.01,
           'load_position moved or is not the raw encoder angle: the DUT offset '
           'copy may still be running')
 
@@ -218,7 +268,8 @@ try:
     rig.send('declare_centre')
     rig.pump(2, until=lambda r: r.w.get('centre') is not None)
     print(f'  A4 {rig.w.get("message")}')
-    check(rig.w.get('centre') is not None and abs(rig.w['centre'] + 0.3) < 0.01,
+    check(rig.w.get('centre') is not None
+          and abs(rig.w['centre'] - EXPECTED_POWER_UP) < 0.01,
           f'centre not declared at the output angle: {rig.w.get("centre")}')
 
     rig.send('start_test')
@@ -269,11 +320,23 @@ try:
     rig.pump(WKC_DROP_FROM_S + 20, until=lambda r: r.samples >= (WKC_DROP_FROM_S - 5) * 1000)
     n_reasons = len(rig.stop_reasons)
     rig.send('start_test')
-    rig.pump(10, until=lambda r: len(r.stop_reasons) > n_reasons)
-    reason = rig.stop_reasons[-1] if len(rig.stop_reasons) > n_reasons else {}
-    print(f'     shuttle test: stop_reason={reason.get("kind")}/{reason.get("check")} '
-          f'({reason.get("detail")})')
-    check(reason.get('check') == 'wkc_error', 'a lost frame did not stop the test')
+
+    # There is deliberately NO wkc_error safety on this rig, so the assertion
+    # is the inverse of what it used to be: dropped frames must NOT stop a
+    # running test. Both regimes are still injected -- isolated single-cycle
+    # drops and one dense burst -- because the point is that neither is a
+    # nuisance stop. Losing a slave outright still faults the drives, and the
+    # drive-fault path stops the test; that is the layer being relied on.
+    rig.pump(30, until=lambda r: r.samples >= (WKC_BURST_S + 4) * 1000)
+    survived = len(rig.stop_reasons) == n_reasons
+    stopped_by = (rig.stop_reasons[-1] if not survived else {})
+    verdict = ('test still running' if survived
+               else f'STOPPED by {stopped_by.get("check")}')
+    print(f'     {WKC_ISOLATED_N} isolated + {WKC_BURST_CYCLES}-cycle burst of '
+          f'dropped frames: {verdict}')
+    check(survived,
+          f'dropped frames stopped the test ({stopped_by.get("check")!r}) -- '
+          f'there should be no wkc_error safety on this config')
 finally:
     rig.close()
 

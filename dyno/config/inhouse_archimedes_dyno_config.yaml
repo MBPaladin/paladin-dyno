@@ -105,12 +105,28 @@ sensors:
     offset: 0
     supply: NA
 
-  current_clamp:
-    port: ADC1
-    fs_v: 5
-    fs_pos: 50
-    offset: 0
-    supply: NA
+  # No clamp fitted on this bench. Left declared it reads a flat -0.001 A
+  # (measured 2026-09-14, 148 s passive: sd 0.0003 A over 375 distinct values),
+  # which is a trace of nothing on every scope. Re-enable when one goes back on.
+  # current_clamp:
+  #   port: ADC1
+  #   fs_v: 5
+  #   fs_pos: 50
+  #   offset: 0
+  #   supply: NA
+
+  # The two RTDs actually fitted to the absorber. RESERVED_RTD (ch8) below has
+  # no sensor on it and reads NaN -- confirmed over 147817 consecutive samples
+  # on 2026-09-14 -- so a safety watching only that channel can never fire.
+  # These two are the real thermal protection for the efficiency runs, which
+  # hold 100 Nm continuous on the absorber.
+  pt100_rtd_top:
+    port: RTD1
+    sensor_type: PT100
+
+  pt100_rtd_bottom:
+    port: RTD2
+    sensor_type: PT100
 
   load_stator_temp:
     port: RESERVED_RTD
@@ -163,8 +179,22 @@ expected_slave_layout:
       # 600, i_cont 7 -> 20. Opt out; this file is the only source.
       absorber_library: false
       flip_torque_sign: False
+      # Encoder handedness. Hand test 2026-09-14: rotating the input positive
+      # in the right-handed frame read NEGATIVE on dut_output_position, while
+      # positive input torque read positive on the cell. The encoder disagreed
+      # with its own torque cell, so negate it. flip_direction_sign negates
+      # position and velocity coherently, feedback and command
+      # (devices.py:1129/1134/1164/1176) -- unlike flip_torque_sign, which
+      # only negates the commanded current. See log finding 16.
+      flip_direction_sign: True
       # Signed: output counter-rotates. Nothing in the control path uses the
       # sign while feedforward_ratio is 0; the test builder takes abs().
+      # UNRESOLVED: -43 assumes both shafts in the SAME handedness. The bench
+      # convention is input right-handed, output left-handed, which makes the
+      # ratio +43, and with both encoders now flipped the logged channels
+      # should show +43 too. Cannot be confirmed until the gearbox is fitted
+      # (the lockout plate is on as of 2026-09-14). Inert in the control path;
+      # fix the sign before any analysis relies on it.
       gear_ratio: -43
       motor_params:
         kt: 0.983
@@ -187,6 +217,17 @@ expected_slave_layout:
       # output) and velocity 12 -> 50, undoing the deliberate output-speed cap.
       absorber_library: false
       flip_torque_sign: True
+      # Hand test 2026-09-14, output bolted to the lockout plate: rotating the
+      # output negative in the left-handed frame read negative on load_torque
+      # (correct) but a small POSITIVE delta on load_position. Against a
+      # grounded shaft the deflection must follow the applied torque, so the
+      # encoder disagreed with its own cell. Negating it makes K = dT/dtheta
+      # come out positive, which is the whole point of the lockout-plate
+      # stiffness baseline. See log finding 16.
+      # NOTE: this inverts the jog buttons -- "Jog +" now drives the other way
+      # and touch-off's "+ bumper" is the other bumper. Harmless, the bumpers
+      # are symmetric, but expect it at the bench.
+      flip_direction_sign: True
       gear_ratio: 1 # Output should always be set to 1
       motor_params:
         kt: 7.79
@@ -208,8 +249,24 @@ safeties:
   input_torque: { source: devices.adc_1.input_torque, limit: 15, nan_trips: true } # Nm; input cell is 20 Nm FS
   output_velocity: { source: devices.LOAD.velocity, limit: 12, nan_trips: true } # rad/s; tests reach 8.8
   input_velocity: { source: devices.DUT.velocity, limit: 420, nan_trips: true } # rad/s; tests reach 377
+  # Absorber temperature. PROVISIONAL LIMIT, see the EL3208 element-type item
+  # in the implementation log: devices.py writes element type 1 for 'PT100',
+  # and if Beckhoff's enum is 0=PT100/1=NI100 then a Pt sensor is being read on
+  # the Ni curve and every reading is ~30% low. 70 trips at a true ~100 C under
+  # that reading and at 70 C if the scale is already right, so it is safe both
+  # ways. Raise it to the real winding limit once the sweep settles the scale.
+  absorber_temp_top: { source: devices.rtd_module.pt100_rtd_top, limit: 70, nan_trips: true } # C
+  absorber_temp_bottom: { source: devices.rtd_module.pt100_rtd_bottom, limit: 70, nan_trips: true } # C
+  # RESERVED_RTD (ch8) is unfitted and reads NaN, so deliberately NO nan_trips
+  # here: this entry is inert until a sensor goes on that channel. The two
+  # entries above are what actually protect the absorber.
   load_stator_temp: { source: devices.rtd_module.load_stator_temp, limit: 100 } # C
-  wkc_error: { source: wkc_error, limit: 0 } # any lost EtherCAT frame stops the test
+  # No wkc_error safety. The bus is clean at idle -- 0 events in 147817
+  # consecutive cycles on 2026-09-14 -- and the isolated counts seen before
+  # that were the first cycle after OP entry, not running faults. A frame-loss
+  # trip here would only ever be a nuisance stop mid-test; losing a slave still
+  # faults the drives, which stops the test through the existing drive-fault
+  # path. wkc_error stays in log_keys so a post-mortem can look at it.
 
 tare:
   duration_s: 3.0

@@ -158,9 +158,24 @@ class Controller(Master):
                 raise ValueError(
                     f"safeties entry '{check_name}' in {self.mode}_dyno_config.yaml "
                     f"must be a dict with 'source' and 'limit' keys, got: {spec!r}")
+            # trip_samples: how many CONSECUTIVE breaching cycles it takes to
+            # stop the test. Default 1 = the historical instantaneous
+            # behaviour. It exists for wkc_error, which master.py recomputes
+            # every cycle as `expected_wkc - actual_wkc` (master.py:88) rather
+            # than accumulating -- so it is bounded by expected_wkc (8 on this
+            # bench) and a raised limit cannot express "tolerate a glitch but
+            # stop on sustained loss". Raising the limit past expected_wkc
+            # instead disables the check outright, including total bus loss.
+            trip_samples = int(spec.get('trip_samples', 1))
+            if trip_samples < 1:
+                raise ValueError(
+                    f"safeties entry '{check_name}' in {self.mode}_dyno_config."
+                    f"yaml: trip_samples must be >= 1, got {trip_samples}")
             self._safety_checks.append(
                 (check_name, attrgetter(spec['source']), abs(spec['limit']),
-                 bool(spec.get('nan_trips', False))))
+                 bool(spec.get('nan_trips', False)), trip_samples))
+        # Consecutive-breach counter per check, reset on any in-range read.
+        self._safety_streaks = {}
 
         try:
             os.sched_setscheduler(0, SCHED_POLICY, os.sched_param(SCHED_PRIO))
@@ -454,19 +469,30 @@ class Controller(Master):
         # rig left running with no supervision at all. Hence the getattrs.
         at_s = getattr(self, 'time', None)
 
-        for check_name, getter, limit, nan_trips in self._safety_checks:
+        for check_name, getter, limit, nan_trips, trip_samples in self._safety_checks:
             value = abs(getter(self))
             if value > limit or (nan_trips and math.isnan(value)):
-                print(f'Safety triggered, {check_name} of {value} exceeds limit of {limit}')
+                streak = self._safety_streaks.get(check_name, 0) + 1
+                self._safety_streaks[check_name] = streak
+                if streak < trip_samples:
+                    continue
+                held = ('' if trip_samples == 1 else
+                        f' for {streak} consecutive cycles')
+                print(f'Safety triggered, {check_name} of {value} exceeds '
+                      f'limit of {limit}{held}')
                 return {'kind': 'safety',
                         'check': check_name,
                         'value': float(value),
                         'limit': float(limit),
+                        'trip_samples': trip_samples,
                         'at_s': at_s,
                         'detail': (f'safety check {check_name!r} read NaN'
                                    if math.isnan(value) else
                                    f'safety check {check_name!r} measured '
-                                   f'{value:.6g}, over its limit of {limit:g}')}
+                                   f'{value:.6g}, over its limit of '
+                                   f'{limit:g}') + held}
+            # In range: any run of breaches ends here.
+            self._safety_streaks[check_name] = 0
 
         window_trip = self._window_trip(at_s)
         if window_trip:

@@ -12,19 +12,22 @@ Output Torque:
   range: # defines range of each scope
     - -30
     - 30
+  # load_torque was commented out while ch1 had no cell wired to it. A 500 Nm
+  # cell is fitted again as of the 2026-09-02/03 runs, where it tracks
+  # load_current * kt to ~2%, so the trace is back.
   data_keys: # defines which log entries to pull for the scope
     - input_torque
-    #- load_torque
+    - load_torque
     - dut_torque_command
     - load_torque_command
   legends: # defines legends for the above keys
     - Measured Input Torque
-    #- Measured Output Torque
+    - Measured Output Torque
     - DUT Torque Command
     - LOAD Torque Command
   pens: # sets colors for each trace
     - y
-    #- g
+    - g
     - c
     - c
 Output Velocity:
@@ -75,27 +78,35 @@ Current Clamp:
   range: # matches the clamp's fs_pos (50 A) in inhouse_dyno_config.yaml
     - -50
     - 50
+  # current_clamp dropped: no clamp is fitted, so the sensor is commented out in
+  # inhouse_dyno_config.yaml and the trace would draw a flat line of NaN.
   data_keys:
-    - current_clamp
     - dut_current
     - load_current
   legends:
-    - Clamp Current
     - DUT Drive Current
     - Load Drive Current
   pens:
-    - m
     - r
     - g
-Load Temperature:
+Temperature:
   title: Temperature
   unit: C
   range:
     - 0
     - 120
+  # Top and bottom are the fitted absorber RTDs. load_stator_temp is on the
+  # unfitted RESERVED_RTD and draws as NaN; it is kept here so it appears the
+  # moment that channel gets a sensor.
   data_keys:
+    - pt100_rtd_top
+    - pt100_rtd_bottom
     - load_stator_temp
   legends:
+    - Top RTD
+    - Bottom RTD
     - Load Winding Temp
   pens:
     - r
+    - b
+    - y
