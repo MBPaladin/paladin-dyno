@@ -701,7 +701,21 @@ class AKD:
         # overrides only the keys it defines (was: wholesale dict replacement,
         # which silently discarded every layout value and split flip_torque_sign
         # off to a different source than everything else).
-        layout_params = params if params is not None else {}
+        #
+        # `absorber_library: false` in a device's layout params opts that drive
+        # out of the lookup entirely, so the rig config is the only source. It
+        # exists because DRV.NAME is a per-drive label, not a per-bench one: the
+        # same physical drive carries its absorbers.yaml entry onto every bench
+        # it is used on, and a config that deliberately derates or re-rates it
+        # (see inhouse_archimedes_dyno_config.yaml) would otherwise be silently
+        # overridden by that entry. It is a loader directive, not a device
+        # parameter, so it is popped before the merge.
+        layout_params = dict(params) if params is not None else {}
+        use_library = layout_params.pop('absorber_library', True)
+        if not use_library:
+            print(f'{self.name}: absorber_library disabled in the dyno config; '
+                  f'ignoring any absorbers.yaml entry for {drive_name!r}')
+            absorber_params = {}
         if drive_name in absorber_params:
             print('Loading absorber params for: ', drive_name)
             self.params, self.params_provenance = deep_merge(
@@ -1369,7 +1383,14 @@ class ELMO:
             drive_name = ''
         print(f'{self.name} reports device name: {drive_name!r}')
 
-        layout_params = params if params is not None else {}
+        # `absorber_library: false` opts this drive out of the lookup; see the
+        # AKD class for why.
+        layout_params = dict(params) if params is not None else {}
+        use_library = layout_params.pop('absorber_library', True)
+        if not use_library:
+            print(f'{self.name}: absorber_library disabled in the dyno config; '
+                  f'ignoring any absorbers.yaml entry for {drive_name!r}')
+            absorber_params = {}
         if drive_name in absorber_params:
             print('Loading absorber params for: ', drive_name)
             self.params, self.params_provenance = deep_merge(

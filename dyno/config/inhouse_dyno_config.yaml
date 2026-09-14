@@ -120,7 +120,7 @@ expected_slave_layout:
   - { model: EL3208, name: rtd_module }
   - { model: ELM3004, name: adc_1 }
   - model: AKD
-    name: LOAD
+    name: DUT
     params:
       flip_torque_sign: True
       gear_ratio: 1
@@ -136,7 +136,7 @@ expected_slave_layout:
       drive_params:
         i_cont: 7
   - model: AKD
-    name: GIANTMOTOR
+    name: LOAD
     params:
       flip_torque_sign: True
       gear_ratio: 1 # Output should always be set to 1
@@ -150,33 +150,7 @@ expected_slave_layout:
         acceleration: 20 #Rad/s^2
         rotatum: 1000 #Nm/s, 4 x peak torque value
       drive_params:
-        i_cont: 15
-  # SMALL (MAGIC?) MAC MOTOR
-  - model: ELMO
-    name: DUT
-    params:
-      flip_torque_sign: False
-      gear_ratio: 1
-      motor_params: { kt: 0.316, k_tanh: 0.001 }
-      spec_sheet: { kt: .316, km: 1.31}  # add `km: <Nm/sqrt(W)>` to overlay the datasheet Km
-      motor_limits:
-        torque: 50 
-        continuous_torque: 40 
-        velocity: 100
-        acceleration: 1000
-        rotatum: 500
-      drive_params:
-        i_cont: 42.430
-        i_rated: 42.430      # torque -> per-mille scaling
-        # The Elmo reports the quadrature-axis AMPLITUDE, not an rms value, so
-        # every current logged for this drive -- and every kt derived from one
-        # -- is per peak amp. Read by the report generator to pick a unit
-        # label. Nothing converts on this key: it says what the numbers already
-        # are. The AKDs on this bench report rms and are left at the default.
-        current_units: peak
-        counts_per_rev: 262144                 # 2^18
-        position_counter_bits: 32              # 18 if 0x6064 wraps each rev
-        pdo_profile: compact                  
+        i_cont: 15           
 
 # Measured values over these limits stop the test.
 #

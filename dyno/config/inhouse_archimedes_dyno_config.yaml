@@ -6,16 +6,24 @@
 # ./launch/inhouse_archimedes.sh. Kept separate from inhouse_dyno_config.yaml so
 # day-to-day edits there cannot disturb this setup.
 #
-# VERIFY ON THE DYNO BEFORE TRUSTING (see the log's open items):
-#   - Bus and drive roles. Two AKDs only; the Elmo MAC drive is not used and
-#     must be off the chain (bring-up waits until the slave count matches).
-#     The small AKD (RTC-0020, 20 Nm / 600 rad/s) is DUT = input motor, the
-#     large AKD (RTC-0200, 220 Nm) is LOAD = absorber, in that bus order. Check
-#     against ./dyno/bus_scan.sh. The 20 Nm input cell must be on the small
-#     AKD's shaft.
-#   - absorbers.yaml. If a drive's WorkBench name matches an entry there
-#     (e.g. RTC-0200), that entry OVERRIDES the params below. The bring-up print
-#     shows each value's source.
+# CONFIRMED ON THE DYNO 2026-09-14 (bus_scan.sh + drive_status.sh, both inert):
+#   - 5 slaves on enp86s0: EK1100, EL3208, ELM3004, AKD, AKD. The Elmo MAC
+#     drive is off the chain, as this config requires.
+#   - Slave 3 reports DRV.NAME "RTC-0020" (small, 20 Nm / 600 rad/s) = DUT =
+#     input motor. Slave 4 reports "RTC-0200" (large, 220 Nm) = LOAD =
+#     absorber. That is the order below.
+#   - BOTH names have an absorbers.yaml entry, so that file WOULD have
+#     overridden the limits below (it did exactly that on the 2026-09-03 run --
+#     see its resolved_config provenance). Each AKD now sets
+#     `absorber_library: false`, which opts it out. Check the bring-up
+#     provenance print still says "dyno config" for every motor_limits value.
+#
+# STILL TO VERIFY ON THE DYNO (see the log's open items):
+#   - The 20 Nm input cell is fitted and wired on the small AKD's shaft.
+#     `load_torque` (the 500 Nm output cell) is confirmed live and agrees with
+#     load_current * kt to ~2%; `input_torque` has read a dead -0.03 Nm in
+#     every recent log, but the input motor never drove in any of them, so
+#     that is not yet evidence either way.
 #   - Torque and direction signs (flip_torque_sign), Step 1 of the plan.
 #
 # DIRECT-COUPLE RUNS (no gearbox): set DUT gear_ratio to 1 and
@@ -149,6 +157,11 @@ expected_slave_layout:
   - model: AKD
     name: DUT
     params:
+      # This drive's DRV.NAME is RTC-0020, which HAS an absorbers.yaml entry
+      # (confirmed on the bench 2026-09-14). That entry would override the
+      # limits below -- accel 5000 -> 1000, torque 15 -> 20, velocity 400 ->
+      # 600, i_cont 7 -> 20. Opt out; this file is the only source.
+      absorber_library: false
       flip_torque_sign: False
       # Signed: output counter-rotates. Nothing in the control path uses the
       # sign while feedforward_ratio is 0; the test builder takes abs().
@@ -168,6 +181,11 @@ expected_slave_layout:
   - model: AKD
     name: LOAD
     params:
+      # DRV.NAME is RTC-0200, which HAS an absorbers.yaml entry (confirmed on
+      # the bench 2026-09-14). That entry would override the limits below --
+      # acceleration 150 -> 20 (the plan's 3600 rpm shuttles need ~116 at the
+      # output) and velocity 12 -> 50, undoing the deliberate output-speed cap.
+      absorber_library: false
       flip_torque_sign: True
       gear_ratio: 1 # Output should always be set to 1
       motor_params:
