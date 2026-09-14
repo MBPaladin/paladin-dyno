@@ -14,6 +14,7 @@ creeps under any torque at all -- so it cannot be used to exercise anything
 that measures or detects breakaway (test_manager.RampBreak, the stiction
 analyses). Set `stiction_nm: 0` to get the old creep-everywhere behavior back.
 """
+import json
 import math
 import os
 
@@ -32,15 +33,31 @@ DEFAULTS = {
     'thermal_tau_s': 120.0,    # stator temp first-order time constant
     'heat_c_per_nm': 0.15,     # steady-state stator rise per Nm of load torque
     'adc_noise_counts': 4000,  # gaussian noise on unmapped/mapped ADC channels
+    'initial_theta_rad': 0.0,  # shaft angle at power-up
+    # Rubber endstops on the output shaft at theta = endstop_centre_rad +/-
+    # endstop_half_span_rad (None = no endstops). A one-sided spring-damper past
+    # each stop. Their reaction torque reads on the output torque cell, which
+    # sits between the absorber and the stops.
+    'endstop_half_span_rad': None,
+    'endstop_centre_rad': 0.0,
+    'endstop_stiffness_nm_per_rad': 300.0,
+    'endstop_damping_nms': 20.0,
 }
 
 
 def load_sim_params():
+    """DEFAULTS < sim_params.yaml top level < its `modes: {<DYNO_SIM mode>: }`
+    block < JSON in DYNO_SIM_PARAMS (for one-off test cases)."""
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sim_params.yaml')
     params = dict(DEFAULTS)
     if os.path.exists(path):
         with open(path, 'r') as f:
-            params.update(yaml.safe_load(f) or {})
+            loaded = yaml.safe_load(f) or {}
+        modes = loaded.pop('modes', None) or {}
+        params.update(loaded)
+        params.update(modes.get(os.environ.get('DYNO_SIM'), None) or {})
+    if os.environ.get('DYNO_SIM_PARAMS'):
+        params.update(json.loads(os.environ['DYNO_SIM_PARAMS']))
     return params
 
 
@@ -57,8 +74,14 @@ class Plant:
         self.thermal_tau = p['thermal_tau_s']
         self.heat_c_per_nm = p['heat_c_per_nm']
 
+        self.endstop = p['endstop_half_span_rad']
+        self.endstop_centre = float(p['endstop_centre_rad'])
+        self.endstop_k = p['endstop_stiffness_nm_per_rad']
+        self.endstop_c = p['endstop_damping_nms']
+        self.tau_endstop = 0.0
+
         self.omega = 0.0  # output shaft, rad/s
-        self.theta = 0.0  # output shaft, rad
+        self.theta = float(p['initial_theta_rad'])  # output shaft, rad
         self.stator_temp_c = self.ambient_c
 
         self._drive_torques = {}   # name -> output-frame Nm
@@ -73,8 +96,22 @@ class Plant:
             if tau_motor_frame is not None:
                 self.tau_dut_motor = tau_motor_frame
 
+    def _endstop_torque(self):
+        if self.endstop is None:
+            return 0.0
+        x = self.theta - self.endstop_centre
+        over = abs(x) - abs(self.endstop)
+        if over <= 0:
+            return 0.0
+        push = self.endstop_k * over
+        # Damping only resists motion into the stop; the spring never pulls.
+        if self.omega * x > 0:
+            push += self.endstop_c * abs(self.omega)
+        return -math.copysign(push, x)
+
     def step(self, dt):
-        tau_sum = sum(self._drive_torques.values())
+        self.tau_endstop = self._endstop_torque()
+        tau_sum = sum(self._drive_torques.values()) + self.tau_endstop
         at_rest = self.stiction > 0 and abs(self.omega) <= self.stick_band
         if at_rest and abs(tau_sum) <= self.stiction:
             # Stuck. Velocity is pinned to zero outright rather than merely
@@ -103,7 +140,7 @@ class Plant:
         """Named engineering quantities that sensor behaviors can read.
         Unknown names read 0 (noise-only channel)."""
         if sensor_name in ('load_torque', 'output_torque'):
-            return self.tau_dut_out
+            return self.tau_dut_out + self.tau_endstop
         if sensor_name == 'input_torque':
             return self.tau_dut_motor
         if sensor_name == 'load_stator_temp':

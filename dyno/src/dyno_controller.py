@@ -123,6 +123,25 @@ class Controller(Master):
         self._fault_clear_state = None
         self._fault_clear_message = None
 
+        # step() used to copy DUT's position into LOAD.position_offset early in
+        # every session, ignoring any gear ratio. A rig that reads the output
+        # position on its own (the position window below) must turn that off.
+        self._align_load_position = bool(
+            self.dyno_params.get('align_load_position_to_dut', True))
+
+        # Scale on the cross-coupling torque feedforward in step(). 0 disables it.
+        self._feedforward_ratio = float(self.dyno_params.get('feedforward_ratio', 0.8))
+
+        # --- Output position window (limited-travel DUTs) ---
+        # Config `position_window:`; absent means the feature is off and every
+        # _window_* / jog / touch-off method is a no-op. See the section below.
+        self._window = self._compile_window(self.dyno_params.get('position_window'))
+        self._window_centre = None      # LOAD-frame position declared as centre
+        self._touch_off = None          # last completed touch-off result
+        self._touch_off_history = []    # every touch-off this session
+        self._jog = None                # jog or touch-off in flight
+        self._window_message = None
+
         self._aux_funcs = []
         if self.mode == 'actuator_production':
             self._aux_funcs.append(self._aux_func_A3_Dyno)
@@ -130,6 +149,9 @@ class Controller(Master):
         # Compile safety checks from config: each entry names a telemetry
         # source (attrgetter path, same idiom as log_keys) and a limit.
         # safeties: { output_torque: { source: devices.ADC.output_torque, limit: 375 } }
+        # `nan_trips: true` makes a NaN reading trip the check. Off by default
+        # because abs(nan) > limit is False, and some rigs list channels (an
+        # unfitted RTD) that read NaN in normal use.
         self._safety_checks = []
         for check_name, spec in self.dyno_params.get('safeties', {}).items():
             if not isinstance(spec, dict) or 'source' not in spec or 'limit' not in spec:
@@ -137,7 +159,8 @@ class Controller(Master):
                     f"safeties entry '{check_name}' in {self.mode}_dyno_config.yaml "
                     f"must be a dict with 'source' and 'limit' keys, got: {spec!r}")
             self._safety_checks.append(
-                (check_name, attrgetter(spec['source']), abs(spec['limit'])))
+                (check_name, attrgetter(spec['source']), abs(spec['limit']),
+                 bool(spec.get('nan_trips', False))))
 
         try:
             os.sched_setscheduler(0, SCHED_POLICY, os.sched_param(SCHED_PRIO))
@@ -238,6 +261,9 @@ class Controller(Master):
             'faulted_drives': self._faulted_drives(),
             'fault_clear_active': self._fault_clear_state is not None,
             'fault_clear_message': self._fault_clear_message,
+            # Centre, touch-off and jog state for the GUI and the Logger. None
+            # when the config has no position_window.
+            'window': self._window_state(),
         }
 
     def _send_telemetry(self):
@@ -293,6 +319,10 @@ class Controller(Master):
                         print('Unable to start test: DUT in fault state')
                     elif self.devices.LOAD.fault:
                         print('Unable to start test: LOAD in fault state')
+                    elif self._window_arming_refusal():
+                        self._window_message = ('Start refused: '
+                                                + self._window_arming_refusal())
+                        print(f'Unable to start test: {self._window_message}')
                     else:
                         # The previous run's reason must not outlive it into
                         # the next log.
@@ -307,9 +337,26 @@ class Controller(Master):
                         print('Starting test')
                         
                 elif cmd[0] == 'stop_test':
+                    if self._jog is not None:
+                        self._end_jog('Stopped by the operator', failed=True)
                     self._stop_test({'kind': 'operator',
                                      'detail': 'stopped from the GUI by the operator'})
                     print('attempting to stop test, in / out motor commanded to torque mode')
+
+                elif cmd[0] == 'declare_centre':
+                    self._declare_centre()
+
+                elif cmd[0] == 'jog':
+                    self._start_jog(cmd[1])
+
+                elif cmd[0] == 'jog_stop':
+                    # Hold-to-run release. Only ends a manual jog: a touch-off
+                    # is stopped with Stop, not by letting go of a jog button.
+                    if self._jog is not None and self._jog['kind'] == 'jog':
+                        self._end_jog('Jog released')
+
+                elif cmd[0] == 'touch_off':
+                    self._start_touch_off()
 
                 elif cmd[0] == 'test_def':
                     if not self._test_active:
@@ -407,17 +454,24 @@ class Controller(Master):
         # rig left running with no supervision at all. Hence the getattrs.
         at_s = getattr(self, 'time', None)
 
-        for check_name, getter, limit in self._safety_checks:
+        for check_name, getter, limit, nan_trips in self._safety_checks:
             value = abs(getter(self))
-            if value > limit:
+            if value > limit or (nan_trips and math.isnan(value)):
                 print(f'Safety triggered, {check_name} of {value} exceeds limit of {limit}')
                 return {'kind': 'safety',
                         'check': check_name,
                         'value': float(value),
                         'limit': float(limit),
                         'at_s': at_s,
-                        'detail': (f'safety check {check_name!r} measured '
+                        'detail': (f'safety check {check_name!r} read NaN'
+                                   if math.isnan(value) else
+                                   f'safety check {check_name!r} measured '
                                    f'{value:.6g}, over its limit of {limit:g}')}
+
+        window_trip = self._window_trip(at_s)
+        if window_trip:
+            print(f'Safety triggered: {window_trip["detail"]}')
+            return window_trip
 
         for name in (() if self._load_only else ('DUT',)) + ('LOAD',):
             drive = getattr(self.devices, name)
@@ -545,6 +599,8 @@ class Controller(Master):
             self._tare_message = 'Tare refused: a test is running'
         elif self._tare_state is not None:
             self._tare_message = 'Tare refused: a tare is already in progress'
+        elif self._jog is not None:
+            self._tare_message = 'Tare refused: a jog or touch-off is running'
         elif not self._tare_targets():
             self._tare_message = 'Tare refused: no tareable sensors on this rig'
         elif not self._rig_at_rest():
@@ -655,6 +711,372 @@ class Controller(Master):
         self._tare_message = 'Tare cleared'
         print(f'Controller: {self._tare_message}')
 
+    # --- Output position window -------------------------------------------
+    # For DUTs whose output can only travel a limited angle (the Archimedes
+    # drive: 200 deg between internal endstops). The operator declares centre,
+    # a touch-off confirms both bumpers are where the config says, and from
+    # then on a test trips if the output leaves centre +/- half_window. Jog and
+    # touch-off run with the rig otherwise idle: LOAD in velocity mode, DUT
+    # disabled (input shaft free), stopped by a torque cap, the max excursion,
+    # an overspeed check, a timeout, a drive fault, or Stop.
+
+    def _compile_window(self, spec):
+        if not spec or not spec.get('enabled', True):
+            return None
+        t = spec.get('touch_off') or {}
+        try:
+            w = {
+                'source': spec['source'],
+                'get': attrgetter(spec['source']),
+                'half_window': abs(float(spec['half_window_rad'])),
+                'require_touch_off': bool(spec.get('require_touch_off', True)),
+                'torque_nm': abs(float(t['torque_nm'])),
+                'torque_sources': list(t['torque_sources']),
+                'velocity': abs(float(t['velocity_rad_s'])),
+                'approach_velocity': abs(float(t.get('approach_velocity_rad_s',
+                                                     t['velocity_rad_s']))),
+                'slow_from': abs(float(t.get('slow_from_rad', 0.0))),
+                'expected_half_span': abs(float(t['expected_half_span_rad'])),
+                'tolerance': abs(float(t['tolerance_rad'])),
+                'max_excursion': abs(float(t['max_excursion_rad'])),
+                'arm_distance': abs(float(t.get('arm_distance_rad', 0.03))),
+                'trip_samples': max(1, int(t.get('trip_samples', 10))),
+                # Trip on where the output would stop, not where it is: moving
+                # outward at v, it adds v^2 / (2 * stop_decel). 0 = off.
+                'stop_decel': abs(float(spec.get('stop_decel_rad_s2', 0.0))),
+                'velocity_source': spec.get('velocity_source'),
+            }
+        except KeyError as e:
+            raise ValueError(f'position_window in {self.mode}_dyno_config.yaml '
+                             f'is missing {e}')
+        w['velocity_get'] = (attrgetter(w['velocity_source'])
+                             if w['velocity_source'] else None)
+        if w['stop_decel'] > 0 and w['velocity_get'] is None:
+            raise ValueError('position_window: stop_decel_rad_s2 needs velocity_source')
+        w['torque_get'] = [attrgetter(p) for p in w['torque_sources']]
+        if not w['torque_get']:
+            raise ValueError('position_window.touch_off.torque_sources is empty')
+        if w['half_window'] >= w['expected_half_span'] - w['tolerance']:
+            raise ValueError('position_window: half_window_rad must sit inside the '
+                             'bumpers (expected_half_span_rad - tolerance_rad)')
+        if w['max_excursion'] <= w['expected_half_span'] + w['tolerance']:
+            raise ValueError('position_window: max_excursion_rad must reach past '
+                             'expected_half_span_rad + tolerance_rad, or touch-off '
+                             'can never find the bumpers')
+        return w
+
+    def _window_rel(self):
+        """Output position relative to the declared centre; NaN if unknown."""
+        if self._window is None or self._window_centre is None:
+            return math.nan
+        try:
+            return float(self._window['get'](self)) - self._window_centre
+        except (TypeError, ValueError, AttributeError):
+            return math.nan
+
+    def _window_stop_distance(self, rel):
+        """How much further the output travels outward if stopped now, at
+        stop_decel. 0 when off or moving toward centre; NaN if unreadable."""
+        w = self._window
+        if w['stop_decel'] <= 0 or math.isnan(rel):
+            return 0.0
+        try:
+            v = float(w['velocity_get'](self))
+        except (TypeError, ValueError, AttributeError):
+            return math.nan
+        if math.isnan(v):
+            return math.nan
+        outward = v if rel >= 0 else -v
+        return outward * outward / (2 * w['stop_decel']) if outward > 0 else 0.0
+
+    def _window_trip(self, at_s):
+        w = self._window
+        if w is None:
+            return None
+        rel = self._window_rel()
+        stop_distance = self._window_stop_distance(rel)
+        if not math.isnan(rel) and abs(rel) + stop_distance <= w['half_window']:
+            return None
+        if self._window_centre is None:
+            detail = 'position window: no centre declared'
+        elif math.isnan(rel):
+            detail = f'position window: {w["source"]} read NaN'
+        elif math.isnan(stop_distance):
+            detail = f'position window: {w["velocity_source"]} read NaN'
+        elif abs(rel) <= w['half_window']:
+            detail = (f'position window: output at {rel:+.3f} rad would stop at '
+                      f'{math.copysign(abs(rel) + stop_distance, rel):+.3f} rad '
+                      f'(stop_decel {w["stop_decel"]:g} rad/s^2), past '
+                      f'+/-{w["half_window"]:g} rad')
+        else:
+            detail = (f'position window: output {rel:+.3f} rad from centre, '
+                      f'outside +/-{w["half_window"]:g} rad')
+        return {'kind': 'position_window',
+                'check': 'position_window',
+                'value': None if math.isnan(rel) else rel,
+                'limit': w['half_window'],
+                'at_s': at_s,
+                'detail': detail}
+
+    def _touch_off_ok(self):
+        t = self._touch_off
+        return bool(t and t['passed'] and t['centre'] == self._window_centre)
+
+    def _window_arming_refusal(self):
+        """Why Start must be refused, or None."""
+        w = self._window
+        if w is None:
+            return None
+        if self._jog is not None:
+            return 'a jog or touch-off is running'
+        if self._window_centre is None:
+            return 'no centre declared this session'
+        if w['require_touch_off'] and not self._touch_off_ok():
+            return 'touch-off has not passed since centre was declared'
+        rel = self._window_rel()
+        if math.isnan(rel) or abs(rel) > w['half_window']:
+            return (f'output is {rel:+.3f} rad from centre, outside the '
+                    f'+/-{w["half_window"]:g} rad window')
+        return None
+
+    def _window_state(self):
+        w = self._window
+        if w is None:
+            return None
+        rel = self._window_rel()
+        return {
+            'source': w['source'],
+            'centre': self._window_centre,
+            'rel': None if math.isnan(rel) else rel,
+            'half_window': w['half_window'],
+            'expected_half_span': w['expected_half_span'],
+            'tolerance': w['tolerance'],
+            'max_excursion': w['max_excursion'],
+            'jog': None if self._jog is None else self._jog['kind'],
+            'touch_off': self._touch_off,
+            'touch_off_ok': self._touch_off_ok(),
+            'touch_off_history': self._touch_off_history,
+            'refusal': self._window_arming_refusal(),
+            'message': self._window_message,
+        }
+
+    def _window_say(self, message):
+        self._window_message = message
+        print(f'Controller: {message}')
+
+    def _declare_centre(self):
+        if self._window is None:
+            return self._window_say('Declare centre refused: no position_window in config')
+        if self._test_active or self._jog is not None:
+            return self._window_say('Declare centre refused: the rig is busy')
+        if not self._rig_at_rest():
+            return self._window_say('Declare centre refused: the rig is moving')
+        try:
+            pos = float(self._window['get'](self))
+        except (TypeError, ValueError, AttributeError):
+            pos = math.nan
+        if math.isnan(pos):
+            return self._window_say(f'Declare centre refused: {self._window["source"]} '
+                                    'is not readable')
+        self._window_centre = pos
+        # A touch-off is only meaningful relative to the centre it ran against.
+        self._touch_off = None
+        self._window_say(f'Centre declared at {pos:.4f} rad. Run touch-off before testing.')
+
+    def _jog_refusal(self):
+        if self._window is None:
+            return 'no position_window in config'
+        if self.shutdown:
+            return 'the rig is shutting down'
+        if self._test_active:
+            return 'a test is running'
+        if self._jog is not None:
+            return 'a jog or touch-off is already running'
+        if self._tare_state is not None:
+            return 'a tare is running'
+        if self._window_centre is None:
+            return 'declare centre first'
+        if self.devices.LOAD.fault or (not self._load_only and self.devices.DUT.fault):
+            return 'a drive is faulted'
+        return None
+
+    def _leg(self, direction, expect, stop_at=None):
+        """One constant-direction move. `expect` is 'contact' (ends on the
+        torque cap), 'target' (ends when rel crosses stop_at) or 'manual'."""
+        w = self._window
+        span = 2 * w['max_excursion']
+        return {'direction': direction, 'expect': expect, 'stop_at': stop_at,
+                'start_rel': None, 't0': None, 'over': 0,
+                'timeout_s': 2 * span / max(w['velocity'], 1e-3) + 10.0}
+
+    def _start_jog(self, direction):
+        refusal = self._jog_refusal()
+        direction = 1 if float(direction) > 0 else -1
+        if refusal is None and direction * self._window_rel() >= self._window['max_excursion']:
+            refusal = 'already at max excursion in that direction'
+        if refusal:
+            return self._window_say(f'Jog refused: {refusal}')
+        self._jog = {'kind': 'jog', 'legs': [self._leg(direction, 'manual')]}
+        self._window_say(f'Jogging {"+" if direction > 0 else "-"}')
+
+    def _start_touch_off(self):
+        refusal = self._jog_refusal()
+        rel = self._window_rel()
+        if refusal is None and (math.isnan(rel) or abs(rel) > self._window['half_window']):
+            refusal = 'output is outside the window; jog back toward centre first'
+        if refusal:
+            return self._window_say(f'Touch-off refused: {refusal}')
+        self._touch_off = None
+        self._jog = {'kind': 'touch_off',
+                     'legs': [self._leg(+1, 'contact'), self._leg(-1, 'contact'),
+                              self._leg(+1, 'target', stop_at=0.0)],
+                     'contacts': [], 'problems': []}
+        self._window_say('Touch-off running: + bumper, - bumper, back to centre')
+
+    def _jog_step(self):
+        """Advance the jog/touch-off one cycle and return the command to send."""
+        j, w = self._jog, self._window
+        load, dut = self.devices.LOAD, self.devices.DUT
+        hold = {'input_mode': 'torque', 'output_mode': 'velocity',
+                'input_command': 0, 'output_command': 0}
+
+        if self.shutdown:
+            return self._end_jog('Jog ended: shutdown', failed=True)
+        if load.fault or (not self._load_only and dut.fault):
+            return self._end_jog('Jog ended: a drive faulted', failed=True)
+
+        # The input shaft is left free throughout.
+        dut.sw_enable = False
+        if load.mode != 'velocity' or load.switching_modes:
+            if not load.switching_modes:
+                load.command_operating_mode('velocity')
+            load.sw_enable = False
+            return hold
+        load.sw_enable = True
+
+        rel = self._window_rel()
+        if math.isnan(rel):
+            return self._end_jog(f'Jog ended: {w["source"]} read NaN', failed=True)
+
+        now = time.perf_counter()
+        leg = j['legs'][0]
+        if leg['start_rel'] is None:
+            leg['start_rel'], leg['t0'] = rel, now
+        d = leg['direction']
+
+        if d * rel >= w['max_excursion']:
+            return self._leg_done('excursion', rel)
+        if leg['stop_at'] is not None and d * (rel - leg['stop_at']) >= 0:
+            return self._leg_done('target', rel)
+        if abs(load.velocity) > 2 * max(w['approach_velocity'], w['velocity']) + 0.1:
+            return self._end_jog(f'Jog ended: output overspeed '
+                                 f'({load.velocity:+.3f} rad/s)', failed=True)
+        if now - leg['t0'] > leg['timeout_s']:
+            return self._end_jog('Jog ended: timed out', failed=True)
+
+        # Torque cap. Waived only while backing away from a bumper (moving toward
+        # centre, within arm_distance of where the move began), when the
+        # bumper is still unloading. Moving outward it always applies.
+        outward = d * rel > 0
+        if outward or abs(rel - leg['start_rel']) >= w['arm_distance']:
+            torque = max(abs(float(g(self))) for g in w['torque_get'])
+            if math.isnan(torque):
+                return self._end_jog('Jog ended: torque reading is NaN', failed=True)
+            leg['over'] = leg['over'] + 1 if torque > w['torque_nm'] else 0
+            if leg['over'] >= w['trip_samples']:
+                return self._leg_done('contact', rel)
+
+        slow = outward and abs(rel) > w['slow_from']
+        speed = w['velocity'] if slow else w['approach_velocity']
+        return dict(hold, output_command=d * speed)
+
+    def _leg_done(self, reason, rel):
+        j, w = self._jog, self._window
+        leg = j['legs'].pop(0)
+
+        if j['kind'] == 'jog':
+            text = {'contact': f'contact ({w["torque_nm"]:g} Nm) at {rel:+.4f} rad',
+                    'excursion': f'max excursion reached at {rel:+.4f} rad'}[reason]
+            return self._end_jog(f'Jog stopped: {text}')
+
+        side = '+' if leg['direction'] > 0 else '-'
+        if leg['expect'] == 'contact':
+            if reason == 'contact':
+                j['contacts'].append(rel)
+            else:
+                j['problems'].append(f'no {side} bumper contact before max '
+                                     f'excursion ({rel:+.4f} rad)')
+                # Skip any remaining bumper and come home.
+                j['legs'] = [self._leg(-1 if rel > 0 else 1, 'target', stop_at=0.0)]
+        elif reason != 'target':
+            j['problems'].append(f'return to centre stopped by {reason} at '
+                                 f'{rel:+.4f} rad; jog back manually')
+            j['legs'] = []
+
+        if not j['legs']:
+            return self._finish_touch_off()
+        return {'input_mode': 'torque', 'output_mode': 'velocity',
+                'input_command': 0, 'output_command': 0}
+
+    def _finish_touch_off(self, abort_reason=None):
+        j, w = self._jog, self._window
+        contacts = j['contacts']
+        plus = contacts[0] if len(contacts) > 0 else None
+        minus = contacts[1] if len(contacts) > 1 else None
+        problems = list(j['problems']) + ([abort_reason] if abort_reason else [])
+        passed = plus is not None and minus is not None and not abort_reason
+        if passed:
+            for name, value in (('+', plus), ('-', -minus)):
+                if abs(value - w['expected_half_span']) > w['tolerance']:
+                    passed = False
+                    problems.append(f'{name} bumper at {name}{value:.4f} rad, expected '
+                                    f'{w["expected_half_span"]:.4f} +/- {w["tolerance"]:.4f}')
+        result = {
+            'at': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'centre': self._window_centre,
+            'plus_rad': plus,
+            'minus_rad': minus,
+            # Where the bumpers put centre, relative to the declared one.
+            'centre_error_rad': None if plus is None or minus is None else (plus + minus) / 2,
+            'span_rad': None if plus is None or minus is None else plus - minus,
+            'torque_nm': w['torque_nm'],
+            'expected_half_span_rad': w['expected_half_span'],
+            'tolerance_rad': w['tolerance'],
+            # Only the bumper positions decide a pass. A failed return leg is
+            # reported, and Start stays refused until the output is back in
+            # the window anyway.
+            'passed': passed,
+            'problems': problems,
+        }
+        self._touch_off = result
+        self._touch_off_history.append(result)
+        verdict = 'PASSED' if result['passed'] else 'FAILED'
+        detail = (f'+{plus:.4f} / {minus:+.4f} rad' if plus is not None and minus is not None
+                  else 'incomplete')
+        return self._end_jog(f'Touch-off {verdict}: {detail}'
+                             + (f' ({"; ".join(problems)})' if problems else ''),
+                             finished=True)
+
+    def _end_jog(self, message, failed=False, finished=False):
+        """Stop LOAD and clear the jog. Returns the idle command for this cycle."""
+        j = self._jog
+        if j is not None and j['kind'] == 'touch_off' and not finished:
+            # An interrupted touch-off must not leave an earlier pass standing.
+            self._finish_touch_off(abort_reason=message)
+            return self._safe_default_command
+        self._jog = None
+        load = self.devices.LOAD
+        load.sw_enable = False
+        self.devices.DUT.sw_enable = False
+        if load.mode != 'torque' or load.switching_modes:
+            load.command_operating_mode('torque')
+        self._safe_default_command['input_mode'] = 'torque'
+        self._safe_default_command['output_mode'] = 'torque'
+        self._safe_default_command['input_command'] = 0
+        self._safe_default_command['output_command'] = 0
+        self._window_say(message)
+        return self._safe_default_command
+
     def _sensor_snapshot(self):
         """Live torque-cell, position and velocity readings for behaviors that
         need telemetry (the multisine preamble anchors its amplitude to the
@@ -714,7 +1136,8 @@ class Controller(Master):
 
         # Aligning LOAD's position frame to DUT's only means something when the
         # two are mechanically coupled, which load-only assumes they are not.
-        if (not self._load_only
+        if (self._align_load_position
+                and not self._load_only
                 and self.devices.LOAD.position_offset == 0
                 and not self.devices.DUT.position == 0):
             self.devices.LOAD.position_offset = self.devices.DUT.position - self.devices.LOAD.position
@@ -762,6 +1185,10 @@ class Controller(Master):
                                 if self.shutdown else
                                 {'kind': 'completed', 'detail': 'test ran to completion'})
 
+        elif self._jog is not None:
+            # A jog or touch-off drives LOAD itself; _jog_step owns the enables.
+            self.current_cmd = self._jog_step()
+
         else:
             self.current_cmd = self._safe_default_command
 
@@ -780,7 +1207,7 @@ class Controller(Master):
         # sample except the one a ramp_break detection fired on.
         self.breakaway_torque = self.current_cmd.get('breakaway', float('nan'))
 
-        ff_ratio = 0.8
+        ff_ratio = self._feedforward_ratio
 
         # The feedforward terms exist to cancel the torque the *other* machine is
         # putting through the coupling. Load-only has no DUT contribution to

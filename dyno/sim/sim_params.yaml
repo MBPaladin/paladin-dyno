@@ -10,3 +10,20 @@ ambient_c: 25.0
 thermal_tau_s: 120.0   # stator temperature first-order time constant, s
 heat_c_per_nm: 0.15    # steady-state stator rise per Nm of load torque
 adc_noise_counts: 4000 # gaussian noise on ADC channels (raw counts)
+
+# Per-rig overrides, keyed by the DYNO_SIM mode (the config name).
+modes:
+  inhouse_archimedes:
+    # Starts off zero so a DUT->LOAD position-offset copy would show as a step.
+    initial_theta_rad: 0.3
+    # Lighter shaft, heavy drag: a disabled output stops within a few degrees,
+    # as the real drive does, instead of coasting into the bumpers.
+    inertia_kgm2: 2.0
+    viscous_nms: 10.0
+    coulomb_nm: 3.0
+    stiction_nm: 4.0
+    # 200 deg of output travel: bumpers 100 deg either side of the power-up angle.
+    endstop_centre_rad: 0.3
+    endstop_half_span_rad: 1.745
+    endstop_stiffness_nm_per_rad: 300.0
+    endstop_damping_nms: 20.0

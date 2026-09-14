@@ -1,0 +1,11 @@
+# Sim only (dyno/sim/archimedes_window_test.py): 0.3 rad output shuttle, well
+# inside the position window, for checks that need a test running.
+behaviors:
+  - id: SHUTTLE
+    type: test_trace
+    settings:
+      input_motor:
+        control_mode: torque
+      output_motor:
+        control_mode: position
+      trace_file: "sim_archimedes_shuttle.csv"

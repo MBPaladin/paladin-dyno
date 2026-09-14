@@ -489,6 +489,12 @@ class Master:
         self.state = NONE_STATE
         self.plant = None
         self._opened = False
+        # DYNO_SIM_WKC_DROP='SECONDS[,SECONDS...]': lose one frame (working
+        # counter one short) at each of those times after config_init.
+        self._cycles = 0
+        self._wkc_drops = sorted(float(s) for s in
+                                 (os.environ.get('DYNO_SIM_WKC_DROP') or '').split(',')
+                                 if s.strip())
 
     # -- lifecycle ---------------------------------------------------------
     def open(self, ifname, ifname_red=None):
@@ -580,6 +586,10 @@ class Master:
         # 3) sensors and drives publish the new state as input bytes
         for s in self.slaves:
             s.input = s._behavior.step(CYCLE_S, s.output)
+        self._cycles += 1
+        if self._wkc_drops and self._cycles * CYCLE_S >= self._wkc_drops[0]:
+            self._wkc_drops.pop(0)
+            return self.expected_wkc - 1
         return self.expected_wkc
 
     @property

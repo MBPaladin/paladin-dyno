@@ -64,6 +64,8 @@ class Logger:
         # bias cannot change mid-file and one scalar per sensor describes the
         # whole log.
         self.live_tare = None
+        # Declared centre and last touch-off, for rigs with a position window.
+        self.live_window = None
         # How the run being closed ended, set by stop_logging for _report_meta.
         self.stop_reason = None
         # Naming metadata pushed by the GUI through the logging queue (dict
@@ -104,6 +106,7 @@ class Logger:
                     if isinstance(sample[-1], dict):
                         self.live_session_id = sample[-1].get('session_id')
                         self.live_tare = sample[-1].get('tare')
+                        self.live_window = sample[-1].get('window')
 
                     # starts logging
                     if sample[-2]['log'] == True and self.save == False:
@@ -201,6 +204,13 @@ class Logger:
         # applied, which is what every log written before this feature means.
         if self.live_tare:
             self.file.attrs['tare'] = json.dumps(self.live_tare, default=str)
+
+        # Centre and touch-off can't change while a test runs (the controller
+        # refuses both), so the values at file open describe the whole log.
+        if self.live_window and self.live_window.get('centre') is not None:
+            self.file.attrs['position_window'] = json.dumps(
+                {k: self.live_window.get(k) for k in
+                 ('source', 'centre', 'half_window', 'touch_off')}, default=str)
 
         # makes the HDF5 file and the datasets within it that are needed
         self.dsets = {}

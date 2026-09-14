@@ -1,0 +1,104 @@
+# Scope layout for inhouse_archimedes_dyno_config.yaml. Every data_key must
+# exist in that config's resolved log_keys.
+Output Position:
+  title: Output Position
+  unit: Rad
+  range: # output travel between bumpers is about +/-1.75 rad around centre
+    - -2.5
+    - 2.5
+  data_keys:
+    - load_position
+    - load_position_command
+  legends:
+    - Load Position
+    - LOAD Position Command
+  pens:
+    - g
+    - c
+Torque:
+  title: Torque
+  unit: Nm
+  range:
+    - -20
+    - 20
+  data_keys:
+    - input_torque
+    - load_torque
+    - dut_torque_command
+    - load_torque_command
+  legends:
+    - Measured Input Torque
+    - Measured Output Torque
+    - DUT Torque Command
+    - LOAD Torque Command
+  pens:
+    - y
+    - g
+    - c
+    - m
+Velocity:
+  title: Velocity
+  unit: Rad/s
+  range:
+    - -400
+    - 400
+  data_keys:
+    - dut_velocity
+    - load_velocity
+    - dut_velocity_command
+    - load_velocity_command
+  legends:
+    - DUT Velocity
+    - Load Velocity
+    - DUT Velocity Command
+    - LOAD Velocity Command
+  pens:
+    - r
+    - g
+    - c
+    - c
+Input Position:
+  title: Input Position
+  unit: Rad
+  range:
+    - -150
+    - 150
+  data_keys:
+    - dut_output_position
+    - dut_position_command
+  legends:
+    - DUT Position
+    - DUT Position Command
+  pens:
+    - r
+    - c
+Current Clamp:
+  title: Current
+  unit: A
+  range:
+    - -50
+    - 50
+  data_keys:
+    - current_clamp
+    - dut_current
+    - load_current
+  legends:
+    - Clamp Current
+    - DUT Drive Current
+    - Load Drive Current
+  pens:
+    - m
+    - r
+    - g
+EtherCAT:
+  title: WKC error
+  unit: frames
+  range:
+    - -1
+    - 3
+  data_keys:
+    - wkc_error
+  legends:
+    - WKC Error
+  pens:
+    - r

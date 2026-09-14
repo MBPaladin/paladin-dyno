@@ -1,0 +1,227 @@
+# In-house dyno, IMSystems Archimedes Drive (43:1, counter-rotating, 200 deg
+# output travel between internal endstops).
+#
+# See dyno/docs/archimedes_gearbox_implementation_plan.md and the companion
+# archimedes_gearbox_implementation_log.md. Launch with
+# ./launch/inhouse_archimedes.sh. Kept separate from inhouse_dyno_config.yaml so
+# day-to-day edits there cannot disturb this setup.
+#
+# VERIFY ON THE DYNO BEFORE TRUSTING (see the log's open items):
+#   - Bus and drive roles. Two AKDs only; the Elmo MAC drive is not used and
+#     must be off the chain (bring-up waits until the slave count matches).
+#     The small AKD (RTC-0020, 20 Nm / 600 rad/s) is DUT = input motor, the
+#     large AKD (RTC-0200, 220 Nm) is LOAD = absorber, in that bus order. Check
+#     against ./dyno/bus_scan.sh. The 20 Nm input cell must be on the small
+#     AKD's shaft.
+#   - absorbers.yaml. If a drive's WorkBench name matches an entry there
+#     (e.g. RTC-0200), that entry OVERRIDES the params below. The bring-up print
+#     shows each value's source.
+#   - Torque and direction signs (flip_torque_sign), Step 1 of the plan.
+#
+# DIRECT-COUPLE RUNS (no gearbox): set DUT gear_ratio to 1 and
+# position_window.enabled to false. Leaving -43 lets the test builder allow 43x
+# the torque through the input cell's shaft; the input_torque safety is the only
+# backstop then.
+
+load_only: false
+
+# The controller normally copies DUT position into LOAD.position_offset early
+# in each session, with no gear ratio. That corrupts the output position the
+# window reads, so it is off here.
+align_load_position_to_dut: false
+
+# Cross-coupling torque feedforward. It assumes a fixed positive ratio; this
+# drive reverses and creeps, so it is off.
+feedforward_ratio: 0.0
+
+# --- Output position window ---
+# Centre is declared by the operator each session (output vertical). Start is
+# refused until centre is declared, touch-off has passed against that centre,
+# and the output is inside the window. During a test, leaving the window (or a
+# NaN reading) trips the test like any other safety. Units: rad at the output.
+position_window:
+  enabled: true
+  source: devices.LOAD.position   # absorber encoder, direct to output
+  half_window_rad: 1.50           # ~86 deg; test trips beyond centre +/- this
+  # Early trip: moving outward at v, trip when |pos| + v^2/(2*stop_decel) passes
+  # the window, so the stopped output lands inside it. PLACEHOLDER, deliberately
+  # low: replace with the output deceleration measured in the STO coast check.
+  # At 50, traverses ending at +/-76 deg false-trip above ~2300 rpm input
+  # (5000 rad/s^2 test accel); 3600 rpm needs >= ~76.
+  stop_decel_rad_s2: 50.0
+  velocity_source: devices.LOAD.velocity
+  require_touch_off: true
+  touch_off:
+    # Contact is declared when any of these reads above torque_nm for
+    # trip_samples consecutive cycles. The output cell sits between absorber and
+    # gearbox. Gearbox drag at jog speed must be well under torque_nm.
+    torque_sources: [devices.adc_1.load_torque]
+    torque_nm: 5.0                # same low torque every time (rubber compresses)
+    trip_samples: 10              # 10 ms at 1 kHz
+    velocity_rad_s: 0.05          # outward speed beyond slow_from_rad
+    approach_velocity_rad_s: 0.25 # speed inside slow_from_rad and toward centre
+    slow_from_rad: 1.40
+    arm_distance_rad: 0.03        # torque cap waived for this far when backing off a bumper
+    expected_half_span_rad: 1.745 # 100 deg each side of centre
+    tolerance_rad: 0.09           # ~5 deg: pass/fail for each bumper
+    max_excursion_rad: 1.95       # jog/touch-off never goes further than this from centre
+
+# --- 0. PORTS ---
+ports:
+  - role: input
+    prefix: dut
+    device: DUT
+    attached: Archimedes Drive input
+    cell: input_torque
+  - role: output
+    prefix: load
+    device: LOAD
+    attached: Archimedes Drive output
+    cell: load_torque
+
+# --- 1. SENSOR CONFIGURATION ---
+sensors:
+  # Output torque cell
+  load_torque:
+    port: RESERVED_ADC_1
+    fs_v: 5
+    fs_pos: 500
+    offset: 0
+    supply: NA
+
+  # Input torque cell
+  input_torque:
+    port: RESERVED_ADC_2
+    fs_v: 10
+    fs_pos: 20
+    offset: 0
+    supply: NA
+
+  current_clamp:
+    port: ADC1
+    fs_v: 5
+    fs_pos: 50
+    offset: 0
+    supply: NA
+
+  load_stator_temp:
+    port: RESERVED_RTD
+    sensor_type: PT100
+
+# --- 2. PHYSICAL PANEL WIRING HARNESS ---
+panel_ports:
+  RESERVED_ADC_1:
+    signal_module: adc_1
+    signal_channel: ch1
+  RESERVED_ADC_2:
+    signal_module: adc_1
+    signal_channel: ch2
+  ADC1:
+    signal_module: adc_1
+    signal_channel: ch3
+  ADC2:
+    signal_module: adc_1
+    signal_channel: ch4
+  RTD1:
+    signal_module: rtd_module
+    signal_channel: ch1
+  RTD2:
+    signal_module: rtd_module
+    signal_channel: ch2
+  RTD3:
+    signal_module: rtd_module
+    signal_channel: ch3
+  RTD4:
+    signal_module: rtd_module
+    signal_channel: ch4
+  RESERVED_RTD:
+    signal_module: rtd_module
+    signal_channel: ch8
+
+# --- 3. PHYSICAL HARDWARE BUS ---
+# Positional and must match the scan. The two AKDs keep the order they have in
+# inhouse_dyno_config.yaml; their names (and so their roles) differ.
+expected_slave_layout:
+  - { model: EK1100, name: coupler }
+  - { model: EL3208, name: rtd_module }
+  - { model: ELM3004, name: adc_1 }
+  # Small AKD (RTC-0020): input motor.
+  - model: AKD
+    name: DUT
+    params:
+      flip_torque_sign: False
+      # Signed: output counter-rotates. Nothing in the control path uses the
+      # sign while feedforward_ratio is 0; the test builder takes abs().
+      gear_ratio: -43
+      motor_params:
+        kt: 0.983
+        k_tanh: 0.0001
+      motor_limits:
+        torque: 15              # input cell is 20 Nm FS; test needs ~3.3 Nm + accel
+        continuous_torque: 15
+        velocity: 400           # 3600 rpm = 377 rad/s
+        acceleration: 5000      # rad/s^2, top speeds do not fit the throw at less
+        rotatum: 500
+      drive_params:
+        i_cont: 7
+  # Large AKD (RTC-0200): absorber, direct to the output.
+  - model: AKD
+    name: LOAD
+    params:
+      flip_torque_sign: True
+      gear_ratio: 1 # Output should always be set to 1
+      motor_params:
+        kt: 7.79
+        k_tanh: 0.0164
+      motor_limits:
+        torque: 200
+        continuous_torque: 100
+        velocity: 12            # max test output speed is 8.8 rad/s
+        acceleration: 150       # rad/s^2; 3600 rpm shuttles need ~116 at the output
+        rotatum: 1000
+      drive_params:
+        i_cont: 15
+
+# Measured values over these limits stop the test. nan_trips: a NaN reading
+# trips too (it would otherwise silently pass). The RTD is left without it
+# because an unfitted RTD reads NaN.
+safeties:
+  output_torque: { source: devices.adc_1.load_torque, limit: 200, nan_trips: true } # Nm; raise only if slip torque needs it
+  input_torque: { source: devices.adc_1.input_torque, limit: 15, nan_trips: true } # Nm; input cell is 20 Nm FS
+  output_velocity: { source: devices.LOAD.velocity, limit: 12, nan_trips: true } # rad/s; tests reach 8.8
+  input_velocity: { source: devices.DUT.velocity, limit: 420, nan_trips: true } # rad/s; tests reach 377
+  load_stator_temp: { source: devices.rtd_module.load_stator_temp, limit: 100 } # C
+  wkc_error: { source: wkc_error, limit: 0 } # any lost EtherCAT frame stops the test
+
+tare:
+  duration_s: 3.0
+  sensors: [load_torque, input_torque]
+  max_velocity: 0.05
+  warn_frac_fs: 0.02
+
+gui_params:
+  window_length_s: 30
+  displayed_samples: 2048
+
+log_keys:
+  - [time, time]
+  - [dut_mode, devices.DUT.servo_drive_mode]
+  - [dut_torque_command, devices.DUT.torque_command]
+  - [dut_velocity_command, devices.DUT.velocity_command]
+  - [dut_position_command, devices.DUT.position_command]
+  - [dut_output_position, devices.DUT.position]
+  - [dut_velocity, devices.DUT.velocity]
+  - [dut_current, devices.DUT.current]
+  - [load_mode, devices.LOAD.servo_drive_mode]
+  - [load_torque_command, devices.LOAD.torque_command]
+  - [load_velocity_command, devices.LOAD.velocity_command]
+  - [load_position_command, devices.LOAD.position_command]
+  - [load_position, devices.LOAD.position]
+  - [load_velocity, devices.LOAD.velocity]
+  - [load_current, devices.LOAD.current]
+  - [load_statusword, devices.LOAD.statusword]
+  - [dut_statusword, devices.DUT.statusword]
+  - [cycle_time_us, cycle_dt_us]
+  - [wkc_error, wkc_error]
+  - [preamble_sample, preamble_sample]
+  - [breakaway_torque, breakaway_torque]

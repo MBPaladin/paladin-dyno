@@ -430,6 +430,11 @@ class Window(QWidget):
         self.tare_label.setStyleSheet('font-size: 11px; color: gray;')
         self.controls_layout.addWidget(self.tare_label)
 
+        window_cfg = self.dyno_params.get('position_window')
+        self._has_window = bool(window_cfg) and bool(window_cfg.get('enabled', True))
+        if self._has_window:
+            self.__build_window_panel()
+
         self.__build_safeties_panel()
 
         self.controls_layout.addStretch(1)
@@ -489,6 +494,115 @@ class Window(QWidget):
             grid.addWidget(edit_link, i, 2)
             self._safety_rows.append(
                 (value_label, path_to_row.get(spec.get('source')), limit))
+
+    def __build_window_panel(self):
+        """Centre / jog / touch-off controls for a limited-travel output (config
+        `position_window:`). Jog is hold-to-run: press sends 'jog', release
+        sends 'jog_stop'. The controller enforces every limit; the buttons only
+        offer what it would accept."""
+        title = QLabel('Output Position', alignment=Qt.AlignmentFlag.AlignCenter)
+        title.setStyleSheet('font-size: 16px;')
+        self.controls_layout.addWidget(title)
+
+        self.window_label = QLabel('No centre declared')
+        self.window_label.setWordWrap(True)
+        self.window_label.setStyleSheet('font-size: 11px; color: #b58900;')
+        self.controls_layout.addWidget(self.window_label)
+
+        self.declare_centre_button = QPushButton('Declare Centre')
+        self.declare_centre_button.setToolTip(
+            'Store the current output position as centre for this session.\n'
+            'The rig must be still. Clears any earlier touch-off.')
+        self.declare_centre_button.clicked.connect(
+            lambda: self.control_command_queue.put_nowait(['declare_centre', 0]))
+        self.controls_layout.addWidget(self.declare_centre_button)
+
+        jog_row = QHBoxLayout()
+        self.jog_buttons = []
+        for text, direction in (('Jog −', -1), ('Jog +', +1)):
+            button = QPushButton(text)
+            button.setToolTip('Hold to jog the output under the touch-off torque cap.\n'
+                              'Stops on release, contact, or max excursion.')
+            button.pressed.connect(
+                lambda d=direction: self.control_command_queue.put_nowait(['jog', d]))
+            button.released.connect(
+                lambda: self.control_command_queue.put_nowait(['jog_stop', 0]))
+            jog_row.addWidget(button)
+            self.jog_buttons.append(button)
+        self.controls_layout.addLayout(jog_row)
+
+        self.touch_off_button = QPushButton('Touch Off')
+        self.touch_off_button.setToolTip(
+            'Drive to the + bumper, then the - bumper, at the configured torque, '
+            'then back to centre.\nPasses if both contacts are within tolerance. '
+            'Stop aborts it.')
+        self.touch_off_button.clicked.connect(
+            lambda: self.control_command_queue.put_nowait(['touch_off', 0]))
+        self.controls_layout.addWidget(self.touch_off_button)
+
+        self.touch_off_label = QLabel('No touch-off this session')
+        self.touch_off_label.setWordWrap(True)
+        self.touch_off_label.setStyleSheet('font-size: 11px; color: gray;')
+        self.controls_layout.addWidget(self.touch_off_label)
+
+    def __refresh_window(self, state):
+        w = state.get('window')
+        if not w:
+            return
+        test_active = bool(state.get('test_active'))
+        centred = w.get('centre') is not None
+        self.declare_centre_button.setEnabled(not test_active and not w.get('jog'))
+        self.touch_off_button.setEnabled(not test_active and centred and not w.get('jog'))
+        for button in self.jog_buttons:
+            # Never disabled mid-press: a disabled button can swallow its release.
+            if not button.isDown():
+                button.setEnabled(not test_active and centred
+                                  and w.get('jog') != 'touch_off')
+
+        rows = []
+        if not centred:
+            rows.append('No centre declared')
+            colour = '#b58900'
+        else:
+            rel, half = w.get('rel'), w['half_window']
+            if rel is None:
+                rows.append('Output position unreadable')
+                colour = 'red'
+            else:
+                rows.append(f'Output {rel:+.3f} rad ({np.degrees(rel):+.1f}°) from centre, '
+                            f'window ±{half:g}')
+                colour = ('red' if abs(rel) > half else
+                          '#b58900' if abs(rel) > 0.8 * half else 'green')
+        rows.append('Ready to start' if not w.get('refusal')
+                    else f'Start blocked: {w["refusal"]}')
+        if w.get('message'):
+            rows.append(w['message'])
+        self.window_label.setText('\n'.join(rows))
+        self.window_label.setStyleSheet(f'font-size: 11px; color: {colour};')
+
+        t = w.get('touch_off')
+        history = [h for h in (w.get('touch_off_history') or [])
+                   if h.get('plus_rad') is not None and h.get('minus_rad') is not None]
+        if w.get('jog') == 'touch_off':
+            text, colour = 'Touch-off running…', '#b58900'
+        elif not t:
+            text, colour = 'No touch-off since centre was declared', 'gray'
+        else:
+            text = 'Touch-off ' + ('PASSED' if t['passed'] else 'FAILED')
+            if t.get('plus_rad') is not None and t.get('minus_rad') is not None:
+                text += (f': +{np.degrees(t["plus_rad"]):.1f}° / '
+                         f'{np.degrees(t["minus_rad"]):.1f}°, centre off by '
+                         f'{np.degrees(t["centre_error_rad"]):+.1f}°')
+            if t.get('problems'):
+                text += '\n' + '; '.join(t['problems'])
+            colour = 'green' if t['passed'] else 'red'
+        if len(history) > 1:
+            plus = np.degrees([h['plus_rad'] for h in history])
+            minus = np.degrees([h['minus_rad'] for h in history])
+            text += (f'\n{len(history)} runs: + spread {np.ptp(plus):.1f}°, '
+                     f'− spread {np.ptp(minus):.1f}°')
+        self.touch_off_label.setText(text)
+        self.touch_off_label.setStyleSheet(f'font-size: 11px; color: {colour};')
 
     def __open_config_at_safety(self, safety_name):
         """Open the rig config in VS Code at the named safety's line
@@ -1035,6 +1149,9 @@ class Window(QWidget):
             and not state.get('test_active')
             and not state.get('fault_clear_active'))
         self.__refresh_fault_clear(state)
+
+        if self._has_window:
+            self.__refresh_window(state)
 
         armed = state.get('armed')
         if self._requested_arm is not None:

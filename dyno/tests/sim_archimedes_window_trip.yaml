@@ -1,0 +1,11 @@
+# Sim only (dyno/sim/archimedes_window_test.py): drives the output 2 rad from
+# where it starts, so the position window (1.5 rad) must trip it.
+behaviors:
+  - id: WINDOW_TRIP
+    type: test_trace
+    settings:
+      input_motor:
+        control_mode: torque
+      output_motor:
+        control_mode: position
+      trace_file: "sim_archimedes_window_trip.csv"
