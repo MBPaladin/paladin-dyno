@@ -320,24 +320,39 @@ class EL3208:
 
         param_objs = [0x8000, 0x8010, 0x8020, 0x8030, 0x8040, 0x8050, 0x8060, 0x8070]
         
-        # Beckhoff EL3208 Sensor Element Type dictionary (Index 0x80n0:19)
+        # Beckhoff EL3208 Sensor Element Type dictionary (Index 0x80n0:19).
+        #
+        # This table was off by one until 2026-09-14 -- it started at PT100 = 1,
+        # so every channel declared `sensor_type: PT100` was configured as an
+        # NI100 and read a Pt sensor on the Ni curve, about 30% low. Settled on
+        # the bench by sweeping 0..7 against a known ~21 C ambient with PT100s
+        # fitted (see archimedes_gearbox_implementation_log.md):
+        #
+        #   0 -> 23.1 C  (correct)        4 -> -114.1 C (PT200 predicts -118)
+        #   1 -> 15.8 C  (the old value)  5 -> NaN      (NI1000)
+        #   2 -> NaN     (PT1000)         6 -> NaN      (NI120)
+        #   3 -> -192.4 C (PT500          7 -> -15.9 C  (resistance/other)
+        #                  predicts -203)
+        #
+        # The old table also had no PT200 and put PT500 at 4, which is where
+        # PT200 actually lives. Affects every rig: all configs declare PT100.
         sensor_dict = {
-            'PT100': 1,
-            'NI100': 2,
-            'PT1000': 3,
-            'PT500': 4,
+            'PT100': 0,
+            'NI100': 1,
+            'PT1000': 2,
+            'PT500': 3,
+            'PT200': 4,
             'NI1000': 5,
             'NI120': 6,
-            'RESISTANCE': 7 
         }
-        
+
         for ui, key in enumerate(['ch1', 'ch2', 'ch3', 'ch4', 'ch5', 'ch6', 'ch7', 'ch8']):
             ch_params = self.params.get(key, {})
-            raw_type = ch_params.get('sensor_type', 1) 
-            
+            raw_type = ch_params.get('sensor_type', 0)
+
             # If the YAML provided a string, look it up. Otherwise, use the int/default.
             if isinstance(raw_type, str):
-                sensor_type_int = sensor_dict.get(raw_type.upper(), 1) # Default to 1 (PT100) if typo
+                sensor_type_int = sensor_dict.get(raw_type.upper(), 0) # Default to 0 (PT100) if typo
             else:
                 sensor_type_int = int(raw_type)
 

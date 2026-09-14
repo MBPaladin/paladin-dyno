@@ -249,14 +249,13 @@ safeties:
   input_torque: { source: devices.adc_1.input_torque, limit: 15, nan_trips: true } # Nm; input cell is 20 Nm FS
   output_velocity: { source: devices.LOAD.velocity, limit: 12, nan_trips: true } # rad/s; tests reach 8.8
   input_velocity: { source: devices.DUT.velocity, limit: 420, nan_trips: true } # rad/s; tests reach 377
-  # Absorber temperature. PROVISIONAL LIMIT, see the EL3208 element-type item
-  # in the implementation log: devices.py writes element type 1 for 'PT100',
-  # and if Beckhoff's enum is 0=PT100/1=NI100 then a Pt sensor is being read on
-  # the Ni curve and every reading is ~30% low. 70 trips at a true ~100 C under
-  # that reading and at 70 C if the scale is already right, so it is safe both
-  # ways. Raise it to the real winding limit once the sweep settles the scale.
-  absorber_temp_top: { source: devices.rtd_module.pt100_rtd_top, limit: 70, nan_trips: true } # C
-  absorber_temp_bottom: { source: devices.rtd_module.pt100_rtd_bottom, limit: 70, nan_trips: true } # C
+  # Absorber temperature, on the two RTDs actually fitted. The scale is now
+  # trustworthy: the EL3208 element-type enum was swept on the bench 2026-09-14
+  # and devices.py corrected (PT100 is element type 0, not 1), so these read
+  # true degrees C rather than the ~30% low the Ni curve was giving. 100 C is a
+  # real winding limit again rather than the 70 C placeholder.
+  absorber_temp_top: { source: devices.rtd_module.pt100_rtd_top, limit: 100, nan_trips: true } # C
+  absorber_temp_bottom: { source: devices.rtd_module.pt100_rtd_bottom, limit: 100, nan_trips: true } # C
   # RESERVED_RTD (ch8) is unfitted and reads NaN, so deliberately NO nan_trips
   # here: this entry is inert until a sensor goes on that channel. The two
   # entries above are what actually protect the absorber.
