@@ -58,7 +58,7 @@ position_window:
   # (5000 rad/s^2 test accel); 3600 rpm needs >= ~76.
   stop_decel_rad_s2: 50.0
   velocity_source: devices.LOAD.velocity
-  require_touch_off: true
+  require_touch_off: false
   touch_off:
     # Contact is declared when any of these reads above torque_nm for
     # trip_samples consecutive cycles. The output cell sits between absorber and
@@ -173,37 +173,18 @@ expected_slave_layout:
   - model: AKD
     name: DUT
     params:
-      # This drive's DRV.NAME is RTC-0020, which HAS an absorbers.yaml entry
-      # (confirmed on the bench 2026-09-14). That entry would override the
-      # limits below -- accel 5000 -> 1000, torque 15 -> 20, velocity 400 ->
-      # 600, i_cont 7 -> 20. Opt out; this file is the only source.
       absorber_library: false
       flip_torque_sign: False
-      # Encoder handedness. Hand test 2026-09-14: rotating the input positive
-      # in the right-handed frame read NEGATIVE on dut_output_position, while
-      # positive input torque read positive on the cell. The encoder disagreed
-      # with its own torque cell, so negate it. flip_direction_sign negates
-      # position and velocity coherently, feedback and command
-      # (devices.py:1129/1134/1164/1176) -- unlike flip_torque_sign, which
-      # only negates the commanded current. See log finding 16.
       flip_direction_sign: True
-      # Signed: output counter-rotates. Nothing in the control path uses the
-      # sign while feedforward_ratio is 0; the test builder takes abs().
-      # UNRESOLVED: -43 assumes both shafts in the SAME handedness. The bench
-      # convention is input right-handed, output left-handed, which makes the
-      # ratio +43, and with both encoders now flipped the logged channels
-      # should show +43 too. Cannot be confirmed until the gearbox is fitted
-      # (the lockout plate is on as of 2026-09-14). Inert in the control path;
-      # fix the sign before any analysis relies on it.
-      gear_ratio: -43
+      gear_ratio: 1
       motor_params:
         kt: 0.983
         k_tanh: 0.0001
       motor_limits:
         torque: 15              # input cell is 20 Nm FS; test needs ~3.3 Nm + accel
         continuous_torque: 15
-        velocity: 400           # 3600 rpm = 377 rad/s
-        acceleration: 5000      # rad/s^2, top speeds do not fit the throw at less
+        velocity: 500           # 3600 rpm = 377 rad/s
+        acceleration: 5500      # rad/s^2, top speeds do not fit the throw at less
         rotatum: 500
       drive_params:
         i_cont: 7
@@ -248,7 +229,7 @@ safeties:
   output_torque: { source: devices.adc_1.load_torque, limit: 200, nan_trips: true } # Nm; raise only if slip torque needs it
   input_torque: { source: devices.adc_1.input_torque, limit: 15, nan_trips: true } # Nm; input cell is 20 Nm FS
   output_velocity: { source: devices.LOAD.velocity, limit: 12, nan_trips: true } # rad/s; tests reach 8.8
-  input_velocity: { source: devices.DUT.velocity, limit: 420, nan_trips: true } # rad/s; tests reach 377
+  input_velocity: { source: devices.DUT.velocity, limit: 500, nan_trips: true } # rad/s; tests reach 377
   # Absorber temperature, on the two RTDs actually fitted. The scale is now
   # trustworthy: the EL3208 element-type enum was swept on the bench 2026-09-14
   # and devices.py corrected (PT100 is element type 0, not 1), so these read

@@ -188,6 +188,12 @@ class TestTrace:
         self._in_last = float(self._in_arr[-1])
         self._out_last = float(self._out_arr[-1])
 
+        with open(dyno_paths.dyno_config_directory + '/master_config.yaml') as f:
+            self.dt = yaml.safe_load(f)['cycle_time_us'] / 1e6
+        # Body samples at n*dt for n = 0..n_body-1, the last landing on the
+        # trace's final keyframe. test_preview._expand_trace_body uses the same count.
+        self._n_body = int(math.floor(self._trace_max_time / self.dt + 1e-9)) + 1
+
 
 
     # method that yields out commands to the test manager. before yielding the last command the class should be in a state from which it can be run again.
@@ -203,37 +209,40 @@ class TestTrace:
         }
 
 
-        # Use perf_counter (monotonic) instead of time.time(); cached arrays avoid pandas in the hot path.
-        start_time = time.perf_counter()
-        while True:
-            current_time_in_trace = time.perf_counter() - start_time
-            if current_time_in_trace < self._trace_max_time:
-                command = {
-                    'input_mode': self.input_mode,
-                    'output_mode': self.output_mode,
-                    'input_command':  np.interp(current_time_in_trace, self._t_arr, self._in_arr),
-                    'output_command': np.interp(current_time_in_trace, self._t_arr, self._out_arr),
-                }
-                command['log_flag'] = self.log_id_base + str(self.run)
-                yield command
-            else:
-                for i in range(250): # hold constant cmd to stabilize system
-                    yield {
-                        'input_mode': self.input_mode,
-                        'output_mode': self.output_mode,
-                        'input_command': self._in_last,
-                        'output_command': self._out_last,
-                    }
+        # SAMPLE-paced, not wall-clock paced: the n-th command is the trace at
+        # n*dt. The drives are DC-synced and apply one setpoint per cycle on an
+        # exact grid, but step() reads the clock tens of microseconds off that
+        # grid, and that offset can alternate early/late cycle to cycle. Sampling
+        # the trace at the clock turned it into a 500 Hz position zig-zag of
+        # velocity x jitter -- ~15 mrad at 3600 rpm, 6-11 A of current and 3-4 Nm
+        # on the input cell in the 2026-09-16 Archimedes spin runs. Cached arrays
+        # avoid pandas in the hot path.
+        for n in range(self._n_body):
+            t = n * self.dt
+            yield {
+                'input_mode': self.input_mode,
+                'output_mode': self.output_mode,
+                'input_command':  np.interp(t, self._t_arr, self._in_arr),
+                'output_command': np.interp(t, self._t_arr, self._out_arr),
+                'log_flag': self.log_id_base + str(self.run),
+            }
 
-                if (self.input_mode == 'position' or self.output_mode == 'position') and not (self.trace[f'{motor_key}_position'].iloc[-1] == 0 for motor_key in ['input_motor', 'output_motor']): # toggle output mode so that the next time a motor switches to position mode it reset
-                    yield {
-                        'input_mode': 'torque',
-                        'output_mode': 'torque',
-                        'input_command': 0,
-                        'output_command': 0
-                    }
-                self.run += 1
-                return # Exits the generator
+        for i in range(250): # hold constant cmd to stabilize system
+            yield {
+                'input_mode': self.input_mode,
+                'output_mode': self.output_mode,
+                'input_command': self._in_last,
+                'output_command': self._out_last,
+            }
+
+        if (self.input_mode == 'position' or self.output_mode == 'position') and not (self.trace[f'{motor_key}_position'].iloc[-1] == 0 for motor_key in ['input_motor', 'output_motor']): # toggle output mode so that the next time a motor switches to position mode it reset
+            yield {
+                'input_mode': 'torque',
+                'output_mode': 'torque',
+                'input_command': 0,
+                'output_command': 0
+            }
+        self.run += 1
 
 class GridSearch:
     def __init__(self, parameters, mode, limits):

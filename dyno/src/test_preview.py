@@ -210,13 +210,9 @@ def _expand_trace_body(instance, dt):
     im, om = instance.input_mode, instance.output_mode
     t_arr, in_arr, out_arr = instance._t_arr, instance._in_arr, instance._out_arr
 
-    # Body samples: the generator yields while (perf_counter - start) < max_time,
-    # interpolating at ~i*dt for i = 0, 1, 2, .... Its float clock lands the last
-    # sample a hair under max_time, so it emits floor(max_time/dt)+1 samples
-    # (the trailing one at ~max_time). We match that count exactly; the single
-    # boundary sample's value may differ from the rig by << 1 cycle, which is why
-    # cross_check tolerates one sample at the tail. See module docstring.
-    n_body = int(np.floor(instance._trace_max_time / dt + 1e-9)) + 1
+    # Body samples: the generator is sample-paced, interpolating at exactly i*dt
+    # for i < instance._n_body = floor(max_time/dt)+1 (the last at max_time).
+    n_body = instance._n_body
     args = np.arange(n_body) * dt
     body_in = np.interp(args, t_arr, in_arr)
     body_out = np.interp(args, t_arr, out_arr)

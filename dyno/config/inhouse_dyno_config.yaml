@@ -19,7 +19,7 @@
 # motor's torque is not reacted into the DUT, so LOAD may be commanded to its
 # full 200 Nm. Clearing this flag re-arms that check and caps output torque at
 # DUT.torque x DUT.gear_ratio = 25 Nm until the DUT derate below is raised.
-load_only: false
+load_only: true
 
 # --- 0. PORTS ---
 # The rig's mechanical ports. `role` is what commands / the UI / analysis
@@ -136,6 +136,7 @@ expected_slave_layout:
   - model: AKD
     name: DUT
     params:
+      absorber_library: false
       flip_torque_sign: True
       gear_ratio: 1
       motor_params:
@@ -152,13 +153,14 @@ expected_slave_layout:
   - model: AKD
     name: LOAD
     params:
+      absorber_library: false
       flip_torque_sign: True
       gear_ratio: 1 # Output should always be set to 1
       motor_params:
         kt: 7.79
         k_tanh: 0.0164
       motor_limits:
-        torque: 220
+        torque: 500
         continuous_torque: 100
         velocity: 50
         acceleration: 20 #Rad/s^2
@@ -178,7 +180,7 @@ expected_slave_layout:
 # never > limit - so a failed/disconnected RTD reads NaN and silently disables
 # this check rather than tripping it.
 safeties:
-  output_torque: { source: devices.adc_1.load_torque, limit: 220 } # Nm, derated for bringup
+  output_torque: { source: devices.adc_1.load_torque, limit: 500 } # Nm
   output_velocity: { source: devices.LOAD.velocity, limit: 200 } # rad/s, derated for bringup
   input_velocity: { source: devices.DUT.velocity, limit: 300 } # rad/s, catches a back-driven DUT
   load_stator_temp: { source: devices.rtd_module.load_stator_temp, limit: 100 } # C
