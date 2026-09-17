@@ -133,8 +133,8 @@ position_window:
     # (DUT gear_ratio is not trusted for it). Until then every input move is
     # treated as outward (slow speed near the bumpers).
     input:
-      velocity_rad_s: 2.0           # beyond slow_from_rad, moving out (~0.05 rad/s output)
-      approach_velocity_rad_s: 10.0 # elsewhere (~0.23 rad/s output)
+      velocity_rad_s: 4.0           # beyond slow_from_rad, moving out (~0.093 rad/s output at 43:1)
+      approach_velocity_rad_s: 20.0 # elsewhere (~0.465 rad/s output at 43:1)
       acceleration_rad_s2: 20.0     # slew on the speed command; a step kicks the torque over ceiling_nm
       nominal_ratio: 43             # |input/output|; leg timeouts and the slip check
       ratio_tolerance: 0.3          # measured |ratio| outside 43 +/- 30% stops the move
@@ -437,6 +437,13 @@ log_keys:
   # side of the wire the time went. telemetry_us lags one cycle by construction.
   - [step_us, step_us]
   - [telemetry_us, telemetry_us]
+  # Splits what step_us/telemetry_us leave unaccounted. recv_us is time blocked
+  # waiting for the bus; send_delay_us is how late the send was against its own
+  # deadline, which is where a GIL handoff shows up. On the 2026-09-17 runs the
+  # unaccounted median was 1511 us with wkc_error flat at 0, so the expectation
+  # is recv_us stays small and send_delay_us carries it.
+  - [recv_us, recv_us]
+  - [send_delay_us, send_delay_us]
   - [wkc_error, wkc_error]
   - [preamble_sample, preamble_sample]
   - [breakaway_torque, breakaway_torque]

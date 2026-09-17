@@ -1,9 +1,25 @@
 cycle_time_us: 1000 # overall ethercat cycle time. AKD / ELM have their cycle times hard coded in their setup functions
 interface: enp86s0
 # Phase within the cycle at which the process-data frame should pass the DC
-# reference clock, in us. AKDs run a 250 us internal loop, so 0/250/500/750 sit
-# on its tick boundaries and let jitter shift a setpoint by a quarter cycle.
-dc_send_phase_us: 500
+# reference clock, in us. Two constraints pull opposite ways:
+#
+#   - The AKD runs its internal loop on a 250 us grid. A frame landing ON one of
+#     those boundaries (0/250/500/750) lets ordinary jitter carry a setpoint into
+#     the NEIGHBOURING tick, which the 2026-09-16 Archimedes spin runs showed as
+#     exact +/-0.25-cycle position slips and ~20 A kicks. Stay away from them.
+#   - dc_modulo wraps at 0/1000 us, and the phase-lock integrator in
+#     Master._processdata_loop reads that wrap as a full-scale error reversal.
+#     Stay away from 0 and 1000 too.
+#
+# 625 is the best available compromise: 125 us from the nearest AKD tick and
+# 375 us from the wrap. 375 is equally good if a reason to prefer it appears.
+#
+# This was 500 from the day the knob was introduced and never changed -- which
+# is the worst case on the first constraint and the best on the second. The
+# parameter was added BECAUSE of the tick-boundary diagnosis and then set to the
+# value that diagnosis condemns. The old comment here described boundaries as
+# desirable, contradicting master.py; master.py was the correct one.
+dc_send_phase_us: 625
 
 # Default parent directory offered in the post-experiment "Save to" row. Blank
 # or absent means dyno/logs -- the directory the run already recorded into --

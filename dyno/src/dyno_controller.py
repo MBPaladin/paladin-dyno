@@ -5,6 +5,7 @@ import time
 import math
 import os
 import signal
+import sys
 import threading
 from operator import attrgetter
 from deployment import dyno_paths
@@ -70,6 +71,29 @@ class Controller(Master):
         # "not measured yet" rather than a fictitious 0.
         self.step_us = float('nan')
         self.telemetry_us = float('nan')
+
+        # Telemetry slot -1 (the control-state dict) is ~75-80% of every
+        # sample's pickled bytes, and multiprocessing.Queue is a 64 KiB pipe.
+        # At 1 kHz that pipe filled in ~52 ms, blocked the queue's feeder
+        # thread, and the burst of pickles the feeder pushed when the GUI next
+        # drained held the GIL against this process's SCHED_FIFO 80 cyclic
+        # thread. Measured signature: a 52-cycle beat in cycle_time_us, present
+        # at lag 52/102/202 in its autocorrelation, identical in all six
+        # Archimedes runs, with the overrun 4-7 cycles ahead of every 20 A
+        # current spike. See dyno/docs/archimedes_cycle_overrun_handoff.md.
+        #
+        # Nobody consumes it at 1 kHz: the GUI renders at ~33 Hz and the Logger
+        # only reads it when a file opens. So it rides a heartbeat instead --
+        # every CONTROL_STATE_PERIOD cycles, plus any cycle where logging_state
+        # changed, which is exactly the cycles the Logger opens a file, closes
+        # one, or crosses a behavior boundary on. Slot -1 is None in between.
+        #
+        # 20 cycles = 50 Hz, chosen so the 30 ms GUI tick always drains at
+        # least one state. It cannot be change-triggered instead: _window_state
+        # carries 'rel', the live shaft position, which moves every cycle.
+        self._state_counter = 0
+        self._last_logging_state = None
+        self._sample_bytes_logged = False
 
         # The preamble behavior's monotonic sample index, exposed for logging
         # (log key 'preamble_sample'). NaN whenever no preamble is generating.
@@ -209,6 +233,21 @@ class Controller(Master):
                  bool(spec.get('nan_trips', False)), trip_samples))
         # Consecutive-breach counter per check, reset on any in-range read.
         self._safety_streaks = {}
+
+        # Cap how long the cyclic thread can wait to get the GIL back. The
+        # default is 5 ms, and 5 ms is what the worst cycles in the Archimedes
+        # logs cost: cycle_time_us max 5517 us, of which 5453 us was outside
+        # both Controller.step() and _send_telemetry. The waiter here is the
+        # SCHED_FIFO 80 process-data thread and the holder is the telemetry
+        # queue's feeder thread, so priority buys nothing -- the GIL is not
+        # priority-aware. 500 us trades a little more switching overhead for a
+        # 10x shorter worst-case stall.
+        #
+        # This bounds the symptom, it does not remove the cause; the cause is
+        # that the cyclic thread is the producer for a Python queue whose
+        # consumer runs at 33 Hz. See the handoff doc's fix list.
+        sys.setswitchinterval(0.0005)
+        print(f'Controller: GIL switch interval {sys.getswitchinterval()*1e6:.0f} us')
 
         try:
             os.sched_setscheduler(0, SCHED_POLICY, os.sched_param(SCHED_PRIO))
@@ -410,7 +449,12 @@ class Controller(Master):
             # that starts late still has the reason to hand.
             self.logging_state = {'log': False, 'stop_reason': self._stop_reason}
 
-        self.control_state = self._control_state()
+        # Heartbeat, or any cycle that changed what the Logger keys off.
+        send_state = (self._state_counter % self.CONTROL_STATE_PERIOD == 0
+                      or self.logging_state != self._last_logging_state)
+        self._last_logging_state = self.logging_state
+        self._state_counter += 1
+        self.control_state = self._control_state() if send_state else None
 
         self.time = time.perf_counter() - self.t_offset
 
@@ -418,7 +462,42 @@ class Controller(Master):
         telemetry.append(self.logging_state)
         telemetry.append(self.control_state)
 
+        self._report_sample_bytes(telemetry, send_state)
+
         self._telemetry_queue.put_nowait(telemetry)
+
+    # How many cycles between control-state heartbeats. See __init__.
+    CONTROL_STATE_PERIOD = 20
+
+    def _report_sample_bytes(self, telemetry, has_state):
+        """Print the pickled size of both sample variants, once, at bring-up.
+
+        This is the number that sets the overrun period: multiprocessing.Queue
+        is a 64 KiB pipe, so 65536 / sample_bytes is how many samples buffer
+        before the feeder thread blocks, and at 1 kHz that count IS the beat
+        period in ms. Measuring it beats inferring it, and it costs two
+        pickles per bring-up rather than two per cycle."""
+        if self._sample_bytes_logged or not has_state:
+            return
+        self._sample_bytes_logged = True
+        try:
+            import pickle
+            full = len(pickle.dumps(telemetry)) + 4   # +4: send_bytes length header
+            lean = len(pickle.dumps(telemetry[:-1] + [None])) + 4
+            mean = (full + lean * (self.CONTROL_STATE_PERIOD - 1)) / self.CONTROL_STATE_PERIOD
+            rate = 1_000_000 / self.process_data_cycle_time_us
+            print('#' * 32)
+            print('Telemetry sample size')
+            print(f'\twith control_state:    {full} bytes')
+            print(f'\twithout (slot -1 None): {lean} bytes')
+            print(f'\tmean at 1:{self.CONTROL_STATE_PERIOD} heartbeat: {mean:.0f} bytes')
+            print(f'\t64 KiB pipe holds {65536 / mean:.0f} samples '
+                  f'= {65536 / mean / rate * 1000:.0f} ms of buffer')
+            print(f'\t(before this change: {65536 / full:.0f} samples '
+                  f'= {65536 / full / rate * 1000:.0f} ms -- the measured beat was 52 ms)')
+            print('#' * 32)
+        except Exception as e:  # never let instrumentation cost a run
+            print(f'Controller: could not size the telemetry sample: {e}')
 
     # recieves and manages commands from the GUI
     def _cmd_check(self):
@@ -2213,7 +2292,19 @@ class Controller(Master):
         self._send_telemetry()
         self._cmd_check()
         self.telemetry_us = (time.perf_counter() - telemetry_start) * 1e6
-        time.sleep(0) #momentarily yeilds the GIL
+        # There was a time.sleep(0) here "to momentarily yield the GIL". It is
+        # removed deliberately. step() is called from Master._processdata_loop
+        # between process_txpdo and write_rxpdo, so a yield on this line hands
+        # the GIL to the telemetry feeder thread in the one place it hurts
+        # most: immediately before the outbound setpoint is marshalled into the
+        # frame. Reacquiring it costs up to one sys.setswitchinterval, and it
+        # lands in the region the log calls "unaccounted" (median 1.5 ms, max
+        # 5.45 ms against a 5 ms default switch interval).
+        #
+        # It was also redundant. hybrid_sleep_until spends ~700 us of every
+        # cycle inside clock_nanosleep with the GIL released, which is a far
+        # better window for the feeder than a yield mid-cycle, and far more
+        # than the ~5 us it needs to pickle one sample.
 
     def _write_led(self, ch, mode):
 

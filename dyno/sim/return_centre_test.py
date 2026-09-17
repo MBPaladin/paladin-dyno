@@ -74,7 +74,11 @@ class Rig:
                     fail('controller process died')
                     return False
                 continue
-            self.state = s[-1]
+            # Slot -1 rides a ~50 Hz heartbeat rather than every sample, so it
+            # is None on most of them -- see Controller._send_telemetry. Keep the
+            # last real state: every predicate below reads through it.
+            if s[-1] is not None:
+                self.state = s[-1]
             if until is not None and until(self):
                 return True
         return False

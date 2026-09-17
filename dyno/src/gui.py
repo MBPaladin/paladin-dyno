@@ -133,6 +133,31 @@ class Window(QWidget):
         # make a buffer for incoming telementry
         self.telemetry_samples = []
 
+        # Consumer-side lag instrumentation. The handoff doc's Q3 could not be
+        # answered because nothing on this side of the queue was ever measured:
+        # the 'time' channel is the CONTROLLER's perf_counter, so a log full of
+        # clean timestamps says nothing about how stale the plots were.
+        #
+        # _drain_lag is the accrued difference between wall time elapsed here and
+        # sample time elapsed in the stream. It needs no clock sync between the
+        # processes because both terms are differences from the same baseline: it
+        # starts at 0 and grows by exactly the amount this window falls behind.
+        # That is the quantity the operator reports growing over a run.
+        #
+        # _backlog is Queue.qsize(), which counts puts minus gets and so ALSO
+        # sees the samples parked in the producer's feeder-thread deque -- the
+        # unbounded buffer the plots actually fall behind in, and the one no
+        # other measurement can reach.
+        self._lag_wall0 = None
+        self._lag_t0 = None
+        self._drain_lag = 0.0
+        self._lag_peak = 0.0
+        self._backlog = 0
+        self._backlog_peak = 0
+        self._lag_warned = 0.0
+        self._lag_at_run_start = 0.0
+        self._run_ended_pending = False
+
         # Default parent directory for the post-experiment "Save to" row.
         # Blank/absent means the directory the run already recorded into, so a
         # plain Save is a no-op rename.
@@ -1488,6 +1513,7 @@ class Window(QWidget):
 
         # pull samples from telemetry queue
         control_state = None
+        newest_sample_time = None
         read_queue = True
         while read_queue:
             try:
@@ -1503,6 +1529,12 @@ class Window(QWidget):
                     self._run_started = time.time()
                     self._segment_started = None
                     self._segment_seen = None
+                    # Per-run baselines for the lag readout. The lag itself is
+                    # NOT reset: it accrues across a session and zeroing it here
+                    # would hide that. Only what this run added is reported.
+                    self._lag_at_run_start = self._drain_lag
+                    self._lag_peak = self._drain_lag
+                    self._backlog_peak = self._backlog
                     # The Logger resolves 'log_dir' against dyno_logs_directory
                     # itself, so it gets the bare name; we keep the absolute
                     # path, which is what survives a later relocation.
@@ -1516,19 +1548,41 @@ class Window(QWidget):
                 elif not log_flag and self._log_active:
                     self._log_active = False
                     self._notes_prompt_pending = True
+                    self._run_ended_pending = True
                 # Slot -1: the controller's own view of what it holds. Keep the
-                # newest; it is reconciled once, after the drain.
-                control_state = sample[-1]
+                # newest; it is reconciled once, after the drain. It arrives on a
+                # ~50 Hz heartbeat rather than every sample (it was 75-80% of
+                # every sample's pickled bytes and was filling the 64 KiB queue
+                # pipe in 52 ms -- see Controller._send_telemetry), so slot -1 is
+                # None on most samples and a None must never overwrite the last
+                # real state.
+                if sample[-1] is not None:
+                    control_state = sample[-1]
+                newest_sample_time = sample[0]
                 self.logging_queue.put_nowait(sample) #forward sample to the logging thread
                 self.telemetry_samples.append(sample[:-2])
             except:
                 read_queue = False
                 pass
 
+        self.__measure_drain_lag(newest_sample_time)
+
         if control_state is not None:
             self.__reconcile_controller(control_state)
         self.__refresh_status()
         self.__refresh_progress()
+
+        # Reported here rather than in the drain loop: that loop's except is
+        # bare, so anything raised inside it silently ends the drain -- which
+        # looks exactly like the lag this is measuring.
+        if self._run_ended_pending:
+            self._run_ended_pending = False
+            accrued = self._drain_lag - self._lag_at_run_start
+            print(f'GUI: run ended. Plot lag accrued during this run: '
+                  f'{accrued:+.2f} s (now {self._drain_lag:.2f} s behind, peak '
+                  f'{self._lag_peak:.2f} s). Telemetry backlog peak '
+                  f'{self._backlog_peak} samples = '
+                  f'{self._backlog_peak / 1000.0:.2f} s at 1 kHz.')
 
         if self._notes_prompt_pending:
             self._notes_prompt_pending = False
@@ -1550,6 +1604,39 @@ class Window(QWidget):
 
         self.__update_safeties_panel()
         self.redraw()
+
+    def __measure_drain_lag(self, newest_sample_time):
+        """How far behind the rig this window is, and how deep the backlog is.
+
+        Both are relative to the first sample this window ever drained, so a
+        constant offset between the two processes' clocks cancels and only the
+        ACCRUAL shows. A healthy pipeline holds this near 0 for a whole run; the
+        symptom being chased is it climbing to several seconds by the end."""
+        try:
+            self._backlog = self.telemetry_queue.qsize()
+            self._backlog_peak = max(self._backlog_peak, self._backlog)
+        except NotImplementedError:
+            pass  # qsize is unavailable on some platforms; not worth failing over
+
+        if newest_sample_time is None:
+            return  # nothing drained this tick, so nothing new to compare
+
+        now = time.time()
+        if self._lag_wall0 is None:
+            self._lag_wall0 = now
+            self._lag_t0 = newest_sample_time
+            return
+
+        self._drain_lag = ((now - self._lag_wall0)
+                           - (newest_sample_time - self._lag_t0))
+        self._lag_peak = max(self._lag_peak, self._drain_lag)
+
+        # Say it once per whole second of lag rather than on every tick, so a
+        # genuinely lagging run is loud without a healthy one printing at 33 Hz.
+        if self._drain_lag >= self._lag_warned + 1.0:
+            self._lag_warned = self._drain_lag
+            print(f'GUI: plots are {self._drain_lag:.1f} s behind the rig '
+                  f'({self._backlog} samples queued)')
 
     def redraw(self):
         draw_start = time.time()
