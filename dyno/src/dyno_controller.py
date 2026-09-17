@@ -14,6 +14,15 @@ SCHED_POLICY = os.SCHED_FIFO
 SCHED_PRIO = 50
 
 class Controller(Master):
+    # A manual jog stops if the GUI's keepalive ('jog_alive', sent every 0.1 s
+    # while a jog button is held) is missing for this long.
+    JOG_KEEPALIVE_TIMEOUT_S = 0.5
+
+    # Return to centre is refused this close to centre: the move would be over
+    # before the drive finished enabling, and "already there" is the useful
+    # answer.
+    RETURN_CENTRE_DEADBAND_RAD = 0.005
+
     def __init__(self, telemetry_queue=None, command_queue=None,mode=None):
         # Runs in a child process: ignore SIGINT so a terminal Ctrl-C can't kill
         # the real-time control loop mid-cycle (which would orphan it with the
@@ -53,6 +62,15 @@ class Controller(Master):
 
         self.t_offset = time.perf_counter()
 
+        # Loop-time breakdown, for the `step_us` / `telemetry_us` log keys (both
+        # optional -- a config that does not list them pays only the clock
+        # reads). step_us is this cycle's; telemetry_us is necessarily the
+        # PREVIOUS cycle's, since it is not known until after the sample
+        # carrying it has been queued. Seeded NaN so the first cycles read as
+        # "not measured yet" rather than a fictitious 0.
+        self.step_us = float('nan')
+        self.telemetry_us = float('nan')
+
         # The preamble behavior's monotonic sample index, exposed for logging
         # (log key 'preamble_sample'). NaN whenever no preamble is generating.
         # Coherent averaging in analysis needs exact period boundaries, which
@@ -73,6 +91,10 @@ class Controller(Master):
         # off so the Logger can stamp it into the file it is about to close.
         # See _stop_test.
         self._stop_reason = None
+        # The phase between a test ending and the drives coming off: an active
+        # brake, then a logging tail. None whenever no run is winding down.
+        # See _stop_test / _post_test_step.
+        self._post_test = None
         self.generated_cmd = None
         self.test_definition = None
         self._test_init_thread = None
@@ -135,12 +157,23 @@ class Controller(Master):
         # --- Output position window (limited-travel DUTs) ---
         # Config `position_window:`; absent means the feature is off and every
         # _window_* / jog / touch-off method is a no-op. See the section below.
+        # --- End-of-test brake and logging tail ---
+        # Config `post_test:`; absent means tail 0 and brake off, which is the
+        # old cut-the-power-and-close-the-file behaviour exactly.
+        self._post = self._compile_post_test(self.dyno_params.get('post_test'))
+
         self._window = self._compile_window(self.dyno_params.get('position_window'))
         self._window_centre = None      # LOAD-frame position declared as centre
         self._touch_off = None          # last completed touch-off result
         self._touch_off_history = []    # every touch-off this session
         self._jog = None                # jog or touch-off in flight
         self._window_message = None
+        # Measured on input-shaft moves, kept for the session: which way the
+        # output turns for a positive input command (+1/-1) and the signed
+        # input/output ratio. The sign is needed to know which input direction
+        # is outward; config gear_ratio is not trusted for it (see log 16).
+        self._input_sign = None
+        self._input_ratio = None
 
         self._aux_funcs = []
         if self.mode == 'actuator_production':
@@ -208,24 +241,94 @@ class Controller(Master):
         record of what stopped it. The only account of it was a print to a
         terminal nobody kept.
 
-        The reason rides out on the next telemetry sample (the one carrying
-        log=False) and the Logger stamps it onto the file as the `stop_reason`
-        attribute. A None reason still overwrites the previous one: a stale
-        reason on a new run is worse than no reason at all.
+        The reason rides out on the telemetry sample that turns logging off and
+        the Logger stamps it onto the file as the `stop_reason` attribute. A
+        None reason still overwrites the previous one: a stale reason on a new
+        run is worse than no reason at all.
+
+        With `post_test:` configured that sample is no longer the next one: the
+        run hands over to _post_test_step, which brakes the shaft and then keeps
+        logging for log_tail_s before letting the file close. The breaching
+        sample is still absent -- the reason dict carries its value and limit
+        for that -- but what the rig did NEXT is now in the trace, which for a
+        stopping-distance trip is the part that matters. What the brake itself
+        did is folded into the same reason dict under 'brake'.
         """
         self._stop_reason = reason
         if not self.test_definition == None:
             self.test_definition.reset()
-        self.devices.DUT.sw_enable = False
-        self.devices.LOAD.sw_enable = False
+        # Whether a run was actually in progress decides whether there is
+        # anything to wind down. The GUI's Stop button lands here with the rig
+        # already idle, and a tail there would open a fresh log full of nothing.
+        was_active = self._test_active
         self._test_active = False
 
-        # self.devices.DUT.command_operating_mode('torque')
+        # The absorber comes off immediately in every case. It is at zero
+        # command by now and nothing past this point wants it pushing on the
+        # output; only the input drive brakes.
+        self.devices.LOAD.sw_enable = False
         self.devices.LOAD.command_operating_mode('torque')
-        self._safe_default_command['input_mode'] = 'torque'
         self._safe_default_command['output_mode'] = 'torque'
-        self._safe_default_command['input_command'] = 0
         self._safe_default_command['output_command'] = 0
+
+        self._post_test = self._begin_post_test(reason) if was_active else None
+
+        # A braking phase is the one case that keeps the input drive energised,
+        # and _post_test_step drops it the moment the brake ends. Note the input
+        # is deliberately NOT switched to torque mode here: an AKD de-energises
+        # to change mode, so a switch would cut the torque exactly when the
+        # brake needs it. The brake works in whatever mode the run left behind.
+        # In both branches the input's standing command goes to zero. The
+        # brake overrides it with its own every cycle, but _brake_step has one
+        # path that falls through to the default (torque mode, velocity still
+        # reading exactly zero, no direction to oppose yet) -- and there the
+        # last command the TEST issued must not keep being applied.
+        self._safe_default_command['input_command'] = 0
+        if self._post_test is not None and self._post_test['stage'] == 'brake':
+            self._safe_default_command['input_mode'] = self.devices.DUT.mode
+        else:
+            self.devices.DUT.sw_enable = False
+            self._safe_default_command['input_mode'] = 'torque'
+
+    def _dut_command_for_mode(self, cmd):
+        """The input command to actually send, given the mode the drive is IN.
+
+        AKD.send_command dispatches on the drive's own `mode`, not on the mode
+        the command was written for, and the two disagree for as long as a mode
+        switch is in flight -- an AKD has to walk back through Ready to Switch
+        On, which took 18 cycles on this rig. A command of 0 written for torque
+        mode ("no torque") is then read as a POSITION of 0, which means "travel
+        to wherever the shaft was when position mode was entered".
+
+        That is not theoretical. It fired on all five runs in
+        logs/archimedes/gbx_1p2p0/troubleshooting_initial: every stop ended with
+        `dut_position_command` stepping to 0 with `dut_mode` still 2, ~21 A (3x
+        the 7 A continuous rating), and the input at 300 rad/s within 6 ms. In
+        med_speed_5 the drive then disabled and the train coasted 1.19 rad at
+        the output into the rubber bumper. _stop_test and _end_brake both ASK
+        for torque mode before leaving a zero standing, and both are correct
+        about the intent; the gap is that asking is not arriving.
+
+        So while the drive is still in position mode, a command written for any
+        other mode is replaced with "hold where you are". Torque and velocity
+        modes need no equivalent: zero is genuinely zero in both.
+        """
+        command = cmd['input_command']
+        dut = self.devices.DUT
+        if dut.mode != 'position' or cmd.get('input_mode') == 'position':
+            return command
+        # getattr, because only AKD and ELMO have had their command-frame
+        # arithmetic worked out (each differs -- see their properties). A drive
+        # class without it falls through to the behaviour it has today rather
+        # than being held at a position derived from a frame nobody checked.
+        hold = getattr(dut, 'position_command_frame', math.nan)
+        if not math.isnan(hold):
+            return hold
+        # No readable position to hold at. Repeating the last position command
+        # keeps the drive where it was last told to be, which is within a
+        # following error of the shaft -- still bounded, unlike 0.
+        last = getattr(dut, 'position_command', math.nan)
+        return command if math.isnan(last) else last
 
     def _control_state(self):
         """Rig state for the GUI's status indicator (telemetry slot -1).
@@ -250,6 +353,11 @@ class Controller(Master):
                            if self._test_load_error
                            and self._test_load_error[0] == current else None),
             'test_active': self._test_active,
+            # The wind-down after a run: 'brake', 'tail', or None. The GUI shows
+            # it because Start and the jog buttons are refused while it lasts,
+            # and an operator who is not told why reads that as a dead button.
+            'post_test': (None if self._post_test is None
+                          else self._post_test['stage']),
             # Where the run is, for the GUI's progress readout. Only meaningful
             # while a test is running -- an armed-but-idle plan has not entered
             # its first segment, and reporting last run's position would read as
@@ -286,6 +394,13 @@ class Controller(Master):
         if self._test_active and 'log_flag' in self.current_cmd:
             self.logging_state = {'log': True, 'behavior_id': self.current_cmd['log_flag']}
         elif self._test_active: # If test is active but no specific log_flag
+            self.logging_state = {'log': True}
+        elif self._post_test is not None:
+            # The run is over but the file stays open: the brake and the coast
+            # after it are what a stopping-distance trip has to be judged on,
+            # and an E-Stop's interesting part starts here too. No behavior_id,
+            # so the Logger closes out the last behavior's index range and the
+            # tail is not attributed to it.
             self.logging_state = {'log': True}
         elif self._stop_reason is not None:
             # _stop_test cleared _test_active earlier in this same step(), so
@@ -327,9 +442,26 @@ class Controller(Master):
         while read_queue:
             try:
                 cmd = self._command_queue.get_nowait()
+                # An operator action ends the logging tail early rather than
+                # being refused by it. The tail is a best-effort recording
+                # window, not a lock: an operator who reaches for Jog 300 ms
+                # after a trip should get a jog, not a dead button, and the log
+                # simply closes at that point instead of two seconds later. The
+                # BRAKE is the opposite -- that one blocks, because it is still
+                # holding the shaft (see _post_test_refusal).
+                if cmd[0] in self._TAIL_YIELDING_CMDS:
+                    self._yield_post_test_tail()
                 if cmd[0] == 'start_test':
                     if self._test_active:
                         print('Unable to start test: Test already active')
+                    elif self._post_test_refusal():
+                        # Into _window_message, not just a print: this is the
+                        # one refusal an operator meets by pressing Start twice
+                        # in quick succession, and a button that does nothing
+                        # silently reads as a broken button.
+                        self._window_message = ('Start refused: '
+                                                + self._post_test_refusal())
+                        print(f'Unable to start test: {self._window_message}')
                     elif not self._load_only and self.devices.DUT.fault:
                         print('Unable to start test: DUT in fault state')
                     elif self.devices.LOAD.fault:
@@ -362,7 +494,16 @@ class Controller(Master):
                     self._declare_centre()
 
                 elif cmd[0] == 'jog':
-                    self._start_jog(cmd[1])
+                    # ['jog', direction] or ['jog', direction, 'input'|'output']
+                    self._start_jog(cmd[1], cmd[2] if len(cmd) > 2 else 'output')
+
+                elif cmd[0] == 'jog_alive':
+                    # Keepalive from the GUI while a jog button is held. Only
+                    # refreshes a running manual jog; it never starts one, so a
+                    # late keepalive cannot restart a jog that stopped on
+                    # contact.
+                    if self._jog is not None and self._jog['kind'] == 'jog':
+                        self._jog['alive'] = time.perf_counter()
 
                 elif cmd[0] == 'jog_stop':
                     # Hold-to-run release. Only ends a manual jog: a touch-off
@@ -372,6 +513,9 @@ class Controller(Master):
 
                 elif cmd[0] == 'touch_off':
                     self._start_touch_off()
+
+                elif cmd[0] == 'return_centre':
+                    self._start_return_centre()
 
                 elif cmd[0] == 'test_def':
                     if not self._test_active:
@@ -623,6 +767,8 @@ class Controller(Master):
         silently. Better to reject it than to record a confident wrong zero."""
         if self._test_active:
             self._tare_message = 'Tare refused: a test is running'
+        elif self._post_test is not None:
+            self._tare_message = 'Tare refused: ' + self._post_test_refusal()
         elif self._tare_state is not None:
             self._tare_message = 'Tare refused: a tare is already in progress'
         elif self._jog is not None:
@@ -742,9 +888,427 @@ class Controller(Master):
     # drive: 200 deg between internal endstops). The operator declares centre,
     # a touch-off confirms both bumpers are where the config says, and from
     # then on a test trips if the output leaves centre +/- half_window. Jog and
-    # touch-off run with the rig otherwise idle: LOAD in velocity mode, DUT
-    # disabled (input shaft free), stopped by a torque cap, the max excursion,
-    # an overspeed check, a timeout, a drive fault, or Stop.
+    # touch-off run with the rig otherwise idle, driving one shaft in velocity
+    # mode with the other disabled (free):
+    #   - output drive: LOAD moves, contact is a fixed torque on the output cell.
+    #   - input drive (`touch_off.input:`): DUT moves, contact is a RISE above the
+    #     drag measured during the move, on the input cell. The gearbox
+    #     multiplies whatever the input pushes, so a fixed threshold would have
+    #     to sit above the drag and would land ~ratio x that on the bumper.
+    # Either is stopped by contact, the max excursion, an overspeed check, a
+    # timeout, a drive fault, or Stop. Input moves also stop if the output stops
+    # following the input at the configured ratio (coupling slip).
+    #
+    # Return to centre (`return_centre`) is the leg a touch-off ends with,
+    # offered on its own button: one input-driven move home, click to run
+    # rather than hold, subject to every check above.
+
+    # --- End of test: active brake, then a logging tail -------------------
+    #
+    # Both are config (`post_test:`); absent means neither runs and a stop is
+    # the old cut-the-power-and-close-the-file.
+    #
+    # Why the brake exists: on the Archimedes gearbox the free coast is
+    # 20.3 rad/s^2 at the output, so a trip at back-drive speed travels 1.91 rad
+    # before stopping -- past the window and past the bumpers. The input drive
+    # stops it in 0.14 rad at 4 Nm, because the 43.88:1 ratio multiplies its
+    # torque while the train's inertia is mostly its own rotor. See the
+    # measurement in the config block and log section 1.
+    #
+    # Why the tail exists: _test_active gates logging, so the file used to close
+    # on the sample that ended the run. The coast after a trip -- the one thing
+    # a stopping-distance safety is betting on -- was never recorded, and an
+    # E-Stop (which arrives here as a drive fault) cut the file at the instant
+    # the interesting part started.
+
+    # Endings that must not try to brake. A DS402 fault means the drive will not
+    # take a command at all, and shutdown means the process is going away, where
+    # holding a tail open risks losing the log entirely.
+    _NO_BRAKE_KINDS = frozenset({'drive_fault', 'shutdown'})
+    # Endings that skip the tail too.
+    _NO_TAIL_KINDS = frozenset({'shutdown'})
+    # How far over stop_velocity the output has to be for a settling brake to
+    # start pushing again. Hysteresis, not a threshold: it exists so driveline
+    # ring-down cannot re-trigger the brake, only real motion can. Sized off the
+    # rig -- the chatter this guards against reached 0.163 rad/s at the output
+    # (brake_checks/torque_mode_brake_check), so 8 x the 0.05 stop_velocity
+    # leaves 2.5x margin over it. Erring high is safe: the shaft cannot creep
+    # at all until something beats 14 Nm of reflected static friction, and once
+    # it does it will be moving far faster than this.
+    _BRAKE_RESUME_FACTOR = 8.0
+
+    def _compile_post_test(self, spec):
+        """`post_test:` -> {'log_tail_s': float, 'brake': dict or None}.
+
+        Config-only: this runs from __init__, before Master.run has built
+        self.devices, so nothing here may touch a drive. The brake torque is
+        checked against the drive's limit at brake entry instead.
+        """
+        spec = spec or {}
+        post = {'log_tail_s': max(0.0, float(spec.get('log_tail_s', 0.0))),
+                'brake': None}
+        b = spec.get('brake') or {}
+        if not b.get('enabled', False):
+            return post
+        if self._load_only:
+            raise ValueError(f'post_test.brake in {self.mode}_dyno_config.yaml '
+                             'brakes with the input drive, but load_only is set '
+                             '-- that drive is never commanded')
+        source = b.get('velocity_source') or 'devices.LOAD.velocity'
+        post['brake'] = {
+            'torque_nm': abs(float(b['torque_nm'])),
+            'velocity_source': source,
+            'velocity_get': attrgetter(source),
+            'stop_velocity': abs(float(b.get('stop_velocity_rad_s', 0.05))),
+            'min_velocity': abs(float(b.get('min_velocity_rad_s', 0.05))),
+            'settle_s': max(0.0, float(b.get('settle_s', 0.05))),
+            'timeout_s': max(0.0, float(b.get('timeout_s', 0.5))),
+            'verify_s': max(0.0, float(b.get('verify_s', 0.010))),
+            'verify_rise': abs(float(b.get('verify_rise_frac', 0.10))),
+            # 'auto' derives it from the drive's own two sign flags, which is
+            # what the rig is verified on. +1/-1 pins it, for a drive whose
+            # current loop does not follow the usual convention or a sim that
+            # models the flags differently.
+            'polarity': b.get('polarity', 'auto'),
+        }
+        if post['brake']['polarity'] not in ('auto', 1, -1):
+            raise ValueError(f'post_test.brake.polarity in {self.mode}_dyno_'
+                             f'config.yaml must be auto, 1 or -1, got '
+                             f'{post["brake"]["polarity"]!r}')
+        if post['brake']['timeout_s'] <= 0:
+            raise ValueError(f'post_test.brake in {self.mode}_dyno_config.yaml '
+                             'needs timeout_s > 0, or the brake can never run')
+        return post
+
+    def _brake_polarity(self):
+        """Which way a DUT *torque* command moves DUT.velocity as the log reads
+        it: +1 when a positive command speeds the reported velocity up.
+
+        flip_torque_sign and flip_direction_sign are independent knobs on
+        different signals -- current goes through the first (devices.py, in
+        send_command), position and velocity through the second (in
+        process_txpdo) -- so a config with one set and not the other reports a
+        shaft accelerating the opposite way to the torque that drove it. On this
+        rig's DUT that is exactly the case today, which is why commanding
+        +0.5 Nm in the coastdowns logged -192 rad/s.
+
+        Both hardware cases have been measured on this rig, and the derivation
+        matches both (2026-09-17 coastdowns, log finding 21):
+
+        | DUT flags (torque, direction) | +0.5 Nm gave | polarity |
+        |---|---|---|
+        | False, True (`longer_coastdown`) | -0.501 A, -192 rad/s | -1 |
+        | True, True (`test_flip_torque_sign_true`) | -0.490 A, +51 rad/s | +1 |
+
+        The current row is the load-bearing one: a positive command really does
+        send NEGATIVE current on a flipped drive, and the drive's own loop then
+        makes negative torque in its own frame. So flip_torque_sign reaches the
+        shaft, it is not cancelled somewhere -- which is exactly what the fake
+        drive in dyno/sim/fake_pysoem.py used to assume (see its
+        `hw_torque_sign`).
+
+        A torque-mode brake has to know which it is, and getting it wrong
+        accelerates the shaft at the bumper. Deriving it from the same two flags
+        the drive itself uses means the answer cannot drift out of step with
+        them; `post_test.brake.polarity` can pin it, and _brake_step verifies
+        whichever answer it gets against the measured velocity and bails out if
+        the shaft speeds up.
+        """
+        pinned = self._post['brake']['polarity']
+        if pinned != 'auto':
+            return int(pinned)
+        dut = self.devices.DUT
+        polarity = 1
+        if getattr(dut, 'flip_torque_sign', False):
+            polarity = -polarity
+        if getattr(dut, 'flip_direction_sign', False):
+            polarity = -polarity
+        return polarity
+
+    def _begin_post_test(self, reason):
+        """The phase dict for a run that has just ended, or None for no phase.
+
+        Called from _stop_test with the drives still enabled.
+        """
+        kind = (reason or {}).get('kind')
+        tail = 0.0 if kind in self._NO_TAIL_KINDS else self._post['log_tail_s']
+        b = self._post['brake']
+        now = time.perf_counter()
+
+        brake = None
+        if b is not None and kind not in self._NO_BRAKE_KINDS:
+            try:
+                speed = abs(float(b['velocity_get'](self)))
+            except (TypeError, ValueError, AttributeError):
+                speed = math.nan
+            # NaN is not "stopped": the output position source has failed, which
+            # is itself a window trip, and the shaft may well be moving. Brake.
+            if math.isnan(speed) or speed > b['min_velocity']:
+                # Whatever mode the drive is already in is the mode the brake
+                # uses. An AKD drops to Ready to Switch On to change mode, which
+                # would de-energise it for the duration -- the shaft would coast
+                # exactly when it must not.
+                mode = self.devices.DUT.mode
+                torque = min(b['torque_nm'],
+                             abs(float(self.devices.DUT.torque_limit)))
+                # The input's own feedback has to be readable, or there is
+                # nothing to brake against and nothing to check the polarity
+                # with. A NaN entry speed would make the speed-up backstop
+                # compare against NaN, which is False forever -- the brake
+                # would push at the bumper with its one safeguard silently
+                # disabled. Position mode also commands hold_position directly.
+                entry_input = abs(float(self.devices.DUT.velocity))
+                # In the COMMAND frame, not the feedback frame. These differ by
+                # the shaft position at the last position-mode entry, and
+                # commanding the feedback value steps the shaft by that gap
+                # instead of holding it -- see AKD.position_command_frame.
+                hold = float(self.devices.DUT.position_command_frame)
+                if math.isnan(entry_input) or (mode == 'position'
+                                               and math.isnan(hold)):
+                    print('Post-test brake skipped: input drive feedback reads '
+                          'NaN, so there is nothing to brake against')
+                    return {'reason': reason, 'stage': 'tail', 'brake': None,
+                            'tail_s': tail, 'tail_ends': now + tail} if tail > 0 else None
+                brake = {'mode': mode,
+                         # 'slowing' while it is taking energy out, 'settling'
+                         # once the output has been seen at rest. See
+                         # _brake_step.
+                         'phase': 'slowing',
+                         'slowed_at': None,
+                         'torque_nm': torque,
+                         'clipped': torque < b['torque_nm'],
+                         'polarity': self._brake_polarity(),
+                         'entry_speed': None if math.isnan(speed) else speed,
+                         'entry_input_speed': entry_input,
+                         'hold_position': hold,
+                         'started': now,
+                         'deadline': now + b['timeout_s'],
+                         'below_since': None,
+                         'outcome': None}
+
+        if brake is None and tail <= 0:
+            return None
+        return {'reason': reason,
+                'stage': 'brake' if brake else 'tail',
+                'brake': brake,
+                'tail_s': tail,
+                'tail_ends': now + tail}
+
+    def _post_test_step(self):
+        """Advance the brake, then the tail. Returns this cycle's command.
+
+        Never blocks and never raises: this runs after a safety trip, so an
+        exception here would strand the rig with the drives still enabled.
+        """
+        phase = self._post_test
+        now = time.perf_counter()
+
+        # Shutdown ends the wind-down on the spot. Master stops calling step()
+        # shortly after _release_drives, and a tail still holding `log: True`
+        # when that happens never emits the sample the Logger closes the file
+        # on -- so insisting on the last two seconds of trace would cost the
+        # whole log.
+        if self.shutdown:
+            if phase['stage'] == 'brake':
+                phase['brake']['outcome'] = 'cut short by rig shutdown'
+                self._end_brake(phase, now)
+            else:
+                self.devices.DUT.sw_enable = False
+                self.devices.LOAD.sw_enable = False
+            self._post_test = None
+            return self._safe_default_command
+
+        if phase['stage'] == 'brake':
+            cmd = self._brake_step(phase, now)
+            if cmd is not None:
+                return cmd
+            # Brake finished (or gave up): drives off, tail starts now.
+            self._end_brake(phase, now)
+
+        if now >= phase['tail_ends']:
+            self._post_test = None
+        return self._safe_default_command
+
+    def _brake_step(self, phase, now):
+        """One cycle of braking, or None once it is done.
+
+        Records how it ended in phase['brake']['outcome'], which rides out on
+        the stop_reason so the log says what the stop actually did.
+        """
+        b, st = self._post['brake'], phase['brake']
+        dut = self.devices.DUT
+
+        if dut.fault or not dut.sw_enable:
+            st['outcome'] = 'drive came off mid-brake'
+            return None
+        if now >= st['deadline']:
+            st['outcome'] = f'timed out after {b["timeout_s"]:g} s'
+            return None
+
+        # A mode switch would de-energise the drive, so if the mode moved out
+        # from under us there is nothing safe left to command.
+        if dut.switching_modes or dut.mode != st['mode']:
+            st['outcome'] = 'input drive changed mode mid-brake'
+            return None
+
+        try:
+            speed = abs(float(b['velocity_get'](self)))
+        except (TypeError, ValueError, AttributeError):
+            speed = math.nan
+
+        at_rest = not math.isnan(speed) and speed <= b['stop_velocity']
+        if at_rest:
+            if st['below_since'] is None:
+                st['below_since'] = now
+            if now - st['below_since'] >= b['settle_s']:
+                st['outcome'] = 'stopped'
+                st['stopped_after_s'] = round(now - st['started'], 4)
+                return None
+        else:
+            st['below_since'] = None
+
+        # Sub-phase. The torque-mode brake is bang-bang on sign(DUT.velocity),
+        # and once the shaft is stopped that sign is noise: on the rig
+        # (2026-09-17, brake_checks/torque_mode_brake_check) it flipped 77 times
+        # in 500 ms, pumping +/-0.5 Nm into a 3.6e-4 kg m^2 rotor and rocking
+        # the driveline through the gearbox's backlash at +/-0.16 rad/s at the
+        # output. That is over stop_velocity, so the settle window never closed
+        # and the brake timed out -- with the output already parked, having moved
+        # 0.08 deg across the whole half second.
+        #
+        # Once the output has been seen at rest, braking torque does nothing
+        # useful anyway: the gearbox holds the shaft on its own (0.32 Nm of
+        # input drag is 14 Nm at the output). So stop commanding and just watch
+        # it settle. Only clearly real motion pushes it back to slowing.
+        if at_rest:
+            if st['phase'] == 'slowing':
+                st['phase'] = 'settling'
+                st['slowed_at'] = now
+        elif speed > self._BRAKE_RESUME_FACTOR * b['stop_velocity']:
+            st['phase'] = 'slowing'
+
+        if st['mode'] == 'velocity':
+            # Sign-free: zero is zero in either frame, so this path cannot get
+            # the polarity wrong. It is NOT stronger than a torque command,
+            # though -- measured on the rig 2026-09-17 the AKD's own ramp pulled
+            # 0.51 Nm at the input (33 rad/s^2 at the output), against 0.73 Nm
+            # (47 rad/s^2) from a 0.5 Nm torque command. And unlike torque mode
+            # it does not scale with torque_nm: raising that leaves this path
+            # where it is, which is why stop_decel_rad_s2 has to be set from
+            # this weaker number unless the drive's own decel ramp is raised.
+            return dict(self._safe_default_command, input_mode='velocity',
+                        input_command=0.0)
+        if st['mode'] == 'position':
+            # Also sign-free: hold where the shaft was when the run ended.
+            return dict(self._safe_default_command, input_mode='position',
+                        input_command=st['hold_position'])
+
+        # Torque mode. Settling: command nothing. Velocity and position mode
+        # need no equivalent -- their commands (zero speed, hold position) are
+        # closed by the drive's own loop and do not chatter, which the rig
+        # confirmed: the velocity-mode check stopped cleanly in 127 ms.
+        if st['phase'] == 'settling':
+            return dict(self._safe_default_command, input_mode='torque',
+                        input_command=0.0)
+
+        # Oppose the input's own motion -- same shaft the command acts on, and
+        # 43.88x the resolution of the output channel.
+        v_in = float(dut.velocity)
+        if math.isnan(v_in):
+            st['outcome'] = 'input velocity read NaN'
+            return None
+        if v_in == 0.0:
+            # No direction to oppose yet; wait rather than guess one.
+            return self._safe_default_command
+
+        # Backstop on _brake_polarity: if the input is speeding UP the sign is
+        # wrong and every further cycle drives the output harder at the bumper.
+        elapsed = now - st['started']
+        if elapsed >= b['verify_s']:
+            rise = abs(v_in) - st['entry_input_speed'] * (1 + b['verify_rise'])
+            if rise > 0:
+                st['outcome'] = (f'aborted: input sped up from '
+                                 f'{st["entry_input_speed"]:.1f} to {abs(v_in):.1f} '
+                                 f'rad/s under braking torque -- polarity '
+                                 f'{st["polarity"]:+d} is wrong for this drive, '
+                                 f'check flip_torque_sign / flip_direction_sign')
+                print(f'POST-TEST BRAKE {st["outcome"]}')
+                return None
+
+        command = -st['polarity'] * math.copysign(st['torque_nm'], v_in)
+        return dict(self._safe_default_command, input_mode='torque',
+                    input_command=command)
+
+    def _end_brake(self, phase, now):
+        """Drop the drives and fold the brake's outcome into the stop_reason."""
+        st = phase['brake']
+        self.devices.DUT.sw_enable = False
+        self.devices.LOAD.sw_enable = False
+        # Back to torque mode before a zero command is left standing, the same
+        # way _end_jog leaves the drives. A zero command in POSITION mode means
+        # "go to position 0", which on a shaft resting at 10 rad is a lurch --
+        # and the position-mode brake was deliberately holding it where it
+        # stopped right up to this point.
+        if self.devices.DUT.mode != 'torque' or self.devices.DUT.switching_modes:
+            self.devices.DUT.command_operating_mode('torque')
+        self._safe_default_command['input_mode'] = 'torque'
+        self._safe_default_command['input_command'] = 0
+        self._safe_default_command['output_command'] = 0
+        phase['stage'] = 'tail'
+        # The tail is measured from the end of the brake, not from the trip, so
+        # a long brake cannot eat into it.
+        phase['tail_ends'] = now + phase['tail_s']
+
+        if st is not None and isinstance(self._stop_reason, dict):
+            record = {'mode': st['mode'],
+                      'torque_nm': st['torque_nm'],
+                      'polarity': st['polarity'],
+                      'entry_velocity_rad_s': st['entry_speed'],
+                      'outcome': st['outcome'] or 'ended'}
+            if st['clipped']:
+                record['note'] = ('torque_nm clipped to the drive '
+                                  'motor_limits.torque')
+            if 'stopped_after_s' in st:
+                record['stopped_after_s'] = st['stopped_after_s']
+            # How long the brake spent actually taking energy out, as distinct
+            # from the settle window bolted on after it. This is the number a
+            # braked deceleration is measured from.
+            if st['slowed_at'] is not None:
+                record['slowing_s'] = round(st['slowed_at'] - st['started'], 4)
+            self._stop_reason['brake'] = record
+            print(f'Post-test brake: {record["outcome"]} '
+                  f'({st["mode"]} mode, {st["torque_nm"]:g} Nm)')
+
+    # Operator commands that end a logging tail early instead of being refused
+    # by it. Read in _cmd_check, before the command is acted on.
+    _TAIL_YIELDING_CMDS = frozenset({'start_test', 'jog', 'touch_off', 'tare',
+                                     'declare_centre', 'clear_tare',
+                                     'clear_faults', 'test_def', 'disarm',
+                                     'return_centre'})
+
+    def _yield_post_test_tail(self):
+        """Close out a logging tail now, so an operator action can proceed.
+
+        Only the tail: a brake is still holding the shaft and is not something
+        an operator command may cut short. Dropping _post_test here means the
+        next _send_telemetry emits the log=False sample carrying the stop
+        reason, so the file closes one cycle later -- the trace is simply
+        shorter than log_tail_s, which is the right trade for not making the
+        panel feel broken.
+        """
+        if self._post_test is not None and self._post_test['stage'] == 'tail':
+            self._post_test = None
+
+    def _post_test_refusal(self):
+        """Why an operator action must wait, or None.
+
+        Braking only. The tail yields instead (_yield_post_test_tail), so by
+        the time a command reaches its handler a tail is already gone and this
+        speaks for a brake that is still holding the shaft.
+        """
+        if self._post_test is None or self._post_test['stage'] != 'brake':
+            return None
+        return 'the last run is still braking to a stop -- try again in a moment'
 
     def _compile_window(self, spec):
         if not spec or not spec.get('enabled', True):
@@ -756,32 +1320,34 @@ class Controller(Master):
                 'get': attrgetter(spec['source']),
                 'half_window': abs(float(spec['half_window_rad'])),
                 'require_touch_off': bool(spec.get('require_touch_off', True)),
-                'torque_nm': abs(float(t['torque_nm'])),
-                'torque_sources': list(t['torque_sources']),
-                'velocity': abs(float(t['velocity_rad_s'])),
-                'approach_velocity': abs(float(t.get('approach_velocity_rad_s',
-                                                     t['velocity_rad_s']))),
                 'slow_from': abs(float(t.get('slow_from_rad', 0.0))),
                 'expected_half_span': abs(float(t['expected_half_span_rad'])),
                 'tolerance': abs(float(t['tolerance_rad'])),
                 'max_excursion': abs(float(t['max_excursion_rad'])),
-                'arm_distance': abs(float(t.get('arm_distance_rad', 0.03))),
-                'trip_samples': max(1, int(t.get('trip_samples', 10))),
                 # Trip on where the output would stop, not where it is: moving
                 # outward at v, it adds v^2 / (2 * stop_decel). 0 = off.
                 'stop_decel': abs(float(spec.get('stop_decel_rad_s2', 0.0))),
                 'velocity_source': spec.get('velocity_source'),
+                'touch_off_drive': str(t.get('drive', 'output')),
+                # Move centre to the midpoint of the two bumpers after touch-off.
+                'recentre': bool(t.get('recentre', False)),
+                'max_recentre': abs(float(t.get('max_recentre_rad', 0.2))),
             }
+            # Per-shaft settings: jog buttons for a shaft need its block.
+            w['output'] = self._compile_output_drive(t.get('output'))
+            w['input'] = self._compile_input_drive(t.get('input'))
         except KeyError as e:
             raise ValueError(f'position_window in {self.mode}_dyno_config.yaml '
                              f'is missing {e}')
+        if w['touch_off_drive'] not in ('input', 'output'):
+            raise ValueError('position_window.touch_off.drive must be input or output')
+        if w[w['touch_off_drive']] is None:
+            raise ValueError(f'position_window.touch_off.drive is {w["touch_off_drive"]}, '
+                             f'but there is no touch_off.{w["touch_off_drive"]} block')
         w['velocity_get'] = (attrgetter(w['velocity_source'])
                              if w['velocity_source'] else None)
         if w['stop_decel'] > 0 and w['velocity_get'] is None:
             raise ValueError('position_window: stop_decel_rad_s2 needs velocity_source')
-        w['torque_get'] = [attrgetter(p) for p in w['torque_sources']]
-        if not w['torque_get']:
-            raise ValueError('position_window.touch_off.torque_sources is empty')
         if w['half_window'] >= w['expected_half_span'] - w['tolerance']:
             raise ValueError('position_window: half_window_rad must sit inside the '
                              'bumpers (expected_half_span_rad - tolerance_rad)')
@@ -790,6 +1356,61 @@ class Controller(Master):
                              'expected_half_span_rad + tolerance_rad, or touch-off '
                              'can never find the bumpers')
         return w
+
+    @staticmethod
+    def _compile_output_drive(spec):
+        """`position_window.touch_off.output`: jog and touch-off on the output
+        shaft. Speeds and torques are output-frame. None when absent."""
+        if not spec:
+            return None
+        o = {
+            'torque_nm': abs(float(spec['torque_nm'])),
+            'torque_sources': list(spec['torque_sources']),
+            'velocity': abs(float(spec['velocity_rad_s'])),
+            'approach_velocity': abs(float(spec.get('approach_velocity_rad_s',
+                                                    spec['velocity_rad_s']))),
+            'arm_distance': abs(float(spec.get('arm_distance_rad', 0.03))),
+            'trip_samples': max(1, int(spec.get('trip_samples', 10))),
+        }
+        o['torque_get'] = [attrgetter(p) for p in o['torque_sources']]
+        if not o['torque_get']:
+            raise ValueError('position_window.touch_off.output.torque_sources is empty')
+        return o
+
+    @staticmethod
+    def _compile_input_drive(spec):
+        """`position_window.touch_off.input`: jog and touch-off on the input
+        shaft. Speeds and torques are input-frame. None when absent."""
+        if not spec:
+            return None
+        sources = []
+        for entry in spec['torque_sources']:
+            # A bare path, or [path, scale] (e.g. drive current x kt).
+            path, scale = (entry, 1.0) if isinstance(entry, str) else (entry[0], float(entry[1]))
+            sources.append((path, attrgetter(path), scale))
+        if not sources:
+            raise ValueError('position_window.touch_off.input.torque_sources is empty')
+        i = {
+            'velocity': abs(float(spec['velocity_rad_s'])),
+            'approach_velocity': abs(float(spec.get('approach_velocity_rad_s',
+                                                    spec['velocity_rad_s']))),
+            'nominal_ratio': abs(float(spec['nominal_ratio'])),
+            'ratio_tolerance': abs(float(spec.get('ratio_tolerance', 0.3))),
+            'torque_sources': sources,
+            'drag_nm': abs(float(spec['drag_nm'])),
+            'contact_rise_nm': abs(float(spec['contact_rise_nm'])),
+            'ceiling_nm': abs(float(spec['ceiling_nm'])),
+            'arm_input_rad': abs(float(spec.get('arm_input_rad', 1.0))),
+            'trip_samples': max(1, int(spec.get('trip_samples', 10))),
+            'drag_tau_s': abs(float(spec.get('drag_tau_s', 0.5))),
+            # Slew limit on the speed command. A step makes the drive's velocity
+            # loop kick far over the contact torque as the move starts.
+            'acceleration': abs(float(spec['acceleration_rad_s2'])),
+        }
+        if i['drag_nm'] + i['contact_rise_nm'] > i['ceiling_nm']:
+            raise ValueError('position_window.touch_off.input: drag_nm + contact_rise_nm '
+                             'must not exceed ceiling_nm')
+        return i
 
     def _window_rel(self):
         """Output position relative to the declared centre; NaN if unknown."""
@@ -879,6 +1500,13 @@ class Controller(Master):
             'tolerance': w['tolerance'],
             'max_excursion': w['max_excursion'],
             'jog': None if self._jog is None else self._jog['kind'],
+            'jog_drive': None if self._jog is None else self._jog['legs'][0]['drive']
+                         if self._jog['legs'] else None,
+            'input_jog': w['input'] is not None,
+            'output_jog': w['output'] is not None,
+            'touch_off_drive': w['touch_off_drive'],
+            'input_sign': self._input_sign,
+            'input_ratio': self._input_ratio,
             'touch_off': self._touch_off,
             'touch_off_ok': self._touch_off_ok(),
             'touch_off_history': self._touch_off_history,
@@ -909,13 +1537,19 @@ class Controller(Master):
         self._touch_off = None
         self._window_say(f'Centre declared at {pos:.4f} rad. Run touch-off before testing.')
 
-    def _jog_refusal(self):
+    def _jog_refusal(self, drive='output'):
         if self._window is None:
             return 'no position_window in config'
+        if self._window[drive] is None:
+            return f'no position_window.touch_off.{drive} in config'
+        if drive == 'input' and self._load_only:
+            return 'the rig is in load-only mode'
         if self.shutdown:
             return 'the rig is shutting down'
         if self._test_active:
             return 'a test is running'
+        if self._post_test is not None:
+            return self._post_test_refusal()
         if self._jog is not None:
             return 'a jog or touch-off is already running'
         if self._tare_state is not None:
@@ -926,146 +1560,435 @@ class Controller(Master):
             return 'a drive is faulted'
         return None
 
-    def _leg(self, direction, expect, stop_at=None):
-        """One constant-direction move. `expect` is 'contact' (ends on the
-        torque cap), 'target' (ends when rel crosses stop_at) or 'manual'."""
+    def _leg(self, direction, expect, stop_at=None, drive='output'):
+        """One constant-direction move of one shaft. `direction` is the sign of
+        the command to that shaft's drive. `expect` is 'contact' (ends on
+        contact), 'target' (ends when rel crosses stop_at) or 'manual'."""
         w = self._window
         span = 2 * w['max_excursion']
+        if drive == 'input':
+            i = w['input']
+            timeout_s = 2 * span * i['nominal_ratio'] / max(i['velocity'], 1e-3) + 10.0
+        else:
+            timeout_s = 2 * span / max(w['output']['velocity'], 1e-3) + 10.0
         return {'direction': direction, 'expect': expect, 'stop_at': stop_at,
-                'start_rel': None, 't0': None, 'over': 0,
-                'timeout_s': 2 * span / max(w['velocity'], 1e-3) + 10.0}
+                'drive': drive, 'start_rel': None, 't0': None, 'over': 0,
+                'timeout_s': timeout_s,
+                # input drive only
+                'start_input': None, 'baselines': None, 'last_t': None,
+                'drag_samples': 0, 'contact_torque': None, 'speed_cmd': 0.0,
+                'cmd_t': None}
 
-    def _start_jog(self, direction):
-        refusal = self._jog_refusal()
+    def _leg_out_dir(self, leg):
+        """Direction the output turns on this leg (+1/-1), or None while an
+        input move's direction is not yet known."""
+        if leg['drive'] == 'output':
+            return leg['direction']
+        return None if self._input_sign is None else leg['direction'] * self._input_sign
+
+    def _start_jog(self, direction, drive='output'):
+        drive = 'input' if drive == 'input' else 'output'
+        refusal = self._jog_refusal(drive)
         direction = 1 if float(direction) > 0 else -1
-        if refusal is None and direction * self._window_rel() >= self._window['max_excursion']:
-            refusal = 'already at max excursion in that direction'
+        leg = self._leg(direction, 'manual', drive=drive) if refusal is None else None
+        if refusal is None:
+            out_dir = self._leg_out_dir(leg)
+            if out_dir is not None and out_dir * self._window_rel() >= self._window['max_excursion']:
+                refusal = 'already at max excursion in that direction'
+        name = 'input' if drive == 'input' else 'output'
         if refusal:
-            return self._window_say(f'Jog refused: {refusal}')
-        self._jog = {'kind': 'jog', 'legs': [self._leg(direction, 'manual')]}
-        self._window_say(f'Jogging {"+" if direction > 0 else "-"}')
+            return self._window_say(f'Jog {name} refused: {refusal}')
+        self._jog = {'kind': 'jog', 'legs': [leg], 'alive': time.perf_counter()}
+        self._window_say(f'Jogging {name} {"+" if direction > 0 else "-"}')
 
     def _start_touch_off(self):
-        refusal = self._jog_refusal()
+        drive = self._window['touch_off_drive'] if self._window else 'output'
+        refusal = self._jog_refusal(drive)
         rel = self._window_rel()
         if refusal is None and (math.isnan(rel) or abs(rel) > self._window['half_window']):
             refusal = 'output is outside the window; jog back toward centre first'
         if refusal:
             return self._window_say(f'Touch-off refused: {refusal}')
         self._touch_off = None
-        self._jog = {'kind': 'touch_off',
-                     'legs': [self._leg(+1, 'contact'), self._leg(-1, 'contact'),
-                              self._leg(+1, 'target', stop_at=0.0)],
-                     'contacts': [], 'problems': []}
-        self._window_say('Touch-off running: + bumper, - bumper, back to centre')
+        # The return leg is built once both bumpers are found: on the input
+        # shaft, which command direction heads home is only known by then.
+        self._jog = {'kind': 'touch_off', 'drive': drive,
+                     'legs': [self._leg(+1, 'contact', drive=drive),
+                              self._leg(-1, 'contact', drive=drive)],
+                     'contacts': [], 'problems': [], 'contact_torques': [],
+                     # Contacts are relative to the centre the run started
+                     # from; `shift` is how far recentring moved it (None if not).
+                     'run_centre': self._window_centre, 'shift': None}
+        home = 'the bumper midpoint' if self._window['recentre'] else 'centre'
+        self._window_say(f'Touch-off on the {drive} shaft running: one bumper, '
+                         f'the other, then to {home}')
+
+    def _start_return_centre(self):
+        """Drive the input shaft back to centre. Click-to-run: there is no
+        keepalive, so it ends on the target, on contact, on any of the jog
+        checks, or on Stop."""
+        refusal = self._jog_refusal('input')
+        rel = self._window_rel()
+        if refusal is None and math.isnan(rel):
+            refusal = f'{self._window["source"]} is not readable'
+        if refusal is None and abs(rel) <= self.RETURN_CENTRE_DEADBAND_RAD:
+            refusal = f'already at centre ({rel:+.4f} rad)'
+        if refusal:
+            return self._window_say(f'Return to centre refused: {refusal}')
+        leg = self._home_leg(rel, 'input')
+        if leg is None:
+            # No input move yet this session, so which way the output follows
+            # input + is unmeasured. Set off on the assumption it follows +;
+            # _jog_step turns the leg around once the first 0.05 rad of travel
+            # settles it. Both directions are held to max_excursion and the
+            # contact checks meanwhile, so the guess costs travel, not safety.
+            leg = self._leg(-1 if rel > 0 else 1, 'target', stop_at=0.0,
+                            drive='input')
+            leg['probe'] = True
+        self._jog = {'kind': 'return_centre', 'legs': [leg]}
+        self._window_say(f'Returning to centre on the input shaft from '
+                         f'{rel:+.4f} rad')
+
+    def _home_leg(self, rel, drive):
+        """A leg back to centre from rel, or None if the direction is unknown."""
+        if drive == 'output':
+            return self._leg(-1 if rel > 0 else 1, 'target', stop_at=0.0)
+        if self._input_sign is None:
+            return None
+        return self._leg((-1 if rel > 0 else 1) * self._input_sign, 'target',
+                         stop_at=0.0, drive='input')
 
     def _jog_step(self):
         """Advance the jog/touch-off one cycle and return the command to send."""
         j, w = self._jog, self._window
         load, dut = self.devices.LOAD, self.devices.DUT
-        hold = {'input_mode': 'torque', 'output_mode': 'velocity',
+        leg = j['legs'][0]
+        drive = leg['drive']
+        moving, free = (dut, load) if drive == 'input' else (load, dut)
+        hold = {'input_mode': 'velocity' if drive == 'input' else 'torque',
+                'output_mode': 'torque' if drive == 'input' else 'velocity',
                 'input_command': 0, 'output_command': 0}
 
         if self.shutdown:
             return self._end_jog('Jog ended: shutdown', failed=True)
         if load.fault or (not self._load_only and dut.fault):
             return self._end_jog('Jog ended: a drive faulted', failed=True)
+        # Dead-man for hold-to-run. The button's release is not guaranteed to
+        # reach us: Qt drops `released` when the mouse is let go off the button
+        # without a move event first, and a hung GUI sends nothing at all.
+        if (j['kind'] == 'jog'
+                and time.perf_counter() - j['alive'] > self.JOG_KEEPALIVE_TIMEOUT_S):
+            return self._end_jog(f'Jog stopped: no keepalive from the GUI for '
+                                 f'{self.JOG_KEEPALIVE_TIMEOUT_S:g} s (button '
+                                 f'release lost?)', failed=True)
 
-        # The input shaft is left free throughout.
-        dut.sw_enable = False
-        if load.mode != 'velocity' or load.switching_modes:
-            if not load.switching_modes:
-                load.command_operating_mode('velocity')
-            load.sw_enable = False
+        # The other shaft is left free throughout.
+        free.sw_enable = False
+        if free.mode != 'torque' and not free.switching_modes:
+            free.command_operating_mode('torque')
+        if moving.mode != 'velocity' or moving.switching_modes:
+            if not moving.switching_modes:
+                moving.command_operating_mode('velocity')
+            moving.sw_enable = False
             return hold
-        load.sw_enable = True
+        moving.sw_enable = True
 
         rel = self._window_rel()
         if math.isnan(rel):
             return self._end_jog(f'Jog ended: {w["source"]} read NaN', failed=True)
 
         now = time.perf_counter()
-        leg = j['legs'][0]
         if leg['start_rel'] is None:
             leg['start_rel'], leg['t0'] = rel, now
+            if drive == 'input':
+                leg['start_input'] = float(dut.position)
+                leg['baselines'] = [w['input']['drag_nm']] * len(w['input']['torque_sources'])
         d = leg['direction']
 
-        if d * rel >= w['max_excursion']:
+        if drive == 'input':
+            problem = self._learn_input_direction(leg, rel)
+            if problem:
+                return self._end_jog(f'Jog ended: {problem}', failed=True)
+        out_dir = self._leg_out_dir(leg)
+
+        if leg.get('probe') and out_dir is not None:
+            # A return to centre that started before the output direction was
+            # known: now that it is, turn around if the guess was backwards.
+            # The replacement leg re-initialises, so the speed slew and the drag
+            # baselines start again from the reversal.
+            leg['probe'] = False
+            if out_dir * rel > 0:
+                j['legs'][0] = self._home_leg(rel, 'input')
+                self._window_say('Return to centre: the output turns the other '
+                                 'way, reversing')
+                return hold
+
+        if out_dir is None:
+            # Direction unknown: stop past max excursion as soon as the output
+            # is seen moving further out.
+            past = (abs(rel) >= w['max_excursion']
+                    and abs(rel) > abs(leg['start_rel']) + 0.005)
+        else:
+            past = out_dir * rel >= w['max_excursion']
+        if past:
             return self._leg_done('excursion', rel)
-        if leg['stop_at'] is not None and d * (rel - leg['stop_at']) >= 0:
+        if (leg['stop_at'] is not None and out_dir is not None
+                and out_dir * (rel - leg['stop_at']) >= 0):
             return self._leg_done('target', rel)
-        if abs(load.velocity) > 2 * max(w['approach_velocity'], w['velocity']) + 0.1:
+
+        if drive == 'input':
+            i = w['input']
+            fastest = max(i['approach_velocity'], i['velocity'])
+            if abs(dut.velocity) > 2 * fastest + 1.0:
+                return self._end_jog(f'Jog ended: input overspeed '
+                                     f'({dut.velocity:+.2f} rad/s)', failed=True)
+        elif abs(load.velocity) > 2 * max(w['output']['approach_velocity'],
+                                          w['output']['velocity']) + 0.1:
             return self._end_jog(f'Jog ended: output overspeed '
                                  f'({load.velocity:+.3f} rad/s)', failed=True)
         if now - leg['t0'] > leg['timeout_s']:
             return self._end_jog('Jog ended: timed out', failed=True)
 
-        # Torque cap. Waived only while backing away from a bumper (moving toward
-        # centre, within arm_distance of where the move began), when the
-        # bumper is still unloading. Moving outward it always applies.
-        outward = d * rel > 0
-        if outward or abs(rel - leg['start_rel']) >= w['arm_distance']:
-            torque = max(abs(float(g(self))) for g in w['torque_get'])
-            if math.isnan(torque):
-                return self._end_jog('Jog ended: torque reading is NaN', failed=True)
-            leg['over'] = leg['over'] + 1 if torque > w['torque_nm'] else 0
-            if leg['over'] >= w['trip_samples']:
-                return self._leg_done('contact', rel)
+        # Unknown direction counts as outward: slow speed, full contact checks.
+        outward = out_dir is None or out_dir * rel > 0
+        if drive == 'input':
+            result = self._input_contact(leg, outward, now)
+            if result is not None:
+                return result
+        else:
+            # Torque cap. Waived only while backing away from a bumper (moving
+            # toward centre, within arm_distance of where the move began), when
+            # the bumper is still unloading. Moving outward it always applies.
+            o = w['output']
+            if outward or abs(rel - leg['start_rel']) >= o['arm_distance']:
+                torque = max(abs(float(g(self))) for g in o['torque_get'])
+                if math.isnan(torque):
+                    return self._end_jog('Jog ended: torque reading is NaN', failed=True)
+                leg['over'] = leg['over'] + 1 if torque > o['torque_nm'] else 0
+                if leg['over'] >= o['trip_samples']:
+                    return self._leg_done('contact', rel)
 
         slow = outward and abs(rel) > w['slow_from']
-        speed = w['velocity'] if slow else w['approach_velocity']
+        if drive == 'input':
+            i = w['input']
+            target = d * (i['velocity'] if slow else i['approach_velocity'])
+            # Cycle time from the previous command, clamped so a stalled loop
+            # cannot hand the slew one large step.
+            dt = 0.001 if leg['cmd_t'] is None else min(max(now - leg['cmd_t'], 0.0), 0.01)
+            leg['cmd_t'] = now
+            step = i['acceleration'] * dt
+            leg['speed_cmd'] += max(-step, min(step, target - leg['speed_cmd']))
+            return dict(hold, input_command=leg['speed_cmd'])
+        speed = w['output']['velocity'] if slow else w['output']['approach_velocity']
         return dict(hold, output_command=d * speed)
+
+    def _learn_input_direction(self, leg, rel):
+        """Once an input move has turned the output far enough to measure, learn
+        (or confirm) which way the output follows the input and at what ratio.
+        Returns a reason to stop, or None."""
+        i = self._window['input']
+        d_rel = rel - leg['start_rel']
+        # Wait for enough travel that backlash and bumper unloading at the
+        # start of the move are a small part of it.
+        if abs(d_rel) < 0.05:
+            return None
+        d_in = float(self.devices.DUT.position) - leg['start_input']
+        sign = 1 if d_rel * leg['direction'] > 0 else -1
+        if self._input_sign is not None and sign != self._input_sign:
+            return (f'output turned the opposite way to earlier input moves '
+                    f'({d_rel:+.3f} rad for input {d_in:+.2f} rad)')
+        ratio = d_in / d_rel
+        if abs(abs(ratio) - i['nominal_ratio']) > i['ratio_tolerance'] * i['nominal_ratio']:
+            return (f'input/output ratio {ratio:+.1f}, expected '
+                    f'{i["nominal_ratio"]:g} +/- {100 * i["ratio_tolerance"]:.0f}% '
+                    f'-- coupling slipping or encoder wrong?')
+        self._input_sign = sign
+        self._input_ratio = ratio
+        return None
+
+    def _input_contact(self, leg, outward, now):
+        """Contact check for an input-shaft move. Contact is torque above the
+        drag baseline by contact_rise_nm, or above ceiling_nm outright, on any
+        source for trip_samples cycles. The baseline starts at drag_nm and
+        tracks the measured drag while the shaft is moving freely. The rise
+        check waits arm_input_rad into each move (breakaway at the start reads
+        as a rise); the ceiling never waits. Backing away from a bumper, the
+        bumper unloading helps the move, so only the ceiling applies until
+        arm_input_rad clears it."""
+        i, dut = self._window['input'], self.devices.DUT
+        dt = 0.0 if leg['last_t'] is None else now - leg['last_t']
+        leg['last_t'] = now
+        armed = abs(float(dut.position) - leg['start_input']) >= i['arm_input_rad']
+        # Free running: armed, and moving at least half the slow speed.
+        free = armed and abs(dut.velocity) >= 0.5 * i['velocity']
+        alpha = min(1.0, dt / i['drag_tau_s']) if i['drag_tau_s'] > 0 else 1.0
+
+        hit = None
+        for k, (path, get, scale) in enumerate(i['torque_sources']):
+            torque = abs(float(get(self)) * scale)
+            if math.isnan(torque):
+                return self._end_jog(f'Jog ended: {path} read NaN', failed=True)
+            base = leg['baselines'][k]
+            limit = i['ceiling_nm'] if not armed else min(i['ceiling_nm'],
+                                                          base + i['contact_rise_nm'])
+            if torque > limit and hit is None:
+                hit = (path, torque, base)
+            elif free and torque < base + 0.5 * i['contact_rise_nm']:
+                leg['baselines'][k] = min(base + alpha * (torque - base),
+                                          i['ceiling_nm'] - i['contact_rise_nm'])
+        if free:
+            leg['drag_samples'] += 1
+
+        leg['over'] = leg['over'] + 1 if hit else 0
+        if leg['over'] >= i['trip_samples']:
+            path, torque, base = hit
+            leg['contact_torque'] = {'source': path, 'torque_nm': torque,
+                                     'drag_nm': base}
+            return self._leg_done('contact', self._window_rel())
+        return None
+
+    def _input_drag_text(self, leg):
+        if leg['drive'] != 'input' or not leg['drag_samples'] or not leg['baselines']:
+            return ''
+        names = [p.split('.')[-1] for p, _, _ in self._window['input']['torque_sources']]
+        drag = ', '.join(f'{n} {b:.2f}' for n, b in zip(names, leg['baselines']))
+        ratio = ('' if self._input_ratio is None
+                 else f', ratio {self._input_ratio:+.1f}')
+        return f' [drag Nm: {drag}{ratio}]'
 
     def _leg_done(self, reason, rel):
         j, w = self._jog, self._window
         leg = j['legs'].pop(0)
 
         if j['kind'] == 'jog':
-            text = {'contact': f'contact ({w["torque_nm"]:g} Nm) at {rel:+.4f} rad',
-                    'excursion': f'max excursion reached at {rel:+.4f} rad'}[reason]
-            return self._end_jog(f'Jog stopped: {text}')
+            if reason == 'contact' and leg['drive'] == 'input':
+                c = leg['contact_torque']
+                text = (f'contact ({c["source"].split(".")[-1]} {c["torque_nm"]:.2f} Nm '
+                        f'over drag {c["drag_nm"]:.2f}) at {rel:+.4f} rad')
+            elif reason == 'contact':
+                text = f'contact ({w["output"]["torque_nm"]:g} Nm) at {rel:+.4f} rad'
+            else:
+                text = f'max excursion reached at {rel:+.4f} rad'
+            return self._end_jog(f'Jog stopped: {text}{self._input_drag_text(leg)}')
+
+        if j['kind'] == 'return_centre':
+            drag = self._input_drag_text(leg)
+            if reason == 'target':
+                return self._end_jog(f'Back at centre ({rel:+.4f} rad){drag}')
+            if reason == 'contact':
+                c = leg['contact_torque']
+                text = (f'contact ({c["source"].split(".")[-1]} {c["torque_nm"]:.2f} Nm '
+                        f'over drag {c["drag_nm"]:.2f})')
+            else:
+                text = 'max excursion'
+            return self._end_jog(f'Return to centre stopped by {text} at '
+                                 f'{rel:+.4f} rad; jog back manually{drag}',
+                                 failed=True)
 
         side = '+' if leg['direction'] > 0 else '-'
         if leg['expect'] == 'contact':
             if reason == 'contact':
                 j['contacts'].append(rel)
+                j['contact_torques'].append(leg['contact_torque'])
             else:
-                j['problems'].append(f'no {side} bumper contact before max '
-                                     f'excursion ({rel:+.4f} rad)')
+                j['problems'].append(f'no bumper contact moving {j["drive"]} {side} before '
+                                     f'max excursion ({rel:+.4f} rad)')
                 # Skip any remaining bumper and come home.
-                j['legs'] = [self._leg(-1 if rel > 0 else 1, 'target', stop_at=0.0)]
+                j['legs'] = []
         elif reason != 'target':
             j['problems'].append(f'return to centre stopped by {reason} at '
                                  f'{rel:+.4f} rad; jog back manually')
             j['legs'] = []
+            return self._finish_touch_off()
+
+        if not j['legs'] and leg['expect'] == 'contact':
+            rel -= self._recentre(j)
+            home = self._home_leg(rel, j['drive'])
+            if home is None:
+                j['problems'].append('output direction for an input move is unknown; '
+                                     'jog back to centre manually')
+            else:
+                j['legs'] = [home]
 
         if not j['legs']:
             return self._finish_touch_off()
-        return {'input_mode': 'torque', 'output_mode': 'velocity',
+        return {'input_mode': 'torque', 'output_mode': 'torque',
                 'input_command': 0, 'output_command': 0}
+
+    @staticmethod
+    def _bumpers(contacts):
+        """(plus, minus) from the contact positions, by which side of centre
+        they are on -- not by which command found them: on the input shaft that
+        mapping is measured. Either is None if missing."""
+        return (max([c for c in contacts if c > 0], default=None),
+                min([c for c in contacts if c < 0], default=None))
+
+    def _recentre(self, j):
+        """With both bumpers found, move centre to their midpoint (config
+        touch_off.recentre). Returns the shift applied, 0.0 if none. Skipped
+        when the span is out of tolerance (the result reports that) or the shift
+        is over max_recentre_rad: a centre that far out means a bad contact or
+        a bad declaration, and the window must not follow it."""
+        w = self._window
+        plus, minus = self._bumpers(j['contacts'])
+        if not w['recentre'] or plus is None or minus is None:
+            return 0.0
+        mid, half = (plus + minus) / 2, (plus - minus) / 2
+        if abs(half - w['expected_half_span']) > w['tolerance']:
+            return 0.0
+        if abs(mid) > w['max_recentre']:
+            j['problems'].append(f'not recentred: bumper midpoint {mid:+.4f} rad from '
+                                 f'centre, over max_recentre_rad {w["max_recentre"]:g}')
+            return 0.0
+        self._window_centre = j['run_centre'] + mid
+        j['shift'] = mid
+        return mid
 
     def _finish_touch_off(self, abort_reason=None):
         j, w = self._jog, self._window
         contacts = j['contacts']
-        plus = contacts[0] if len(contacts) > 0 else None
-        minus = contacts[1] if len(contacts) > 1 else None
+        raw_plus, raw_minus = self._bumpers(contacts)
+        both = raw_plus is not None and raw_minus is not None
+        # Reported relative to the centre in force after this run: the new one
+        # if recentred (so the check below is the half-span, symmetric), else
+        # the one the run started from.
+        shift = j['shift'] or 0.0
+        plus = None if raw_plus is None else raw_plus - shift
+        minus = None if raw_minus is None else raw_minus - shift
         problems = list(j['problems']) + ([abort_reason] if abort_reason else [])
-        passed = plus is not None and minus is not None and not abort_reason
-        if passed:
+        if len(contacts) == 2 and not both:
+            problems.append(f'both contacts on the same side of centre '
+                            f'({contacts[0]:+.4f}, {contacts[1]:+.4f} rad)')
+        passed = both and not abort_reason
+        if both:
             for name, value in (('+', plus), ('-', -minus)):
                 if abs(value - w['expected_half_span']) > w['tolerance']:
                     passed = False
                     problems.append(f'{name} bumper at {name}{value:.4f} rad, expected '
                                     f'{w["expected_half_span"]:.4f} +/- {w["tolerance"]:.4f}')
+            if w['recentre'] and j['shift'] is None:
+                passed = False  # _recentre refused; its reason is in problems
         result = {
             'at': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'drive': j['drive'],
             'centre': self._window_centre,
+            'run_centre': j['run_centre'],
+            'centre_shift_rad': j['shift'],
             'plus_rad': plus,
             'minus_rad': minus,
-            # Where the bumpers put centre, relative to the declared one.
-            'centre_error_rad': None if plus is None or minus is None else (plus + minus) / 2,
-            'span_rad': None if plus is None or minus is None else plus - minus,
-            'torque_nm': w['torque_nm'],
+            # Where the bumpers put centre, relative to the centre this run
+            # started from. On a repeat after recentring this is the
+            # repeatability of the sensed centre.
+            'centre_error_rad': (raw_plus + raw_minus) / 2 if both else None,
+            'span_rad': raw_plus - raw_minus if both else None,
+            # Encoder frame (LOAD position), comparable across runs whatever
+            # the centre was: the repeatability numbers come from these.
+            'plus_abs_rad': None if raw_plus is None else j['run_centre'] + raw_plus,
+            'minus_abs_rad': None if raw_minus is None else j['run_centre'] + raw_minus,
+            'midpoint_abs_rad': j['run_centre'] + (raw_plus + raw_minus) / 2 if both else None,
+            'torque_nm': w['output']['torque_nm'] if j['drive'] == 'output' else None,
+            'contact_torques': j['contact_torques'] if j['drive'] == 'input' else None,
+            'input_ratio': self._input_ratio if j['drive'] == 'input' else None,
             'expected_half_span_rad': w['expected_half_span'],
             'tolerance_rad': w['tolerance'],
             # Only the bumper positions decide a pass. A failed return leg is
@@ -1077,25 +2000,31 @@ class Controller(Master):
         self._touch_off = result
         self._touch_off_history.append(result)
         verdict = 'PASSED' if result['passed'] else 'FAILED'
-        detail = (f'+{plus:.4f} / {minus:+.4f} rad' if plus is not None and minus is not None
+        detail = (f'+{plus:.4f} / {minus:+.4f} rad, midpoint '
+                  f'{result["centre_error_rad"]:+.4f} rad from run centre' if both
                   else 'incomplete')
+        if j['shift'] is not None:
+            detail += f', centre moved {j["shift"]:+.4f} rad to {self._window_centre:.4f}'
+        if j['drive'] == 'input' and j['contact_torques']:
+            detail += ' (contact at ' + ', '.join(
+                f'{c["torque_nm"]:.2f} Nm over {c["drag_nm"]:.2f} drag'
+                for c in j['contact_torques']) + ')'
         return self._end_jog(f'Touch-off {verdict}: {detail}'
                              + (f' ({"; ".join(problems)})' if problems else ''),
                              finished=True)
 
     def _end_jog(self, message, failed=False, finished=False):
-        """Stop LOAD and clear the jog. Returns the idle command for this cycle."""
+        """Stop both drives and clear the jog. Returns the idle command for this cycle."""
         j = self._jog
         if j is not None and j['kind'] == 'touch_off' and not finished:
             # An interrupted touch-off must not leave an earlier pass standing.
             self._finish_touch_off(abort_reason=message)
             return self._safe_default_command
         self._jog = None
-        load = self.devices.LOAD
-        load.sw_enable = False
-        self.devices.DUT.sw_enable = False
-        if load.mode != 'torque' or load.switching_modes:
-            load.command_operating_mode('torque')
+        for drive in (self.devices.LOAD, self.devices.DUT):
+            drive.sw_enable = False
+            if drive.mode != 'torque' or drive.switching_modes:
+                drive.command_operating_mode('torque')
         self._safe_default_command['input_mode'] = 'torque'
         self._safe_default_command['output_mode'] = 'torque'
         self._safe_default_command['input_command'] = 0
@@ -1153,6 +2082,15 @@ class Controller(Master):
                        'coupled': not self._load_only}
        
     def step(self):
+        # How long this method takes, for the `step_us` log key. The 2026-09-17
+        # Archimedes runs show cycle_time_us reaching 2.6-3.1 ms with wkc_error
+        # flat at 0 -- so frames arrived and the bus was clean, and the late
+        # cycles were spent on THIS side of the wire. Every 20 A current slam in
+        # those logs sits within a few cycles of one. Splitting step() out of
+        # cycle_time_us says whether the time goes here (command generation,
+        # telemetry, safeties) or in the master loop around it, which is the one
+        # thing those logs cannot answer. Costs two clock reads a cycle.
+        step_start = time.perf_counter()
         self.data_counter += 1
 
         # Before anything is commanded: a tare only ever runs with the rig idle,
@@ -1211,6 +2149,12 @@ class Controller(Master):
                                 if self.shutdown else
                                 {'kind': 'completed', 'detail': 'test ran to completion'})
 
+        elif self._post_test is not None:
+            # A run winding down: brake, then hold the log open for the tail.
+            # Ahead of the jog and idle branches because both would force the
+            # drives off, and the brake needs the input drive energised.
+            self.current_cmd = self._post_test_step()
+
         elif self._jog is not None:
             # A jog or touch-off drives LOAD itself; _jog_step owns the enables.
             self.current_cmd = self._jog_step()
@@ -1247,11 +2191,12 @@ class Controller(Master):
             self.devices.LOAD.send_command(self.current_cmd['output_command'])
 
         if not self._load_only:
+            dut_command = self._dut_command_for_mode(self.current_cmd)
             if self.devices.LOAD.mode == 'torque' and not self.devices.DUT.mode == 'torque':
                 torque_ff = ff_ratio*self.current_cmd['output_command'] / self.devices.DUT.params['gear_ratio']
-                self.devices.DUT.send_command(self.current_cmd['input_command'], torque_ff)
+                self.devices.DUT.send_command(dut_command, torque_ff)
             else:
-                self.devices.DUT.send_command(self.current_cmd['input_command'])
+                self.devices.DUT.send_command(dut_command)
 
         if self.current_cmd['input_command'] != getattr(self, '_last_dut_cmd', None):
             self._last_dut_cmd = self.current_cmd['input_command']
@@ -1259,8 +2204,15 @@ class Controller(Master):
         for aux_func in self._aux_funcs:
             aux_func()
 
+        # Set before _send_telemetry so the sample carries this cycle's own
+        # figure. It excludes _send_telemetry and _cmd_check themselves, which
+        # is deliberate: the queue put is timed separately below.
+        self.step_us = (time.perf_counter() - step_start) * 1e6
+
+        telemetry_start = time.perf_counter()
         self._send_telemetry()
         self._cmd_check()
+        self.telemetry_us = (time.perf_counter() - telemetry_start) * 1e6
         time.sleep(0) #momentarily yeilds the GIL
 
     def _write_led(self, ch, mode):

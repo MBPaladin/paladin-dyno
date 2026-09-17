@@ -16,12 +16,17 @@ modes:
   inhouse_archimedes:
     # Starts off zero so a DUT->LOAD position-offset copy would show as a step.
     initial_theta_rad: 0.3
+    # The gearbox is fitted: the input turns 43x the output. The config's DUT
+    # gear_ratio is not used for this (it is left at 1 there).
+    drive_gear_ratio: {DUT: -43}
     # Lighter shaft, heavy drag: a disabled output stops within a few degrees,
-    # as the real drive does, instead of coasting into the bumpers.
+    # as the real drive does, instead of coasting into the bumpers. Coulomb +
+    # viscous at input jog speeds reflect to ~0.3 Nm at the input, the running
+    # drag measured on the bench.
     inertia_kgm2: 2.0
     viscous_nms: 10.0
-    coulomb_nm: 3.0
-    stiction_nm: 4.0
+    coulomb_nm: 11.0
+    stiction_nm: 13.0
     # 200 deg of output travel: bumpers 100 deg either side of the power-up angle.
     endstop_centre_rad: 0.3
     endstop_half_span_rad: 1.745

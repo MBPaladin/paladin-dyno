@@ -496,10 +496,11 @@ class Window(QWidget):
                 (value_label, path_to_row.get(spec.get('source')), limit))
 
     def __build_window_panel(self):
-        """Centre / jog / touch-off controls for a limited-travel output (config
-        `position_window:`). Jog is hold-to-run: press sends 'jog', release
-        sends 'jog_stop'. The controller enforces every limit; the buttons only
-        offer what it would accept."""
+        """Centre / jog / return / touch-off controls for a limited-travel output
+        (config `position_window:`). Jog is hold-to-run: press sends 'jog',
+        release sends 'jog_stop'; Return to Centre and Touch Off are one click.
+        The controller enforces every limit; the buttons only offer what it
+        would accept."""
         title = QLabel('Output Position', alignment=Qt.AlignmentFlag.AlignCenter)
         title.setStyleSheet('font-size: 16px;')
         self.controls_layout.addWidget(title)
@@ -509,33 +510,66 @@ class Window(QWidget):
         self.window_label.setStyleSheet('font-size: 11px; color: #b58900;')
         self.controls_layout.addWidget(self.window_label)
 
+        centre_row = QHBoxLayout()
         self.declare_centre_button = QPushButton('Declare Centre')
         self.declare_centre_button.setToolTip(
             'Store the current output position as centre for this session.\n'
             'The rig must be still. Clears any earlier touch-off.')
         self.declare_centre_button.clicked.connect(
             lambda: self.control_command_queue.put_nowait(['declare_centre', 0]))
-        self.controls_layout.addWidget(self.declare_centre_button)
+        centre_row.addWidget(self.declare_centre_button)
 
-        jog_row = QHBoxLayout()
+        # Click-to-run, not hold-to-run like the jog buttons: one move, and the
+        # controller decides when it is done. Stop ends it early.
+        self.return_centre_button = QPushButton('Return to Centre')
+        self.return_centre_button.setToolTip(
+            'Drive the input shaft (DUT motor) back to the declared centre with '
+            'the output free.\nThe leg touch-off ends with, on its own. Stops at '
+            'centre, on contact, or on Stop.')
+        self.return_centre_button.clicked.connect(
+            lambda: self.control_command_queue.put_nowait(['return_centre', 0]))
+        centre_row.addWidget(self.return_centre_button)
+        self.controls_layout.addLayout(centre_row)
+
+        # Output buttons drive LOAD with the input free; input buttons drive DUT
+        # with the output free. Input "+" is a + command to the input drive:
+        # which way that turns the output is measured, and shown below.
         self.jog_buttons = []
-        for text, direction in (('Jog −', -1), ('Jog +', +1)):
-            button = QPushButton(text)
-            button.setToolTip('Hold to jog the output under the touch-off torque cap.\n'
-                              'Stops on release, contact, or max excursion.')
-            button.pressed.connect(
-                lambda d=direction: self.control_command_queue.put_nowait(['jog', d]))
-            button.released.connect(
-                lambda: self.control_command_queue.put_nowait(['jog_stop', 0]))
-            jog_row.addWidget(button)
-            self.jog_buttons.append(button)
-        self.controls_layout.addLayout(jog_row)
+        self.input_jog_buttons = []
+        # The held jog button. `released` is not reliable: Qt skips it when the
+        # mouse is let go off the button with no move event in between, which
+        # left a jog running. So a timer also watches isDown(), sends a
+        # keepalive while it is held (the controller stops a jog without one),
+        # and sends jog_stop the moment it is not.
+        self._jog_held = None
+        self._jog_timer = QTimer(self)
+        self._jog_timer.timeout.connect(self.__jog_tick)
+        self._jog_timer.start(100)
+        for drive, label, tip in (
+                ('output', 'Output', 'Hold to jog the output shaft (absorber) under the '
+                                     'touch-off torque cap.\nThe input is left free, so the '
+                                     'gearbox must be backdriven.'),
+                ('input', 'Input', 'Hold to jog the input shaft (DUT motor); the output '
+                                   'is left free.\nStops on a torque rise over the '
+                                   'measured drag.')):
+            jog_row = QHBoxLayout()
+            for text, direction in ((f'{label} −', -1), (f'{label} +', +1)):
+                button = QPushButton(text)
+                button.setToolTip(tip + '\nStops on release, contact, or max excursion.')
+                button.pressed.connect(
+                    lambda b=button, d=direction, s=drive: self.__jog_press(b, d, s))
+                button.released.connect(self.__jog_release)
+                jog_row.addWidget(button)
+                self.jog_buttons.append(button)
+                if drive == 'input':
+                    self.input_jog_buttons.append(button)
+            self.controls_layout.addLayout(jog_row)
 
         self.touch_off_button = QPushButton('Touch Off')
         self.touch_off_button.setToolTip(
-            'Drive to the + bumper, then the - bumper, at the configured torque, '
-            'then back to centre.\nPasses if both contacts are within tolerance. '
-            'Stop aborts it.')
+            'Drive to one bumper, then the other, then back to centre, on the '
+            'shaft set by\nposition_window.touch_off.drive. Passes if both contacts '
+            'are within tolerance. Stop aborts it.')
         self.touch_off_button.clicked.connect(
             lambda: self.control_command_queue.put_nowait(['touch_off', 0]))
         self.controls_layout.addWidget(self.touch_off_button)
@@ -545,6 +579,22 @@ class Window(QWidget):
         self.touch_off_label.setStyleSheet('font-size: 11px; color: gray;')
         self.controls_layout.addWidget(self.touch_off_label)
 
+    def __jog_press(self, button, direction, drive):
+        self._jog_held = button
+        self.control_command_queue.put_nowait(['jog', direction, drive])
+
+    def __jog_release(self):
+        self._jog_held = None
+        self.control_command_queue.put_nowait(['jog_stop', 0])
+
+    def __jog_tick(self):
+        if self._jog_held is None:
+            return
+        if self._jog_held.isDown():
+            self.control_command_queue.put_nowait(['jog_alive', 0])
+        else:
+            self.__jog_release()
+
     def __refresh_window(self, state):
         w = state.get('window')
         if not w:
@@ -552,12 +602,17 @@ class Window(QWidget):
         test_active = bool(state.get('test_active'))
         centred = w.get('centre') is not None
         self.declare_centre_button.setEnabled(not test_active and not w.get('jog'))
+        self.return_centre_button.setEnabled(not test_active and centred
+                                             and not w.get('jog')
+                                             and bool(w.get('input_jog')))
         self.touch_off_button.setEnabled(not test_active and centred and not w.get('jog'))
         for button in self.jog_buttons:
             # Never disabled mid-press: a disabled button can swallow its release.
             if not button.isDown():
                 button.setEnabled(not test_active and centred
-                                  and w.get('jog') != 'touch_off')
+                                  and w.get('jog') != 'touch_off'
+                                  and bool(w.get('input_jog') if button in self.input_jog_buttons
+                                           else w.get('output_jog')))
 
         rows = []
         if not centred:
@@ -573,6 +628,9 @@ class Window(QWidget):
                             f'window ±{half:g}')
                 colour = ('red' if abs(rel) > half else
                           '#b58900' if abs(rel) > 0.8 * half else 'green')
+        if w.get('input_sign') is not None:
+            rows.append(f'Input + turns output {"+" if w["input_sign"] > 0 else "−"}, '
+                        f'measured ratio {w["input_ratio"]:+.1f}')
         rows.append('Ready to start' if not w.get('refusal')
                     else f'Start blocked: {w["refusal"]}')
         if w.get('message'):
@@ -581,26 +639,32 @@ class Window(QWidget):
         self.window_label.setStyleSheet(f'font-size: 11px; color: {colour};')
 
         t = w.get('touch_off')
+        # Repeatability over the session, in the encoder frame so recentring
+        # between runs does not move the numbers.
         history = [h for h in (w.get('touch_off_history') or [])
-                   if h.get('plus_rad') is not None and h.get('minus_rad') is not None]
+                   if h.get('midpoint_abs_rad') is not None]
         if w.get('jog') == 'touch_off':
-            text, colour = 'Touch-off running…', '#b58900'
+            text, colour = f'Touch-off ({w.get("jog_drive")} shaft) running…', '#b58900'
         elif not t:
             text, colour = 'No touch-off since centre was declared', 'gray'
         else:
             text = 'Touch-off ' + ('PASSED' if t['passed'] else 'FAILED')
             if t.get('plus_rad') is not None and t.get('minus_rad') is not None:
-                text += (f': +{np.degrees(t["plus_rad"]):.1f}° / '
-                         f'{np.degrees(t["minus_rad"]):.1f}°, centre off by '
-                         f'{np.degrees(t["centre_error_rad"]):+.1f}°')
+                text += (f': +{np.degrees(t["plus_rad"]):.2f}° / '
+                         f'{np.degrees(t["minus_rad"]):.2f}°, midpoint '
+                         f'{np.degrees(t["centre_error_rad"]):+.2f}° from run centre')
+            if t.get('centre_shift_rad') is not None:
+                text += '\nCentre moved to the midpoint'
             if t.get('problems'):
                 text += '\n' + '; '.join(t['problems'])
             colour = 'green' if t['passed'] else 'red'
         if len(history) > 1:
-            plus = np.degrees([h['plus_rad'] for h in history])
-            minus = np.degrees([h['minus_rad'] for h in history])
-            text += (f'\n{len(history)} runs: + spread {np.ptp(plus):.1f}°, '
-                     f'− spread {np.ptp(minus):.1f}°')
+            stats = [(name, np.degrees([h[key] for h in history])) for name, key in (
+                ('+ bumper', 'plus_abs_rad'), ('− bumper', 'minus_abs_rad'),
+                ('midpoint', 'midpoint_abs_rad'), ('span', 'span_rad'))]
+            text += f'\n{len(history)} runs, spread (sd):'
+            for name, values in stats:
+                text += f'\n  {name}: {np.ptp(values):.2f}° ({np.std(values, ddof=1):.2f}°)'
         self.touch_off_label.setText(text)
         self.touch_off_label.setStyleSheet(f'font-size: 11px; color: {colour};')
 

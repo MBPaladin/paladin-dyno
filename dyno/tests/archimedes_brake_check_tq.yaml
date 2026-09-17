@@ -1,0 +1,25 @@
+# Stage 2 of the post-test brake bring-up: TORQUE mode. This is the only path
+# that uses _brake_polarity, so run Stage 1 (archimedes_brake_check_vel.yaml)
+# first and check the polarity the log reports there.
+#
+# BEFORE THE FIRST RUN, set post_test.brake.torque_nm to 1.0 in the rig config.
+# At 1 Nm a wrong polarity adds only ~0.4 rad/s over the 10 ms verify window
+# before the brake aborts, and the free coast that follows still lands inside
+# the bumpers. Put it back to 4.0 once the log shows the polarity is right.
+#
+# Input holds 0.5 Nm from CENTRE; the output accelerates at ~9.6 rad/s^2 and the
+# early trip fires near rel 1.02 at about 4.4 rad/s.
+#
+# Expect: stop_reason.brake {'mode': 'torque', 'polarity': +1, 'outcome':
+# 'stopped'}. An outcome of 'aborted: input sped up...' means the polarity is
+# wrong for this drive -- read finding 21 in the implementation log, do not just
+# flip post_test.brake.polarity.
+behaviors:
+  - id: BRAKE_CHECK_TQ
+    type: test_trace
+    settings:
+      input_motor:
+        control_mode: torque
+      output_motor:
+        control_mode: torque
+      trace_file: "archimedes_brake_check_tq.csv"

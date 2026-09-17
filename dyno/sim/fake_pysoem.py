@@ -244,6 +244,19 @@ class AKDBehavior(Behavior):
         self.tau_limit = self.params.get('motor_limits', {}).get('torque', 10)
         self.flip = self.params.get('flip_torque_sign', False)
         self.coupling = -1.0 if self.flip else 1.0  # mounting direction on shaft
+        # `hardware_torque_sign: true` in sim_params (injected per drive in
+        # config_init). Off by default, which keeps this fake drive's long-
+        # standing convention: it UNDOES the device-side flip_torque_sign, so
+        # positive torque always turns the sim shaft the same way whatever the
+        # flag says. That is not what the real AKD does -- the hardware logs
+        # settle it, `sign(load_torque_command) == sign(load_current)` is 0% of
+        # 1.8M samples on a (True, True) drive, i.e. a positive command really
+        # does send negative current and make negative torque in the drive's
+        # own frame. Log finding 10 called the mismatch out; this flag is how a
+        # test opts into the hardware behaviour, and anything that depends on
+        # the torque SIGN (DynoController._brake_polarity) has to be tested
+        # with it on.
+        self.hw_torque_sign = bool(self.params.get('sim_hardware_torque_sign', False))
         self.is_input_side = layout_entry['name'] == 'DUT'
 
         self.state = 'switch_on_disabled'
@@ -252,6 +265,9 @@ class AKDBehavior(Behavior):
         self._pending_mode = None
         self._pending_countdown = 0
         self.tau_motor = 0.0
+        # Velocity-mode integrator, Nm. A P-only loop sits short of its target
+        # by drag / kv, which on a geared input is most of a slow jog speed.
+        self._v_integral = 0.0
         # Position-command unwrap state (raw i32 counts). devices.AKD scales
         # position at 2^32 counts/rev into an int32 PDO field, so the raw
         # command wraps every half motor revolution; a real drive follows the
@@ -346,14 +362,17 @@ class AKDBehavior(Behavior):
                 # one that simply never receives it.
                 i_cmd = (getattr(rx, 'current_command', 0) / 1000.0
                          + getattr(rx, 'torque_ff', 0) * self.i_cont / 1000.0)
-                if self.flip:
+                if self.flip and not self.hw_torque_sign:
                     i_cmd = -i_cmd  # undo the device-side sign flip
                 tau = self._current_to_torque(i_cmd)
             elif self.op_mode == 3:  # velocity mode: stiff first-order servo
                 v_cmd = getattr(rx, 'velocity_command', 0) / 1000.0 * 2 * math.pi / 60.0
                 # gain limited by explicit-Euler stability at the 1 ms cycle
                 kv = min(self.tau_limit / 0.5, j_motor * 200.0)
-                tau = kv * (v_cmd - omega_m)
+                err = v_cmd - omega_m
+                self._v_integral = max(-self.tau_limit, min(
+                    self.tau_limit, self._v_integral + 20.0 * kv * err * CYCLE_S))
+                tau = kv * err + self._v_integral
             elif self.op_mode == 7:  # position mode: critically damped PD
                 raw = getattr(rx, 'position_command', 0)
                 if self._pos_cmd_prev_raw is None:
@@ -373,6 +392,8 @@ class AKDBehavior(Behavior):
                 tau = kp * (theta_cmd - theta_m) - kd * omega_m
             tau = max(-self.tau_limit, min(self.tau_limit, tau))
 
+        if self.op_mode != 3 or self.state != 'operation_enabled':
+            self._v_integral = 0.0
         if self.op_mode != 7 or self.state != 'operation_enabled':
             self._pos_cmd_prev_raw = None  # re-seed on next position-mode entry
 
@@ -412,7 +433,7 @@ class AKDBehavior(Behavior):
         else:
             omega_m, theta_m = 0.0, 0.0
         current = self._torque_to_current(self.tau_motor)
-        if self.flip:
+        if self.flip and not self.hw_torque_sign:
             current = -current
 
         emit('op_mode', self.op_mode)
@@ -516,6 +537,20 @@ class Master:
         self.plant = Plant(sim_params)
 
         layout = cfg['expected_slave_layout']
+        # `drive_gear_ratio: {DUT: -43}` in sim_params: the sim shaft's ratio for
+        # that drive, independent of the config's gear_ratio (which the
+        # controller uses for limits and may be left at 1).
+        for name, ratio in (sim_params.get('drive_gear_ratio') or {}).items():
+            layout = [dict(e, params=dict(e.get('params') or {}, gear_ratio=ratio))
+                      if e.get('name') == name else e for e in layout]
+        # `hardware_torque_sign: true` in sim_params: make every drive treat
+        # flip_torque_sign the way the real one does (see _SimAKD.__init__).
+        # Injected through the layout params for the same reason the ratio is --
+        # the behaviours never see sim_params themselves.
+        if sim_params.get('hardware_torque_sign'):
+            layout = [dict(e, params=dict(e.get('params') or {},
+                                          sim_hardware_torque_sign=True))
+                      for e in layout]
         self.slaves = [
             _SimSlave(entry, DEVICE_CLASSES[entry['model']]['id'], noise)
             for entry in layout]

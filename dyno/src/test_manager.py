@@ -194,7 +194,113 @@ class TestTrace:
         # trace's final keyframe. test_preview._expand_trace_body uses the same count.
         self._n_body = int(math.floor(self._trace_max_time / self.dt + 1e-9)) + 1
 
+        # Typical spacing between keyframes. Median, not mean: these traces open
+        # with a lead-in held for a second or more, and one long gap would drag
+        # a mean well off the rate the body is actually written at.
+        spacing = np.diff(self._t_arr)
+        spacing = spacing[spacing > 1e-9]
+        self._keyframe_dt = float(np.median(spacing)) if spacing.size else self.dt
 
+        # Resample the whole body onto the control grid once, here, rather than
+        # interpolating per cycle in commands(). That keeps np.interp out of the
+        # 1 kHz path, and -- the part that matters -- it is where a position
+        # trace written coarser than the control rate gets reconstructed into
+        # something a position loop can follow. See _smooth_position.
+        self._grid = np.arange(self._n_body) * self.dt
+        self._in_body = np.interp(self._grid, self._t_arr, self._in_arr)
+        self._out_body = np.interp(self._grid, self._t_arr, self._out_arr)
+        if self.input_mode == 'position':
+            self._in_body = self._smooth_position(self._in_body)
+        if self.output_mode == 'position':
+            self._out_body = self._smooth_position(self._out_body)
+
+        # What the drive will ACTUALLY be asked for, cycle by cycle, after
+        # reconstruction. The keyframe corner check above reads the source
+        # trace, which is the wrong grid to judge this on: a trace can pass it
+        # comfortably and still demand thousands of rad/s^2 per cycle once
+        # sampled at 1 kHz (every archimedes_bench_input_spin_* trace did).
+        # A warning, not an assert, for the same reason as the corner check --
+        # several long-standing traces would trip it.
+        for motor, body in (('input', self._in_body), ('output', self._out_body)):
+            if self.settings[f'{motor}_motor']['control_mode'] != 'position':
+                continue
+            if body.size < 3:
+                continue
+            accel = np.abs(np.diff(np.diff(body) / self.dt) / self.dt)
+            limit = self.limits[motor]['acceleration']
+            if accel.size and accel.max() > limit:
+                worst = int(np.argmax(accel))
+                print(f"WARNING: {motor}_motor position trace demands "
+                      f"{accel.max():.0f} rad/s^2 at t={self._grid[worst + 1]:.3f}s "
+                      f"once resampled to the {self.dt * 1e3:g} ms control grid "
+                      f"(limit {limit:g}). The trace is written at "
+                      f"{1.0 / self._keyframe_dt:.0f} Hz; "
+                      "regenerate it at the control rate for real headroom.")
+
+
+
+    def _smooth_position(self, body):
+        """Turn a linearly-interpolated position body into a C1 one.
+
+        np.interp between keyframes gives piecewise-CONSTANT velocity: the
+        commanded speed holds for a whole keyframe spacing and then steps, in
+        one control cycle, to the next. The position loop absorbs that step in
+        about a cycle, so the drive sees an acceleration impulse of
+        (velocity step / dt) -- not the acceleration the trace was built with.
+
+        Measured on archimedes_bench_input_spin_mid, whose traces are written at
+        the segment rate rather than the control rate:
+
+            segment  keyframes  design accel  per-cycle accel, linear
+            V0600     54.9 Hz      345            6283 rad/s^2
+            V1200    109.9 Hz     1381           12566
+            V1800    164.8 Hz     3106           18850
+
+        against a configured motor_limits.acceleration of 5500. The 2026-09-17
+        troubleshooting_initial logs show it as a 108-112 Hz ripple on
+        input_torque, load_torque and dut_current at V1200 -- exactly that
+        trace's 109.9 Hz keyframe rate -- and +/-36 Nm at the output through the
+        43.88:1 ratio. The constant-speed stretches, where linear interpolation
+        is exact, are quiet by comparison (load_torque sd 0.88 Nm, dut_current
+        sd 0.058 A), which is what says the ripple is the reconstruction and not
+        the gearbox.
+
+        The fix is a centred moving average exactly one keyframe spacing wide.
+        That is the matched reconstruction for this defect: averaging a
+        piecewise-constant velocity over one spacing yields a piecewise-LINEAR
+        velocity, so the acceleration comes out at the value the trace was built
+        with instead of a spike (V1200: 12566 -> 1396, against a design 1381).
+        It also preserves both endpoints exactly and does not raise peak speed,
+        which a spline reconstruction does not: PCHIP on the same traces left
+        2784 rad/s^2 and overshot 125.7 rad/s to 127.8.
+
+        Only position channels get this. A torque or velocity trace is already
+        continuous in the quantity being commanded, and smoothing one could lift
+        its slope past the rotatum/acceleration limits asserted above.
+        """
+        width = int(round(self._keyframe_dt / self.dt))
+        if width < 2:
+            return body          # already at (or finer than) the control rate
+        if width % 2 == 0:
+            width += 1           # odd, so the window is centred with no shift
+        if width >= body.size:
+            return body
+        pad = width // 2
+        padded = np.concatenate([np.full(pad, body[0]), body, np.full(pad, body[-1])])
+        smoothed = np.convolve(padded, np.ones(width) / width, mode='valid')
+        # Both endpoints have to land exactly where they did: the trace is
+        # asserted to start at 0, and the hold after the body continues from the
+        # final value, so a discrepancy at either end is a step into or out of
+        # the body. Edge padding leaves them off by up to ~1e-4 rad on the
+        # traces in this repo. Correct that with a LINEAR ramp rather than by
+        # pinning the two samples: pinning removes the endpoint error by putting
+        # a one-cycle step next to it, which is the artefact being removed here.
+        # Spread over the whole body the same error is ~1e-5 rad/s of velocity
+        # bias, i.e. nothing.
+        ends = np.linspace(0.0, 1.0, smoothed.size)
+        start_err = body[0] - smoothed[0]
+        end_err = body[-1] - smoothed[-1]
+        return smoothed + (start_err + (end_err - start_err) * ends)
 
     # method that yields out commands to the test manager. before yielding the last command the class should be in a state from which it can be run again.
     def commands(self):
@@ -217,13 +323,13 @@ class TestTrace:
         # velocity x jitter -- ~15 mrad at 3600 rpm, 6-11 A of current and 3-4 Nm
         # on the input cell in the 2026-09-16 Archimedes spin runs. Cached arrays
         # avoid pandas in the hot path.
+        in_body, out_body = self._in_body, self._out_body
         for n in range(self._n_body):
-            t = n * self.dt
             yield {
                 'input_mode': self.input_mode,
                 'output_mode': self.output_mode,
-                'input_command':  np.interp(t, self._t_arr, self._in_arr),
-                'output_command': np.interp(t, self._t_arr, self._out_arr),
+                'input_command':  in_body[n],
+                'output_command': out_body[n],
                 'log_flag': self.log_id_base + str(self.run),
             }
 

@@ -792,6 +792,15 @@ class AKD:
         self.switching_modes = False
 
         self.position_offset = 0
+        # Position FEEDBACK and position COMMANDS are in different frames.
+        # `position` counts from bring-up; a position command is relative to
+        # wherever the shaft sat when the drive last entered position mode
+        # (pos_cmd_offset, captured in update_modes). Both are recorded on that
+        # mode switch so position_command_frame can convert between them -- see
+        # its docstring for why feeding `position` straight back as a command is
+        # a step, not a hold.
+        self.pos_cmd_offset = 0
+        self.position_cmd_origin = 0.0
         # from the MERGED params like everything else (was: read from the raw
         # dyno-config argument even when an absorber entry overrode the rest)
         self.flip_torque_sign = self.params['flip_torque_sign']
@@ -938,6 +947,14 @@ class AKD:
                     self._rx_pdo.control_mode = self._mode_to_op[self.target_mode]
                     if self.target_mode == 'position':
                         self.pos_cmd_offset = getattr(self._tx_pdo, 'actual_position', 0)
+                        # Same instant, same encoder reading, expressed in the
+                        # frame `position` uses: this is the position a command
+                        # of 0 now parks the shaft at, and so the origin that
+                        # converts between the two frames. process_txpdo has
+                        # already refreshed self.position this cycle from the
+                        # very PDO pos_cmd_offset is read from, so the two
+                        # cannot disagree.
+                        self.position_cmd_origin = self.position
                     self.mode = self.target_mode
 
             # Once drive confirms mode change, return to normal operation        
@@ -1170,6 +1187,29 @@ class AKD:
 
     def write_rxpdo(self):
         self._slave.output = bytes(self._rx_pdo)
+
+    @property
+    def position_command_frame(self):
+        '''Where the shaft is NOW, as a position command that would hold it there.
+
+        `self.position` counts from bring-up. A position command is relative to
+        the shaft position captured when the drive entered position mode, so the
+        two frames differ by exactly that entry position (position_cmd_origin):
+        commanding c parks the shaft where `position` reads c + origin, for
+        either setting of flip_direction_sign. On the Archimedes rig the gap has
+        been 1.4-1.9 rad at the input, so `send_command(self.position)` is not a
+        hold, it is a step of that size -- which is what drove the 20 A slams at
+        the start of every post-test brake in
+        logs/archimedes/gbx_1p2p0/troubleshooting_initial.
+
+        Anything handing measured position back to the drive as a command wants
+        this, not `position`. NaN if the position feedback is unreadable, so a
+        caller can refuse rather than command a guess.
+        '''
+        try:
+            return float(self.position) - float(self.position_cmd_origin)
+        except (TypeError, ValueError):
+            return math.nan
 
     def send_command(self, command, torque_ff = 0):
 
@@ -1673,6 +1713,21 @@ class ELMO:
         self._rx_set('target_position', 0)
         self._rx_set('target_velocity', 0)
         self._rx_set('torque_offset', 0)
+
+    @property
+    def position_command_frame(self):
+        '''Where the shaft is NOW, as a position command that would hold it there.
+
+        Same contract as AKD.position_command_frame, different arithmetic: this
+        drive never re-bases pos_cmd_offset on a mode switch (it is set to 0 in
+        __init__ and left there), so a command of 0 parks the shaft at raw zero,
+        where `position` reads position_offset. The gap between the feedback and
+        command frames is therefore position_offset alone.
+        '''
+        try:
+            return float(self.position) - float(self.position_offset)
+        except (TypeError, ValueError):
+            return math.nan
 
     def send_command(self, command, torque_ff=0):
         if self.mode == 'position':

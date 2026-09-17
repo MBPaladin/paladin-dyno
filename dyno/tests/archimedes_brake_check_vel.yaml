@@ -1,0 +1,31 @@
+# Stage 1 of the post-test brake bring-up: VELOCITY mode, which is the
+# sign-free path (the brake commands zero speed, so a wrong polarity is not
+# possible). Run this before the torque-mode one.
+#
+# Input ramps to 100 rad/s over 0.5 s (~2.3 rad/s at the output) and holds.
+# Start from CENTRE. The output walks outward and the window's early trip fires
+# at about rel 1.37; the brake then commands zero speed.
+#
+# Safe by construction, three ways:
+#   - stop_decel_rad_s2 is the MEASURED free coast (20.3), so the early trip on
+#     its own lands the output at 1.50 rad with 0.245 rad still to the bumper,
+#     even if the brake does nothing at all.
+#   - velocity mode cannot get the polarity wrong.
+#   - the absorber is held at zero torque and never drives.
+#
+# The trace holds 100 rad/s to 9.5 s and then returns to 0 (the loader refuses
+# a velocity trace that does not end at zero). That tail is never reached: the
+# window trips under a second in.
+#
+# Expect in the log: stop_reason.kind 'position_window', and
+# stop_reason.brake {'mode': 'velocity', 'outcome': 'stopped'}, with the output
+# coming to rest around rel 1.38 instead of the 1.50 the free coast would give.
+behaviors:
+  - id: BRAKE_CHECK_VEL
+    type: test_trace
+    settings:
+      input_motor:
+        control_mode: velocity
+      output_motor:
+        control_mode: torque
+      trace_file: "archimedes_brake_check.csv"
