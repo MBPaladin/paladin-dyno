@@ -1,0 +1,38 @@
+# Syno 1.2.1 -- the new gearbox fitted 2026-09-18, the first unit run against
+# the 100 Nm slip plans.
+#
+# Copied from gbx_1p2p0.yaml. The only substantive difference is `exclude`:
+# see the note there.
+
+unit: "1.2.1"
+unit_label: "Syno 1.2.1"
+
+# Everything beneath this is searched, recursively, for .hdf5 logs.
+log_root: dyno/logs/archimedes/gbx_1p2p1
+
+# Path components to skip. NOTE the difference from 1.2.0: `calibration` is NOT
+# excluded here. On 1.2.0 that folder held V0030/V0060 bring-up spins that would
+# have landed in the customer's velocity ramp. On this unit the only thing under
+# it is calibration/gravity_map, which is the real archimedes_fwd_gravity_map
+# run (SLOW/FAST segments, kind=gravity) -- a customer test, not bring-up.
+# Excluding the component by name would silently drop it.
+#
+# If bring-up spins are later dropped under this unit's calibration/, move them
+# to initial_setup/ rather than adding the component back, or the gravity map
+# goes with them.
+exclude:
+  - initial_setup
+  - troubleshooting_initial
+
+# Customer's hard limit for this unit (1.2.0/1.2.1 = 100 Nm, 1.2.2 = 140 Nm).
+torque_cap_nm: 100.0
+# What the unit is rated to, for the "does it meet spec" finding on slip.
+rated_torque_nm: 100.0
+
+# Output position window in force during these runs, for the endstop figure.
+# These ran 2026-09-18 15:03-15:17, after the raise to 1.60 (see the config).
+position_half_window_rad: 1.6
+
+# Nameplate. This unit has no no-load velocity sweep yet, so the ratio cannot be
+# measured off the data and this value is the one that gets used.
+ratio: 43.88

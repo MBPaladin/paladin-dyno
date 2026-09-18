@@ -1,8 +1,20 @@
 {
-  "//": "LaTeX Workshop: use MiKTeX pdflatex directly (no latexmk/Perl needed). Absolute path so it works even before a VS Code PATH refresh.",
+  "//": "LaTeX Workshop. This file is COMMITTED and shared, so the default recipe must work on every machine: it calls `pdflatex` from PATH, which is what both TeX Live (Linux) and MiKTeX (Windows) put there. The MiKTeX absolute-path recipe below is kept as a fallback for a Windows box where VS Code has not picked up the PATH yet -- it was the original default, and it is machine-specific, so it is no longer the one that runs by default.",
+
   "latex-workshop.latex.tools": [
     {
       "name": "pdflatex",
+      "command": "pdflatex",
+      "args": [
+        "-synctex=1",
+        "-interaction=nonstopmode",
+        "-file-line-error",
+        "%DOC%"
+      ]
+    },
+    {
+      "//": "Windows / MiKTeX fallback. Only used by the second recipe.",
+      "name": "pdflatex-miktex",
       "command": "C:/Users/Nathan Justus/AppData/Local/Programs/MiKTeX/miktex/bin/x64/pdflatex.exe",
       "args": [
         "-synctex=1",
@@ -12,14 +24,26 @@
       ]
     }
   ],
+
+  "//recipes": "Twice, because the reports carry a table of contents and cross-references: the first pass writes the .aux and .toc, the second resolves them.",
   "latex-workshop.latex.recipes": [
     {
       "name": "pdflatex x2",
       "tools": ["pdflatex", "pdflatex"]
+    },
+    {
+      "name": "pdflatex x2 (MiKTeX absolute path)",
+      "tools": ["pdflatex-miktex", "pdflatex-miktex"]
     }
   ],
   "latex-workshop.latex.recipe.default": "pdflatex x2",
+
+  "//autoBuild": "onSave applies to hand-edited .tex. Generated reports are written by dyno/src/archimedes/report.py and are built explicitly, so this does not fire on them.",
   "latex-workshop.latex.autoBuild.run": "onSave",
+
+  "//rootFile": "The generated section files carry a `% !TEX root` magic comment pointing at their own driver. Without it, auto-detection scans the workspace for \\documentclass and can bind a section to another unit's report -- there is one report root per gearbox under dyno/logs/, plus the mac_motors one.",
+  "latex-workshop.latex.rootFile.useSubFile": true,
+
   "//clean": "clean.method defaults to 'command', which shells out to latexmk (not installed in this MiKTeX) and pops a package-install dialog mid-build. 'glob' makes clean.fileTypes below actually apply.",
   "latex-workshop.latex.clean.method": "glob",
   "latex-workshop.latex.autoBuild.cleanAndRetry.enabled": false,

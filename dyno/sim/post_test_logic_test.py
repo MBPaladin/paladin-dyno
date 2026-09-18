@@ -286,6 +286,35 @@ c.devices.DUT.velocity = 175.0 * 1.5
 check(c._brake_step(c._post_test, t0 + 0.005) is not None,
       'brake aborted before verify_s elapsed')
 
+# --- a brake that overshoots through zero is NOT a wrong polarity ------------
+# Regression for 2026-09-18, bkw_passes/velocity_ramp_3: the backstop compared
+# |v| against the entry speed, so a correct brake that drove the input through
+# zero and rang to a LARGER reverse speed read as "sped up" and aborted. The
+# input rotor takes ~11 rad/s per cycle at 4 Nm, so on this rig overshoot is the
+# normal case, not the exception. Only speeding up ALONG THE ENTRY DIRECTION is
+# a polarity fault.
+for reverse in (-1.6, -1.0, -0.5):
+    c = stub()
+    c._stop_test({'kind': 'position_window'})
+    t0 = c._post_test['brake']['started']
+    c.devices.DUT.velocity = 175.0 * reverse      # reversed, possibly faster
+    out = c._brake_step(c._post_test, t0 + 0.011)
+    check(out is not None,
+          f'brake aborted on a reversal to {175.0 * reverse:g} rad/s '
+          f'(outcome: {c._post_test["brake"]["outcome"]})')
+print('  overshoot through zero -> keeps braking, even past the entry speed')
+
+# ...and the same run entering in the NEGATIVE direction still catches a real
+# wrong sign, so the fix is not just "never abort".
+c = stub()
+c.devices.DUT.velocity = -175.0
+c._stop_test({'kind': 'position_window'})
+t0 = c._post_test['brake']['started']
+c.devices.DUT.velocity = -175.0 * 1.5         # faster, same direction
+check(c._brake_step(c._post_test, t0 + 0.011) is None,
+      'a genuine speed-up entering negative was not caught')
+print('  genuine speed-up still aborts, in either entry direction')
+
 # --- already slow: skip the brake, go straight to the tail -------------------
 c = stub(v_out=0.01)
 c._stop_test({'kind': 'position_window'})

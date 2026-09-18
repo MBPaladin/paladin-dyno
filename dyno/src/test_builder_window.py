@@ -657,8 +657,10 @@ class TestBuilderWindow(QWidget):
                 widget.setChecked(bool(value))
                 widget.toggled.connect(self._commit_form)
             elif typ is int:
+                lo, hi, step = test_builder.int_param_range(key)
                 widget = QSpinBox()
-                widget.setRange(1, 100000)
+                widget.setRange(lo, hi)
+                widget.setSingleStep(step)
                 widget.setValue(int(value))
                 widget.valueChanged.connect(self._commit_form)
             elif typ is list:

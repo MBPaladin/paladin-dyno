@@ -1,0 +1,35 @@
+# Syno 1.2.0 -- the commissioning / redundant drive of batch 1.
+#
+# This file is the ONLY thing that changes between gearboxes. Copy it, point
+# log_root at the next unit's folder, set the rating and the cap, and run. The
+# analyzers find the tests by segment name and read forward/back-drive off the
+# data, so a campaign split across a different number of files needs no edit
+# here.
+
+unit: "1.2.0"
+unit_label: "Syno 1.2.0"
+
+# Everything beneath this is searched, recursively, for .hdf5 logs.
+log_root: dyno/logs/archimedes/gbx_1p2p0
+
+# Path components to skip. Bring-up and troubleshooting runs reuse the plans'
+# segment names -- `calibration/` holds V0030/V0060 spins that would otherwise
+# land in the customer's velocity ramp -- so they are excluded by name, not by
+# hoping their numbers look different.
+exclude:
+  - initial_setup
+  - troubleshooting_initial
+  - calibration
+
+# Customer's hard limit for this unit (1.2.0/1.2.1 = 100 Nm, 1.2.2 = 140 Nm).
+torque_cap_nm: 100.0
+# What the unit is rated to, for the "does it meet spec" finding on slip.
+rated_torque_nm: 100.0
+
+# Output position window in force during these runs, for the endstop figure.
+# 1.50 rad on 2026-09-17; raised to 1.60 on 2026-09-18 (see the config).
+position_half_window_rad: 1.5
+
+# Nameplate, used only if the no-load sweep is missing and the ratio cannot be
+# measured.
+ratio: 43.88

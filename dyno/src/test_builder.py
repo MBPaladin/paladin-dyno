@@ -175,6 +175,23 @@ START_HOLD_S = 1.0              # [s] default lead-in hold at zero
 GENERATED_TEST_DIR = 'ui_generated_tests'   # under the tests directory
 GENERATED_TRACE_DIR = 'ui_generated'        # under tests/traces/
 
+# Integer params whose spinbox may go negative, key -> (min, max, step).
+# Every other int param is a count (cycles, debounce) and keeps the 1.. range.
+# `direction` is the one signed integer on any form, and a spinbox that cannot
+# reach -1 does not just display the wrong thing: the form commits whatever the
+# widget clamped to, so opening a -1 segment and touching anything rewrote it
+# to +1. Step 2 so the arrows walk -1 <-> +1 without stopping at 0.
+SIGNED_INT_PARAMS = {
+    'direction': (-1, 1, 2),
+}
+DEFAULT_INT_RANGE = (1, 100000, 1)
+
+
+def int_param_range(key):
+    """(min, max, step) for an integer param's spinbox."""
+    return SIGNED_INT_PARAMS.get(key, DEFAULT_INT_RANGE)
+
+
 # Pattern parameter metadata: key -> (label, default, type). The UI builds its
 # forms from this, and compile falls back to these defaults for missing keys.
 PATTERNS = {
@@ -224,6 +241,12 @@ PATTERNS = {
         'rate':               ('Ramp rate [Nm/s]', 0.1, float),
         'release_s':          ('Release back to 0 [s]', 1.0, float),
         'rest_s':             ('Rest after release [s]', 2.0, float),
+        # Which way a NON-bipolar ramp pushes. Ignored when `bipolar` is set,
+        # which alternates +/- regardless. Exists so a single ramp can be aimed
+        # one way -- a slip or breakaway hunt that has to recentre between
+        # attempts cannot use `bipolar`, because the recentre has to happen
+        # BETWEEN the two directions and a bipolar segment has no gap there.
+        'direction':          ('Ramp direction (+1 / -1)', 1, int),
         'bipolar':            ('Alternate direction each ramp', True, bool),
         'cycles':             ('Ramps per direction', 3, int),
         'velocity_threshold': ('Breakaway speed [rad/s]', 0.5, float),
@@ -408,6 +431,7 @@ def breakaway_settings(segment):
         'rate': abs(float(p('rate'))),
         'release_s': float(p('release_s')),
         'rest_s': float(p('rest_s')),
+        'direction': 1 if float(p('direction')) >= 0 else -1,
         'bipolar': bool(p('bipolar')),
         'cycles': int(p('cycles')),
         'detect': {
@@ -446,7 +470,7 @@ def breakaway_preview_rows(segment):
     if s['lead_in_s'] > 0:
         t += s['lead_in_s']
         emit(0.0)
-    directions = (1.0, -1.0) if s['bipolar'] else (1.0,)
+    directions = (1.0, -1.0) if s['bipolar'] else (float(s['direction']),)
     for level in s['hold_levels']:
         if level != sec:
             t += abs(level - sec) / hold_rate
@@ -1046,6 +1070,8 @@ def _validate_breakaway(segment, limits=None):
         issues.append('Arm fraction must be in [0, 1]')
     if not s['hold_levels']:
         issues.append('Hold motor has no levels')
+    if s['direction'] not in (1, -1):
+        issues.append('Ramp direction must be +1 or -1')
 
     if limits:
         ramp = limits[primary['motor']]

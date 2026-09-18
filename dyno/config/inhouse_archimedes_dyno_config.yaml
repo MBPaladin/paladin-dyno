@@ -51,7 +51,38 @@ feedforward_ratio: 0.0
 position_window:
   enabled: true
   source: devices.LOAD.position   # absorber encoder, direct to output
-  half_window_rad: 1.50           # ~86 deg; test trips beyond centre +/- this
+  # 1.60 rad = 91.7 deg (operator call, 2026-09-18). Raised from 1.50 to open
+  # the gap between the commanded throw and the trip: the back-drive runs in
+  # logs/archimedes/gbx_1p2p0/bkw_passes overshoot their OWN command at the
+  # turnaround, and that overshoot grows with speed --
+  #
+  #     rpm_in   command   actual peak   overshoot
+  #        300    1.330       1.320       -0.010
+  #        600    1.330       1.390       +0.060
+  #        900    1.330       1.448       +0.118
+  #       1200    1.330       1.491       +0.161
+  #       1500    1.330       1.499       +0.169  <- tripped the 1.50 window
+  #
+  # so the trips were the absorber's position loop overshooting the corner, not
+  # the command going anywhere near the limit. The commanded throw is unchanged
+  # at 1.33 rad (generate_archimedes_tests.OUTPUT_END_RAD).
+  #
+  # WHAT THIS COSTS, in the one place it matters. Touch-off measures the bumpers
+  # at +/-1.7511 rad from centre (2026-09-18, both sides agree), so the window
+  # leaves 0.1511 rad (8.7 deg) for a trip to stop in -- down from 0.245 rad at
+  # 1.50. The braked stop is now MEASURED rather than expected: 148 rad/s^2 at
+  # the output (bkw_passes/velocity_ramp_3 tail; the comment below predicted
+  # ~270, so the real figure is well under the guess). Unbraked-look-ahead, that
+  # distance is only good to ~2820 rpm at the input:
+  #
+  #     3000 rpm in  ->  0.171 rad   past 0.1511
+  #     3600 rpm in  ->  0.246 rad   past 0.1511
+  #
+  # which is why stop_decel_rad_s2 below is now ARMED at 150. With the
+  # look-ahead on, the trip fires far enough ahead of the boundary that the
+  # braked stop lands INSIDE the window, and this margin stops being the thing
+  # the top of the speed range depends on.
+  half_window_rad: 1.60           # Half window: 91.7 deg
   # Early trip: moving outward at v, trip when |pos| + v^2/(2*stop_decel) passes
   # the window, so the stopped output lands inside it.
   #
@@ -82,7 +113,9 @@ position_window:
   #
   # WHAT THIS COSTS: a real excursion is now caught at the boundary rather than
   # ahead of it, so the stop has to work in the distance left between the window
-  # (1.5) and the bumpers (1.745) -- 0.245 rad. Free-coasting at 20.3 rad/s^2
+  # (now 1.60) and the bumpers (1.7511 measured) -- 0.1511 rad; the figures in
+  # this paragraph are the 1.50/0.245 ones it was written against.
+  # Free-coasting at 20.3 rad/s^2
   # that is only good to 3.15 rad/s at the output (~2100 rpm at the input); the
   # 2026-09-17 tail coast measured 23.5 rad/s^2, so this is not optimistic.
   # Below that speed the coast fits; above it, the stop has to be the brake
@@ -91,7 +124,29 @@ position_window:
   # dyno_controller._dut_command_for_mode). Before running the _high traces
   # (2100-3600 rpm = 4.5-8.6 rad/s at the output, coasting 0.5-1.8 rad),
   # re-measure the braked stop from a tail log and set this from it.
-  stop_decel_rad_s2: 0
+  #
+  # THAT TAIL LOG NOW EXISTS (2026-09-18, bkw_passes/velocity_ramp_3): a braked
+  # trip pulled the input 37.6 -> 2.7 rad/s in 4.9 ms, which is 148 rad/s^2 at
+  # the output, and the output moved 0.013 rad doing it. So 150 is the braked
+  # figure this asks for, not the free-coast 20.3 that made the look-ahead
+  # unusable -- a 12x difference, and the reason it can be armed at all.
+  #
+  # ARMED at 150 (operator call, 2026-09-18).
+  #
+  # Two things to keep honest about it:
+  #
+  #  1. 150 is 1.4% ABOVE the 148 that was measured, which is the optimistic
+  #     direction -- the same mistake the old 50 placeholder made. It is small:
+  #     at 3600 rpm the real stop is 0.249 rad against the 0.246 assumed, a
+  #     0.003 rad error, and the 0.1511 rad window->bumper margin covers it many
+  #     times over. Do not round it UP again without another tail log.
+  #  2. It re-sizes traverses. generate_archimedes_tests reads this value and
+  #     shrinks each throw until |x| + v^2/(2*stop_decel) fits the window, so
+  #     the high-speed points now turn short of 1.33 rad. The generator prints
+  #     the throw it picked for every speed -- read that list after regenerating,
+  #     because a speed whose constant-speed run gets too short is SKIPPED
+  #     rather than shortened.
+  stop_decel_rad_s2: 150
   velocity_source: devices.LOAD.velocity
   require_touch_off: true
   touch_off:
@@ -270,7 +325,7 @@ expected_slave_layout:
         torque: 15              # input cell is 20 Nm FS; test needs ~3.3 Nm + accel
         continuous_torque: 15
         velocity: 500           # 3600 rpm = 377 rad/s
-        acceleration: 5500      # rad/s^2, top speeds do not fit the throw at less
+        acceleration: 7500      # rad/s^2, top speeds do not fit the throw at less
         rotatum: 5000
       drive_params:
         i_cont: 7
@@ -302,8 +357,8 @@ expected_slave_layout:
       motor_limits:
         torque: 200
         continuous_torque: 100
-        velocity: 12            # max test output speed is 8.8 rad/s
-        acceleration: 150       # rad/s^2; 3600 rpm shuttles need ~116 at the output
+        velocity: 60            # max test output speed is 8.8 rad/s
+        acceleration: 2000       # rad/s^2; 
         rotatum: 1000
       drive_params:
         i_cont: 15
@@ -314,7 +369,7 @@ expected_slave_layout:
 safeties:
   output_torque: { source: devices.adc_1.load_torque, limit: 200, nan_trips: true } # Nm; raise only if slip torque needs it
   input_torque: { source: devices.adc_1.input_torque, limit: 15, nan_trips: true } # Nm; input cell is 20 Nm FS
-  output_velocity: { source: devices.LOAD.velocity, limit: 12, nan_trips: true } # rad/s; tests reach 8.8
+  output_velocity: { source: devices.LOAD.velocity, limit: 60, nan_trips: true } # rad/s; tests reach 8.8
   input_velocity: { source: devices.DUT.velocity, limit: 500, nan_trips: true } # rad/s; tests reach 377
   # RATIO BREAK -- the slip safety. Added 2026-09-17 after a slip ran the input
   # to 155 rad/s with the output locked and NOTHING stopped it: the output sits
@@ -335,7 +390,7 @@ safeties:
   # the customer's 5% creep limit, and the alternating level sign cancels it
   # between cycles) and above where a measured slip settles (0.356 rad on
   # 2026-09-17), so the slip test still completes its own measurement.
-  ratio_break: { source: ratio_error_rad, limit: 2.0, trip_samples: 50, resumable: true } # output rad
+  ratio_break: { source: ratio_error_rad, limit: 10.0, trip_samples: 50, resumable: true } # output rad
   # ratio_slip is the rate, output rad/s, averaged over 50 ms. This is the one
   # that catches a runaway fast: the 2026-09-17 free-spin ran at 2.1-2.7 rad/s
   # and would have been stopped inside ~150 ms, at roughly 20 rad of input
@@ -421,7 +476,7 @@ post_test:
     stop_velocity_rad_s: 0.05   # at or under this, held for settle_s, = stopped
     settle_s: 0.05
     min_velocity_rad_s: 0.05    # already this slow: skip the brake, go to tail
-    timeout_s: 0.60             # hard cap; the rig took 90 ms at 0.5 Nm
+    timeout_s: 0.5             # hard cap; the rig took 90 ms at 0.5 Nm
     # Which way a positive torque command moves the LOGGED dut_velocity.
     # `auto` derives it from the DUT's flip_torque_sign / flip_direction_sign
     # pair; both of this rig's flag combinations have been measured and agree

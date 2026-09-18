@@ -1099,6 +1099,9 @@ class RampBreak:
         self.release_s = max(float(s.get('release_s', 1.0)), 1e-3)
         self.rest_s = max(float(s.get('rest_s', 0.0)), 0.0)
         self.bipolar = bool(s.get('bipolar', True))
+        # Which way a non-bipolar ramp pushes. Absent (every plan written before
+        # this existed) means +1, which is what a non-bipolar ramp always did.
+        self.direction = 1.0 if float(s.get('direction', 1)) >= 0 else -1.0
         self.cycles = max(1, int(s.get('cycles', 1)))
 
         detect = s.get('detect') or {}
@@ -1257,7 +1260,7 @@ class RampBreak:
         span = 0
         self.repeat = 0
         hold_value = 0.0
-        directions = (1.0, -1.0) if self.bipolar else (1.0,)
+        directions = (1.0, -1.0) if self.bipolar else (self.direction,)
 
         if self.lead_in_s > 0:
             yield from self._dwell(0.0, 0.0, self.lead_in_s)

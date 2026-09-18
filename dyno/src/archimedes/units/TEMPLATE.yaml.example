@@ -1,0 +1,49 @@
+# Template for the next Archimedes unit. Copy to <name>.yaml and edit; the
+# analyzers need nothing else. Run with:
+#
+#     ./dyno/utilities/archimedes.sh <name>
+#
+# What you do NOT have to do between units:
+#   - say how many files each test landed in, or in what order they ran
+#   - say which runs are forward and which are back-drive (read off the data)
+#   - re-point anything when the back-drive pass arrives a week later; drop the
+#     logs anywhere under log_root and re-run
+#   - deal with a resumed run repeating the level it died on; the longer copy
+#     is kept and the drop is listed in report.txt
+
+unit: "1.2.1"
+# Goes on the title page of the customer report, so it carries the unit's name
+# and nothing else -- no log-folder tag, no internal bookkeeping.
+unit_label: "Syno 1.2.1"
+
+# Searched recursively for .hdf5. Anything the plans named is picked up.
+log_root: dyno/logs/archimedes/gbx_1p2p1
+
+# Path components to skip. Bring-up runs reuse the plans' segment names, so
+# they must be excluded by PATH rather than hoped to look different: a
+# `calibration/` folder holding a V0030 spin would otherwise land in the
+# customer's velocity ramp as a legitimate step.
+exclude:
+  - initial_setup
+  - troubleshooting_initial
+  - calibration
+
+# Customer's hard torque limit for this unit: 100 Nm for 1.2.0 and 1.2.1,
+# 140 Nm for 1.2.2. Drives the "did the sweep cover the requested range"
+# finding and the line on the coverage figure.
+torque_cap_nm: 100.0
+
+# Nameplate rating, for the "does this unit meet spec" finding on slip torque.
+rated_torque_nm: 100.0
+
+# Output position window in force during the runs, for the endstop figure.
+# Read it off position_window.half_window in the config that was live.
+position_half_window_rad: 1.6
+
+# Only used if there is no no-load sweep to measure the ratio from.
+ratio: 43.88
+
+# Optional. Set false to leave the measured torque-cell zero in place -- the
+# customer's raw data is uncorrected, so a pack meant to match it verbatim
+# wants this off. Default true.
+# correct_zero: true

@@ -1245,7 +1245,13 @@ class Controller(Master):
                 # compare against NaN, which is False forever -- the brake
                 # would push at the bumper with its one safeguard silently
                 # disabled. Position mode also commands hold_position directly.
-                entry_input = abs(float(self.devices.DUT.velocity))
+                # SIGNED, not |v|. The polarity backstop below has to tell a
+                # shaft speeding up in the direction it was already going (the
+                # sign is wrong) from one that the brake drove through zero and
+                # out the other side (the sign is right and the brake is
+                # strong). Those look identical in |v|.
+                entry_input_signed = float(self.devices.DUT.velocity)
+                entry_input = abs(entry_input_signed)
                 # In the COMMAND frame, not the feedback frame. These differ by
                 # the shaft position at the last position-mode entry, and
                 # commanding the feedback value steps the shaft by that gap
@@ -1268,6 +1274,7 @@ class Controller(Master):
                          'polarity': self._brake_polarity(),
                          'entry_speed': None if math.isnan(speed) else speed,
                          'entry_input_speed': entry_input,
+                         'entry_input_signed': entry_input_signed,
                          'hold_position': hold,
                          'started': now,
                          'deadline': now + b['timeout_s'],
@@ -1411,13 +1418,36 @@ class Controller(Master):
 
         # Backstop on _brake_polarity: if the input is speeding UP the sign is
         # wrong and every further cycle drives the output harder at the bumper.
+        #
+        # Measured ALONG THE ENTRY DIRECTION, not as |v|. A correct brake on
+        # this rig routinely overshoots through zero -- 4 Nm on the 3.6e-4 kg m^2
+        # input rotor is ~11 rad/s of input speed per 1 kHz cycle, so a shaft
+        # entering at 37.6 rad/s crosses zero mid-cycle and the bang-bang sign
+        # flip arrives one sample late. On 2026-09-18 that rang to -49.5 rad/s
+        # and back down (bkw_passes/velocity_ramp_3): |v| exceeded the entry
+        # speed, the check fired, and it aborted a brake that had just stopped
+        # the shaft in 6 ms and pulled the output back off the window.
+        #
+        # Projecting onto the entry direction separates the two cases for good:
+        # a wrong sign keeps driving the shaft the way it was already going, so
+        # the projection GROWS; an overshoot reverses it, so the projection goes
+        # negative. Only the forward direction can abort.
+        #
+        # This path is reached only when the input is left in torque mode, which
+        # is every BACK-DRIVE plan (the output commands position, the input
+        # holds torque) and no forward one -- which is why it stayed hidden
+        # until back-drive testing started.
         elapsed = now - st['started']
         if elapsed >= b['verify_s']:
-            rise = abs(v_in) - st['entry_input_speed'] * (1 + b['verify_rise'])
-            if rise > 0:
+            entry_signed = st.get('entry_input_signed', 0.0)
+            direction = math.copysign(1.0, entry_signed) if entry_signed else 0.0
+            along = v_in * direction        # speed in the entry direction
+            rise = along - st['entry_input_speed'] * (1 + b['verify_rise'])
+            if direction and rise > 0:
                 st['outcome'] = (f'aborted: input sped up from '
-                                 f'{st["entry_input_speed"]:.1f} to {abs(v_in):.1f} '
-                                 f'rad/s under braking torque -- polarity '
+                                 f'{st["entry_input_speed"]:.1f} to {along:.1f} '
+                                 f'rad/s in the direction it was already turning, '
+                                 f'under braking torque -- polarity '
                                  f'{st["polarity"]:+d} is wrong for this drive, '
                                  f'check flip_torque_sign / flip_direction_sign')
                 print(f'POST-TEST BRAKE {st["outcome"]}')
