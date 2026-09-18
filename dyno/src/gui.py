@@ -158,6 +158,18 @@ class Window(QWidget):
         self._lag_at_run_start = 0.0
         self._run_ended_pending = False
 
+        # Recentre-and-resume after a position-window trip. The controller
+        # reports the resume point in control_state['resume'] and the GUI runs
+        # the operator through it in two steps: (1) recentre or abort, once the
+        # brake and log tail are done; (2) after return-to-centre ends, confirm
+        # the output is really at centre (rules out the OUTPUT having slipped)
+        # and resume from the start of the interrupted segment, or abort.
+        # _resume_key identifies the offer already handled so a 50 Hz state
+        # heartbeat does not re-raise it; _recover holds the step-2 watch.
+        self._resume_key = None
+        self._recover = None
+        self._resume_box = None
+
         # Default parent directory for the post-experiment "Save to" row.
         # Blank/absent means the directory the run already recorded into, so a
         # plain Save is a no-op rename.
@@ -1241,6 +1253,7 @@ class Window(QWidget):
 
         if self._has_window:
             self.__refresh_window(state)
+        self.__refresh_resume(state)
 
         armed = state.get('armed')
         if self._requested_arm is not None:
@@ -1259,6 +1272,137 @@ class Window(QWidget):
             # The controller holds nothing, whatever we believed. This only
             # ever narrows our claim to match it, which is the safe direction.
             self._armed_test = None
+
+    # Output-frame tolerance for "at centre" after a return-to-centre. The
+    # controller's own deadband is 0.005 rad; this is looser because the
+    # question here is whether the shaft came back at all, not whether the
+    # last millirad landed. A return that stopped on contact or on the
+    # ratio check leaves the output far outside this.
+    RESUME_CENTRE_TOL_RAD = 0.05
+
+    def __refresh_resume(self, state):
+        offer = state.get('resume')
+        if offer is None:
+            # Consumed (resumed), aborted, or overwritten by a fresh start.
+            self._resume_key = None
+            self._recover = None
+            if self._resume_box is not None:
+                self._resume_box.close()
+                self._resume_box = None
+            return
+        if state.get('test_active') or state.get('post_test') is not None:
+            return  # brake / log tail still running; the offer waits
+        key = (offer.get('test'), offer.get('segment'))
+        w = state.get('window') or {}
+
+        if self._recover is None:
+            if self._resume_key == key:
+                return  # already asked; a box is up or the answer is pending
+            self._resume_key = key
+            self.__offer_recentre(offer, w)
+            return
+
+        # Step 2: watching the return-to-centre the operator asked for.
+        r = self._recover
+        jog = w.get('jog')
+        if jog == 'return_centre':
+            r['seen'] = True
+            return
+        if jog is not None:
+            return  # some other jog; leave it alone
+        message = w.get('message') or ''
+        refused = (message != r['message_at_send']
+                   and message.startswith('Return to centre refused'))
+        # A refusal that repeats the previous message word for word (a retry
+        # against the same faulted drive, say) is invisible to the comparison
+        # above, so a return that has not started within a few seconds is
+        # treated as refused rather than waited on forever.
+        if not r['seen'] and not refused and time.time() - r['sent_at'] < 3.0:
+            return  # command not acted on yet
+        self._recover = None
+        self.__confirm_centre(offer, w, message)
+
+    def __offer_recentre(self, offer, w):
+        rel = w.get('rel')
+        where = '' if rel is None else f' Output is now {rel:+.3f} rad from centre.'
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle('Position window trip')
+        box.setText(f'{offer["test"]} stopped in segment {offer["segment"]}/'
+                    f'{offer["segments"]} ({offer["segment_id"]}).')
+        box.setInformativeText(
+            f'{offer.get("detail") or "position window trip"}.{where}\n\n'
+            'Brake and log tail are done. Drive the output back to centre on the '
+            f'input shaft, then restart segment {offer["segment"]} from its '
+            'beginning? Centre itself is not moved: the output encoder is the '
+            'reference and should not have changed.')
+        recentre = box.addButton('Recentre, then resume', QMessageBox.AcceptRole)
+        box.addButton('Abort experiment', QMessageBox.RejectRole)
+        box.setDefaultButton(recentre)
+        box.setModal(False)
+
+        def done(button):
+            self._resume_box = None
+            if button is recentre:
+                self._recover = {'seen': False, 'sent_at': time.time(),
+                                 'message_at_send': (w.get('message') or '')}
+                self.control_command_queue.put_nowait(['return_centre', 0])
+            else:
+                self.control_command_queue.put_nowait(['abort_resume', 0])
+        box.buttonClicked.connect(done)
+        self._resume_box = box
+        box.open()
+
+    def __confirm_centre(self, offer, w, message):
+        rel = w.get('rel')
+        at_centre = rel is not None and abs(rel) <= self.RESUME_CENTRE_TOL_RAD
+        box = QMessageBox(self)
+        box.setWindowTitle('Confirm centre before resuming')
+        lines = []
+        if rel is None:
+            lines.append('Output position is unreadable.')
+        else:
+            lines.append(f'Output is {rel:+.4f} rad ({np.degrees(rel):+.2f}°) from the '
+                         f'declared centre.')
+        if w.get('input_ratio') is not None:
+            lines.append(f'Input/output ratio measured on the return: '
+                         f'{w["input_ratio"]:+.1f} (nominal 43).')
+        if message:
+            lines.append(f'Controller: {message}')
+        box.setText('\n'.join(lines))
+        if at_centre:
+            box.setIcon(QMessageBox.Question)
+            box.setInformativeText(
+                'Check the rig: does the output look centred against its marks? '
+                'If the OUTPUT shaft slipped on its coupling this reading is '
+                f'wrong and you should abort.\n\nResume {offer["test"]} from the '
+                f'start of segment {offer["segment"]}/{offer["segments"]} '
+                f'({offer["segment_id"]})?')
+            go = box.addButton(f'Resume segment {offer["segment"]}', QMessageBox.AcceptRole)
+        else:
+            box.setIcon(QMessageBox.Warning)
+            box.setInformativeText(
+                'The output did NOT come back to centre (it stopped on contact, on '
+                'the ratio check, or the move was refused). Retry the return, or '
+                'abort and sort it out by hand.')
+            go = box.addButton('Retry recentre', QMessageBox.AcceptRole)
+        box.addButton('Abort experiment', QMessageBox.RejectRole)
+        box.setDefaultButton(go)
+        box.setModal(False)
+
+        def done(button):
+            self._resume_box = None
+            if button is not go:
+                self.control_command_queue.put_nowait(['abort_resume', 0])
+            elif at_centre:
+                self.control_command_queue.put_nowait(['resume_test', 0])
+            else:
+                self._recover = {'seen': False, 'sent_at': time.time(),
+                                 'message_at_send': message}
+                self.control_command_queue.put_nowait(['return_centre', 0])
+        box.buttonClicked.connect(done)
+        self._resume_box = box
+        box.open()
 
     def __set_status(self, state, text):
         self.status_light.set_state(state, text)

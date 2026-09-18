@@ -111,6 +111,13 @@ class Controller(Master):
         self._current_input_mode = None
         self._current_output_mode = None
         self._test_active = False
+        # Resume point after a position-window trip: which armed test and
+        # which segment it was in, so the run can be picked up at the START of
+        # that segment once the output is back at centre. Set by _stop_test,
+        # reported in control_state (the GUI offers it once post_test is over),
+        # consumed by the 'resume_test' command, cleared by 'abort_resume' or
+        # any ordinary start. None when there is nothing to resume.
+        self._resume = None
         # Why the last test ended, published on the sample that turns logging
         # off so the Logger can stamp it into the file it is about to close.
         # See _stop_test.
@@ -294,6 +301,20 @@ class Controller(Master):
         did is folded into the same reason dict under 'brake'.
         """
         self._stop_reason = reason
+        # Record where a window trip left the plan BEFORE reset() clears the
+        # segment bookkeeping. Only a window trip is resumable: the output is
+        # still sound and merely displaced, and return-to-centre puts it back.
+        # Any other stop (operator, safety, completion) clears the offer.
+        self._resume = None
+        if (self._test_active and self.test_definition is not None
+                and isinstance(reason, dict) and reason.get('kind') == 'position_window'):
+            p = self.test_definition.progress()
+            self._resume = {'test': self.test_definition.name,
+                            'segment': p['segment'], 'segments': p['segments'],
+                            'segment_id': p['segment_id'],
+                            'value': reason.get('value'), 'detail': reason.get('detail')}
+            print(f'Controller: window trip in segment {p["segment"]}/{p["segments"]} '
+                  f'({p["segment_id"]}); resumable from its start once recentred')
         if not self.test_definition == None:
             self.test_definition.reset()
         # Whether a run was actually in progress decides whether there is
@@ -328,6 +349,45 @@ class Controller(Master):
         else:
             self.devices.DUT.sw_enable = False
             self._safe_default_command['input_mode'] = 'torque'
+
+    def _start_test(self, start_segment=1):
+        """The Start button, and the resume path with start_segment > 1."""
+        if self._test_active:
+            print('Unable to start test: Test already active')
+        elif self._post_test_refusal():
+            # Into _window_message, not just a print: this is the
+            # one refusal an operator meets by pressing Start twice
+            # in quick succession, and a button that does nothing
+            # silently reads as a broken button.
+            self._window_message = ('Start refused: '
+                                    + self._post_test_refusal())
+            print(f'Unable to start test: {self._window_message}')
+        elif not self._load_only and self.devices.DUT.fault:
+            print('Unable to start test: DUT in fault state')
+        elif self.devices.LOAD.fault:
+            print('Unable to start test: LOAD in fault state')
+        elif self._window_arming_refusal():
+            self._window_message = ('Start refused: '
+                                    + self._window_arming_refusal())
+            print(f'Unable to start test: {self._window_message}')
+        else:
+            # The previous run's reason must not outlive it into
+            # the next log.
+            self._stop_reason = None
+            resumed = self._resume if start_segment > 1 else None
+            self._resume = None
+            self.pull_cmd = True
+            if not self._load_only:
+                self.devices.DUT.sw_enable = True
+            self.devices.LOAD.sw_enable = True
+            if not self.test_definition == None:
+                self._test_active = True
+                self.test_definition.reset(start_segment=start_segment)
+            if resumed:
+                self._window_say(f'Resuming {resumed["test"]} from the start of segment '
+                                 f'{resumed["segment"]}/{resumed["segments"]} '
+                                 f'({resumed["segment_id"]})')
+            print('Starting test')
 
     def _dut_command_for_mode(self, cmd):
         """The input command to actually send, given the mode the drive is IN.
@@ -397,6 +457,9 @@ class Controller(Master):
             # and an operator who is not told why reads that as a dead button.
             'post_test': (None if self._post_test is None
                           else self._post_test['stage']),
+            # Where a window trip left the plan, or None. The GUI waits for
+            # post_test to clear before offering recentre-and-resume on it.
+            'resume': self._resume,
             # Where the run is, for the GUI's progress readout. Only meaningful
             # while a test is running -- an armed-but-idle plan has not entered
             # its first segment, and reporting last run's position would read as
@@ -531,37 +594,29 @@ class Controller(Master):
                 if cmd[0] in self._TAIL_YIELDING_CMDS:
                     self._yield_post_test_tail()
                 if cmd[0] == 'start_test':
-                    if self._test_active:
-                        print('Unable to start test: Test already active')
-                    elif self._post_test_refusal():
-                        # Into _window_message, not just a print: this is the
-                        # one refusal an operator meets by pressing Start twice
-                        # in quick succession, and a button that does nothing
-                        # silently reads as a broken button.
-                        self._window_message = ('Start refused: '
-                                                + self._post_test_refusal())
-                        print(f'Unable to start test: {self._window_message}')
-                    elif not self._load_only and self.devices.DUT.fault:
-                        print('Unable to start test: DUT in fault state')
-                    elif self.devices.LOAD.fault:
-                        print('Unable to start test: LOAD in fault state')
-                    elif self._window_arming_refusal():
-                        self._window_message = ('Start refused: '
-                                                + self._window_arming_refusal())
-                        print(f'Unable to start test: {self._window_message}')
+                    self._start_test()
+
+                elif cmd[0] == 'resume_test':
+                    # Pick the armed plan up at the start of the segment a
+                    # window trip interrupted. Same refusals as Start, plus:
+                    # there must be an offer, and the armed plan must still be
+                    # the one that tripped (re-arming another test between the
+                    # trip and the resume makes the segment number meaningless).
+                    r = self._resume
+                    if r is None:
+                        self._window_say('Resume refused: nothing to resume')
+                    elif self.test_definition is None or self.test_definition.name != r['test']:
+                        self._window_say(f'Resume refused: {r["test"]} is no longer armed')
+                    elif self._jog is not None:
+                        self._window_say('Resume refused: a jog or return-to-centre is running')
                     else:
-                        # The previous run's reason must not outlive it into
-                        # the next log.
-                        self._stop_reason = None
-                        self.pull_cmd = True
-                        if not self._load_only:
-                            self.devices.DUT.sw_enable = True
-                        self.devices.LOAD.sw_enable = True
-                        if not self.test_definition == None:
-                            self._test_active = True
-                            self.test_definition.reset()
-                        print('Starting test')
-                        
+                        self._start_test(start_segment=r['segment'])
+
+                elif cmd[0] == 'abort_resume':
+                    if self._resume is not None:
+                        self._window_say(f'Resume of {self._resume["test"]} abandoned by the operator')
+                    self._resume = None
+
                 elif cmd[0] == 'stop_test':
                     if self._jog is not None:
                         self._end_jog('Stopped by the operator', failed=True)
@@ -1360,7 +1415,7 @@ class Controller(Master):
 
     # Operator commands that end a logging tail early instead of being refused
     # by it. Read in _cmd_check, before the command is acted on.
-    _TAIL_YIELDING_CMDS = frozenset({'start_test', 'jog', 'touch_off', 'tare',
+    _TAIL_YIELDING_CMDS = frozenset({'start_test', 'resume_test', 'jog', 'touch_off', 'tare',
                                      'declare_centre', 'clear_tare',
                                      'clear_faults', 'test_def', 'disarm',
                                      'return_centre'})

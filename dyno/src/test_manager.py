@@ -1181,10 +1181,18 @@ class TestManager:
         else:
             raise ValueError('Print invalid test "type" specified: '+behavior['type'])
 
-    def reset(self):
+    def reset(self, start_segment=1):
+        """Arm a fresh run. `start_segment` (1-based) skips every segment before
+        it, so a run interrupted mid-plan can be picked up at the start of the
+        segment it was in. Segments are counted the same way progress() and the
+        preview count them (behavior_iterator order, loops unrolled), so the
+        number the GUI showed when the run stopped is the number to pass here.
+        Skipped segments still advance segment_index, so the readout on a
+        resumed run reads k/N exactly as it did on the original."""
         self._test_start_real_time = time.time() # Capture new start time for the run
         self._test_complete = False              # Test is no longer complete
         self._clear_segment()                    # Nothing is running yet
+        self._start_segment = max(1, int(start_segment))
 
         # Re-create the top-level behavior generator
         self._behavior_gen = behavior_iterator(self.test_config)
@@ -1206,6 +1214,13 @@ class TestManager:
             self.segment_id = behavior_id
             self.segment_type = behavior_definition['type']
             self.current_behavior = behavior_instance
+            if self.segment_index < self._start_segment:
+                # Resuming past this one. Nothing is yielded, so the drives
+                # never see it; the first segment that does run yields its own
+                # mode command first, exactly as it would on a fresh start.
+                print(f"--- Skipping Behavior: '{behavior_id}' "
+                      f"({self.segment_index}/{self.segment_count}, resumed run) ---")
+                continue
             # commands() is a generator: its body -- including the repeat reset
             # -- does not run until the first command is pulled. Behaviors are
             # shared across loop passes, so without this the readout would show
