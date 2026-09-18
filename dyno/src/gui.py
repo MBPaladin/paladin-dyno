@@ -1325,9 +1325,15 @@ class Window(QWidget):
     def __offer_recentre(self, offer, w):
         rel = w.get('rel')
         where = '' if rel is None else f' Output is now {rel:+.3f} rad from centre.'
+        # A slip displaces the INPUT against a stationary output, so the output
+        # can sit at centre with nothing to recentre. Say what moved, or the
+        # 'Output is now +0.000 rad from centre' line reads as a broken dialog.
+        if (offer.get('check') or '').startswith('ratio'):
+            where += (' The output has fallen behind the input; the output itself'
+                      ' may not have moved.')
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Warning)
-        box.setWindowTitle('Position window trip')
+        box.setWindowTitle(offer.get('label') or 'Position window trip')
         box.setText(f'{offer["test"]} stopped in segment {offer["segment"]}/'
                     f'{offer["segments"]} ({offer["segment_id"]}).')
         box.setInformativeText(

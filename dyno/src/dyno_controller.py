@@ -206,6 +206,26 @@ class Controller(Master):
         self._input_sign = None
         self._input_ratio = None
 
+        # Ratio-break watch. A slip is the one failure every other safety here
+        # sleeps through: the output stops following the input, so it stays
+        # still (position window and output velocity happy) while the input
+        # spins well inside its own limit. On 2026-09-17 that let the input
+        # reach 155 rad/s with the output locked and nothing stopped it -- see
+        # docs/archimedes_gearbox_implementation_log.md. These two numbers are
+        # the channel a slip actually moves, published for `safeties:` entries
+        # (`source: ratio_error_rad` / `ratio_slip_rad_s`) and for the log.
+        #   ratio_error_rad  how far the output has fallen behind where the
+        #                    input says it should be, in OUTPUT rad, since the
+        #                    reference was latched
+        #   ratio_slip_rad_s the rate of that, output rad/s, averaged over
+        #                    _RATIO_RATE_WINDOW_S so it is not a 1 kHz
+        #                    difference of two encoder readings
+        # Both NaN until a reference is latched and both positions read.
+        self._ratio_ref = None
+        self._ratio_rate_mark = None
+        self.ratio_error_rad = math.nan
+        self.ratio_slip_rad_s = math.nan
+
         self._aux_funcs = []
         if self.mode == 'actuator_production':
             self._aux_funcs.append(self._aux_func_A3_Dyno)
@@ -217,6 +237,7 @@ class Controller(Master):
         # because abs(nan) > limit is False, and some rigs list channels (an
         # unfitted RTD) that read NaN in normal use.
         self._safety_checks = []
+        self._resumable_checks = set()
         for check_name, spec in self.dyno_params.get('safeties', {}).items():
             if not isinstance(spec, dict) or 'source' not in spec or 'limit' not in spec:
                 raise ValueError(
@@ -238,6 +259,18 @@ class Controller(Master):
             self._safety_checks.append(
                 (check_name, attrgetter(spec['source']), abs(spec['limit']),
                  bool(spec.get('nan_trips', False)), trip_samples))
+            # resumable: this breach leaves the rig sound and merely displaced,
+            # so the run can be picked up at the start of the segment it died
+            # in once the output is back at centre -- the same offer a
+            # position-window trip makes. Off by default: most safeties
+            # (over-torque, over-temperature) mean stop and go look at it.
+            #
+            # Held as a set of names rather than a sixth element of the tuple
+            # above, because _safety_checks is built by hand outside this class
+            # -- dyno/sim/archimedes_window_test.py stubs it -- and widening
+            # the tuple breaks every such caller for a flag none of them set.
+            if spec.get('resumable', False):
+                self._resumable_checks.add(check_name)
         # Consecutive-breach counter per check, reset on any in-range read.
         self._safety_streaks = {}
 
@@ -301,19 +334,32 @@ class Controller(Master):
         did is folded into the same reason dict under 'brake'.
         """
         self._stop_reason = reason
-        # Record where a window trip left the plan BEFORE reset() clears the
-        # segment bookkeeping. Only a window trip is resumable: the output is
-        # still sound and merely displaced, and return-to-centre puts it back.
-        # Any other stop (operator, safety, completion) clears the offer.
+        # Record where a resumable trip left the plan BEFORE reset() clears
+        # the segment bookkeeping. A window trip always qualifies -- the output
+        # is still sound and merely displaced, and return-to-centre puts it
+        # back. A safety may opt in with `resumable: true`, which is how a
+        # ratio-break (slip) trip gets the same offer: the customer's drive is
+        # built to slip, so a slip displaces the shafts rather than damaging
+        # them, and the cure is the same one -- put the output back on centre
+        # and restart the segment. Every other stop (operator, an ordinary
+        # safety, completion) clears the offer.
         self._resume = None
         if (self._test_active and self.test_definition is not None
-                and isinstance(reason, dict) and reason.get('kind') == 'position_window'):
+                and isinstance(reason, dict)
+                and (reason.get('kind') == 'position_window'
+                     or reason.get('resumable'))):
             p = self.test_definition.progress()
+            # `label` titles the operator's dialog, so it has to name the thing
+            # that actually tripped rather than always saying window.
+            label = ('Position window trip'
+                     if reason.get('kind') == 'position_window'
+                     else f'Safety trip: {reason.get("check")}')
             self._resume = {'test': self.test_definition.name,
                             'segment': p['segment'], 'segments': p['segments'],
-                            'segment_id': p['segment_id'],
+                            'segment_id': p['segment_id'], 'label': label,
+                            'kind': reason.get('kind'), 'check': reason.get('check'),
                             'value': reason.get('value'), 'detail': reason.get('detail')}
-            print(f'Controller: window trip in segment {p["segment"]}/{p["segments"]} '
+            print(f'Controller: {label} in segment {p["segment"]}/{p["segments"]} '
                   f'({p["segment_id"]}); resumable from its start once recentred')
         if not self.test_definition == None:
             self.test_definition.reset()
@@ -387,6 +433,7 @@ class Controller(Master):
                 self._window_say(f'Resuming {resumed["test"]} from the start of segment '
                                  f'{resumed["segment"]}/{resumed["segments"]} '
                                  f'({resumed["segment_id"]})')
+            self._latch_ratio_reference()
             print('Starting test')
 
     def _dut_command_for_mode(self, cmd):
@@ -763,6 +810,8 @@ class Controller(Master):
                         'value': float(value),
                         'limit': float(limit),
                         'trip_samples': trip_samples,
+                        'resumable': check_name in getattr(
+                            self, '_resumable_checks', ()),
                         'at_s': at_s,
                         'detail': (f'safety check {check_name!r} read NaN'
                                    if math.isnan(value) else
@@ -804,6 +853,11 @@ class Controller(Master):
     # that a fault whose cause is still present has re-latched by the time it is
     # read -- checking the instant the fault bit drops would report success on a
     # drive that faults again a millisecond later.
+    # Averaging window for ratio_slip_rad_s. Long enough that encoder
+    # quantisation does not dominate, short enough that a runaway is caught in
+    # a tenth of a second once trip_samples is added on top.
+    _RATIO_RATE_WINDOW_S = 0.05
+
     _FAULT_CLEAR_SETTLE_S = 0.5
 
     def _drives(self):
@@ -1555,6 +1609,83 @@ class Controller(Master):
         except (TypeError, ValueError, AttributeError):
             return math.nan
 
+    def _ratio_positions(self):
+        """(input position, output position) in their own raw frames, or None
+        when either is unreadable. Load-only has no input shaft to compare
+        against, so it never reports a pair."""
+        if self._load_only:
+            return None
+        try:
+            din = float(self.devices.DUT.position)
+            dout = float(self._window['get'](self)) if self._window is not None \
+                else float(self.devices.LOAD.position)
+        except (TypeError, ValueError, AttributeError, KeyError):
+            return None
+        if math.isnan(din) or math.isnan(dout):
+            return None
+        return din, dout
+
+    def _ratio_value(self):
+        """Signed input/output ratio to hold the shafts to, or None.
+
+        Prefers the ratio TOUCH-OFF MEASURED (`_input_ratio`, input rad per
+        output rad, signed, in the frame the logged channels use) over the
+        config's `gear_ratio`. That is deliberate: as of 2026-09-17 this rig
+        carries `gear_ratio: -43.88` with `flip_direction_sign: true` on the
+        DUT, so the two flips cancel and the channels actually read +43.88 --
+        the config sign is the open item in the log, not a fact. Taking the
+        measured one means this check cannot be wrong-footed by that sign,
+        whichever way it is eventually settled, and a wrong sign here would
+        double every normal motion into a false trip."""
+        if self._input_ratio:
+            return float(self._input_ratio)
+        try:
+            r = float(self.devices.DUT.params.get('gear_ratio', 0) or 0)
+        except (TypeError, ValueError, AttributeError):
+            return None
+        return r or None
+
+    def _latch_ratio_reference(self):
+        """Zero the ratio-break watch where the shafts are now.
+
+        Called at Declare Centre and at the start of every test, so a run
+        measures the slip it causes itself instead of inheriting the last
+        one's. Without that, one deliberate slip test would leave the error
+        parked past the limit and refuse every run after it."""
+        pos = self._ratio_positions()
+        ratio = self._ratio_value()
+        self._ratio_ref = (None if pos is None or not ratio else
+                           {'input': pos[0], 'output': pos[1], 'ratio': ratio})
+        self._ratio_rate_mark = None
+        self.ratio_error_rad = math.nan
+        self.ratio_slip_rad_s = math.nan
+
+    def _update_ratio_error(self):
+        """Refresh the two ratio channels. Runs every cycle, before the safety
+        checks read them.
+
+        NaN when there is no reference or a position is unreadable. Whether that
+        stops a test is the config's call, through `nan_trips` on the entry --
+        this does not decide it, the same way the window's own NaN handling is
+        declared rather than assumed."""
+        ref = self._ratio_ref
+        pos = self._ratio_positions() if ref is not None else None
+        if pos is None:
+            self.ratio_error_rad = math.nan
+            self.ratio_slip_rad_s = math.nan
+            return
+        err = ((pos[1] - ref['output'])
+               - (pos[0] - ref['input']) / ref['ratio'])
+        self.ratio_error_rad = err
+        now = time.perf_counter()
+        mark = self._ratio_rate_mark
+        if mark is None:
+            self._ratio_rate_mark = (now, err)
+            self.ratio_slip_rad_s = 0.0
+        elif now - mark[0] >= self._RATIO_RATE_WINDOW_S:
+            self.ratio_slip_rad_s = (err - mark[1]) / (now - mark[0])
+            self._ratio_rate_mark = (now, err)
+
     def _window_stop_distance(self, rel):
         """How much further the output travels outward if stopped now, at
         stop_decel. 0 when off or moving toward centre; NaN if unreadable."""
@@ -1669,6 +1800,7 @@ class Controller(Master):
         self._window_centre = pos
         # A touch-off is only meaningful relative to the centre it ran against.
         self._touch_off = None
+        self._latch_ratio_reference()
         self._window_say(f'Centre declared at {pos:.4f} rad. Run touch-off before testing.')
 
     def _jog_refusal(self, drive='output'):
@@ -2239,6 +2371,9 @@ class Controller(Master):
                 and self.devices.LOAD.position_offset == 0
                 and not self.devices.DUT.position == 0):
             self.devices.LOAD.position_offset = self.devices.DUT.position - self.devices.LOAD.position
+
+        # Before _safety_trigger, which reads the channels it publishes.
+        self._update_ratio_error()
 
         if self._test_active:
             trip = self._safety_trigger()

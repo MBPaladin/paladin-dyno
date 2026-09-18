@@ -142,8 +142,8 @@ position_window:
         - devices.adc_1.input_torque
         - [devices.DUT.current, 0.983]  # A x kt: backup if the cell reads dead
       drag_nm: 0.3                  # starting baseline, replaced by the measured drag
-      contact_rise_nm: 0.25
-      ceiling_nm: 0.6
+      contact_rise_nm: 0.35
+      ceiling_nm: 0.75
       arm_input_rad: 1.0            # rise check waits this much input travel into each move (breakaway)
       drag_tau_s: 0.5               # baseline averaging time constant
       trip_samples: 10
@@ -316,6 +316,40 @@ safeties:
   input_torque: { source: devices.adc_1.input_torque, limit: 15, nan_trips: true } # Nm; input cell is 20 Nm FS
   output_velocity: { source: devices.LOAD.velocity, limit: 12, nan_trips: true } # rad/s; tests reach 8.8
   input_velocity: { source: devices.DUT.velocity, limit: 500, nan_trips: true } # rad/s; tests reach 377
+  # RATIO BREAK -- the slip safety. Added 2026-09-17 after a slip ran the input
+  # to 155 rad/s with the output locked and NOTHING stopped it: the output sits
+  # still, so the position window and output-velocity checks stay happy, while
+  # the input stays well inside its own 500 rad/s limit and neither torque cell
+  # goes near its ceiling. Slip is the one failure every other entry here sleeps
+  # through, because it is the only one that moves no single channel out of
+  # range -- it moves the RELATION between two. Both entries below watch that
+  # relation, zeroed at Declare Centre and again at the start of every test.
+  #
+  # `resumable: true` is why a trip offers recentre-and-resume rather than just
+  # ending the run: IMSystems say the drive is designed to slip, so a slip
+  # displaces the shafts instead of damaging them, and the cure is the position
+  # window's cure -- put the output back on centre and restart the segment.
+  #
+  # ratio_break is the accumulated one, in OUTPUT rad. 0.40 sits above what
+  # creep can legitimately reach (plan section 4: ~0.175 rad per shuttle cycle at
+  # the customer's 5% creep limit, and the alternating level sign cancels it
+  # between cycles) and above where a measured slip settles (0.356 rad on
+  # 2026-09-17), so the slip test still completes its own measurement.
+  ratio_break: { source: ratio_error_rad, limit: 0.40, trip_samples: 50, resumable: true } # output rad
+  # ratio_slip is the rate, output rad/s, averaged over 50 ms. This is the one
+  # that catches a runaway fast: the 2026-09-17 free-spin ran at 2.1-2.7 rad/s
+  # and would have been stopped inside ~150 ms, at roughly 20 rad of input
+  # travel instead of 96. Legitimate creep stays far below it -- 5% creep at the
+  # fastest efficiency point (3000 rpm, output 7.16 rad/s) is 0.36 rad/s -- and
+  # the slip test's own detected slip peaked at 0.44 rad/s, so neither trips it.
+  # Raise it if high-speed efficiency ever nuisance-trips; 1.0 rad/s is ~14%
+  # creep at 3000 rpm, already well past what the customer's spec allows.
+  ratio_slip: { source: ratio_slip_rad_s, limit: 1.0, trip_samples: 50, resumable: true } # output rad/s
+  #
+  # Neither carries nan_trips. Both read NaN whenever a position is unreadable
+  # or no reference is latched, and the position window already trips on a NaN
+  # output position with a message that says which channel died -- a second
+  # entry tripping on the same cause would only bury it.
   # Absorber temperature, on the two RTDs actually fitted. The scale is now
   # trustworthy: the EL3208 element-type enum was swept on the bench 2026-09-14
   # and devices.py corrected (PT100 is element type 0, not 1), so these read
@@ -380,7 +414,7 @@ post_test:
     # rad/s^2 at the output. NOTE it only moves the TORQUE-mode path: the
     # velocity-mode brake is the drive's own ramp and measured 33 rad/s^2
     # whatever this is set to.
-    torque_nm: 0.5
+    torque_nm: 4.0
     # Braked to rest in the OUTPUT frame, because the output is what the window
     # and the bumpers are about.
     velocity_source: devices.LOAD.velocity
@@ -447,3 +481,8 @@ log_keys:
   - [wkc_error, wkc_error]
   - [preamble_sample, preamble_sample]
   - [breakaway_torque, breakaway_torque]
+  # The ratio-break channels. Logged, not just watched: the slip point is read
+  # off these afterwards (RampBreak's own trigger only decides when to release),
+  # and a run that does NOT trip still shows how close it came.
+  - [ratio_error, ratio_error_rad]
+  - [ratio_slip, ratio_slip_rad_s]

@@ -85,6 +85,16 @@ TRIP = {'kind': 'position_window', 'check': 'position_window', 'value': 1.52,
         'limit': 1.5, 'at_s': 12.3, 'detail': 'position window: output +1.520 rad '
         'from centre, outside +/-1.5 rad'}
 
+# A ratio-break (slip) trip, which reaches the same offer by a different route:
+# it is an ordinary `safeties:` entry carrying `resumable: true`, not a window
+# trip. See the 2026-09-17 log entry -- a slip leaves every other safety in
+# range, and the customer's drive is built to slip, so the cure is the window's
+# cure: put the output back on centre and restart the segment.
+SLIP_TRIP = {'kind': 'safety', 'check': 'ratio_break', 'value': 0.62,
+             'limit': 0.40, 'trip_samples': 50, 'resumable': True, 'at_s': 12.3,
+             'detail': "safety check 'ratio_break' measured 0.62, over its "
+                       'limit of 0.4 for 50 consecutive cycles'}
+
 # --- what leaves a resume point ------------------------------------------------
 c = stub(FakePlan())
 c._stop_test(TRIP)
@@ -111,6 +121,18 @@ for reason in ({'kind': 'operator', 'detail': 'stopped from the GUI'},
                {'kind': 'stator_temp', 'detail': 'hot'}, None):
     c = stub(FakePlan()); c._stop_test(reason)
     check(c._resume is None, f'{reason and reason["kind"]} stop must not offer a resume')
+
+c = stub(FakePlan()); c._stop_test(SLIP_TRIP)
+check(c._resume is not None, 'a resumable safety trip should leave a resume point')
+check(c._resume and c._resume['label'] == 'Safety trip: ratio_break',
+      f'the offer should name what tripped, for the dialog title: {c._resume}')
+check(c._resume and c._resume['check'] == 'ratio_break',
+      'the offer should carry the check name (the GUI keys its wording off it)')
+
+c = stub(FakePlan())
+c._stop_test(dict(SLIP_TRIP, resumable=False))
+check(c._resume is None,
+      'a safety WITHOUT resumable should clear the offer, as before')
 
 c = stub(FakePlan(), active=False); c._stop_test(TRIP)
 check(c._resume is None, 'a trip with no test running leaves nothing to resume')
