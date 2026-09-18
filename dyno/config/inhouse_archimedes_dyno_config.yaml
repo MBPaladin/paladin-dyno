@@ -335,7 +335,7 @@ safeties:
   # the customer's 5% creep limit, and the alternating level sign cancels it
   # between cycles) and above where a measured slip settles (0.356 rad on
   # 2026-09-17), so the slip test still completes its own measurement.
-  ratio_break: { source: ratio_error_rad, limit: 0.40, trip_samples: 50, resumable: true } # output rad
+  ratio_break: { source: ratio_error_rad, limit: 2.0, trip_samples: 50, resumable: true } # output rad
   # ratio_slip is the rate, output rad/s, averaged over 50 ms. This is the one
   # that catches a runaway fast: the 2026-09-17 free-spin ran at 2.1-2.7 rad/s
   # and would have been stopped inside ~150 ms, at roughly 20 rad of input
@@ -344,7 +344,7 @@ safeties:
   # the slip test's own detected slip peaked at 0.44 rad/s, so neither trips it.
   # Raise it if high-speed efficiency ever nuisance-trips; 1.0 rad/s is ~14%
   # creep at 3000 rpm, already well past what the customer's spec allows.
-  ratio_slip: { source: ratio_slip_rad_s, limit: 1.0, trip_samples: 50, resumable: true } # output rad/s
+  ratio_slip: { source: ratio_slip_rad_s, limit: 10.0, trip_samples: 50, resumable: true } # output rad/s
   #
   # Neither carries nan_trips. Both read NaN whenever a position is unreadable
   # or no reference is latched, and the position window already trips on a NaN

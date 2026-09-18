@@ -147,6 +147,73 @@ SLIP_ARM_MARGIN = 1.6               # x the worst stiction ramp / the torque hel
 # Efficiency levels stop at this fraction of a MEASURED slip torque. Above the
 # traction limit a level does not load the drive, it grinds it.
 EFF_SLIP_MARGIN = 0.8
+# Measured creep, as a RATIO: output rad of slip per output rad of rolling, per
+# Nm of output torque. From gbx_1p2p0/fwd_passes/efficiency_to_25 and
+# efficiency_to_30, five levels at 20 rpm, each one cycle of +/-1.33 rad:
+#
+#     T [Nm]      5       10      15      20      25
+#     drift    0.0206  0.0435  0.0710  0.1067  0.1560   rad
+#     c        7.7e-4  8.2e-4  8.9e-4  1.00e-3 1.17e-3  per Nm
+#
+# so c rises as the traction limit approaches; the worst measured is taken.
+#
+# THIS IS A RATIO, NOT A RATE. An earlier version of this file modelled creep in
+# rad/s and concluded the fast speeds barely drift, because they spend so little
+# time under load. Wrong: creep is slip per unit ROLLING DISTANCE, so it does not
+# fall with speed, and a 3000 rpm level running 7 cycles drifts 7x what a 20 rpm
+# level running 1 cycle does. That is what EFF_RECENTRE_PER_CYCLE_RPM is for.
+# At 40 Nm this is 4.7% creep, right against the customer's 5% limit.
+CREEP_RATIO_PER_NM = 1.17e-3
+# Multiplier on that ratio when sizing the throw. The fit above is five points on
+# one unit on one day, and the failure mode is a window trip 8 minutes in.
+CREEP_SAFETY = 1.5
+# At and above this input speed, each level is split into ONE SEGMENT PER CYCLE,
+# each with its own recentre. Creep per cycle does not fall with speed (it is a
+# ratio, see above), but the number of cycles a level needs rises sharply to
+# collect TARGET_CONST_S of constant speed -- 3 at 1500 rpm, 7 at 3000. Left
+# whole, a 40 Nm level at 3000 rpm drifts ~2.3 rad against 0.17 rad of headroom.
+EFF_RECENTRE_PER_CYCLE_RPM = 1500
+# Efficiency is emitted one segment PER LEVEL rather than one per speed. A
+# window trip is resumable only from the start of the segment it happened in,
+# and a 15-minute segment means losing 15 minutes.
+EFF_SEGMENT_PER_LEVEL = True
+# A `recentre` segment after every level: drives the output back to the declared
+# centre on the INPUT shaft (test_manager.Recentre), so creep is undone between
+# levels instead of being paid for out of the throw. Where the output is already
+# inside `tolerance_rad` it costs only the settle, so the high-speed levels --
+# which barely creep -- barely notice it.
+EFF_RECENTRE_BETWEEN_LEVELS = True
+RECENTRE_PARAMS = {
+    'tolerance_rad': 0.02,              # ~1.1 deg of output
+    'slow_within_rad': 0.05,
+    'velocity_rad_s': 4.0,              # input shaft; = 0.09 rad/s at the output
+    'approach_velocity_rad_s': 1.0,
+    'acceleration_rad_s2': 20.0,
+    'timeout_s': 20.0,
+    'settle_s': 0.5,
+}
+# Which efficiency variant the megabatch carries. Both are always written; the
+# batch takes exactly one, because running both would measure efficiency twice.
+# 'alt' -- the full four quadrants -- is the one that answers the customer's
+# request; 'pos' is the faster half, for when the batch is a shakedown.
+MEGABATCH_EFFICIENCY = 'alt'
+# Which way the OUTPUT moves for a POSITIVE input position command, in the output
+# frame. +1 as of 2026-09-17: touch-off stamped `input_ratio: +43.82` on every
+# run in gbx_1p2p0/fwd_passes, and the efficiency logs agree (positive output
+# torque, output drifting positive, input commanded positive first).
+#
+# Used only to aim the FIRST leg of each efficiency shuttle. Creep walks the
+# output in the direction of the applied torque, so the peak on that side is the
+# one that trips the window -- and it is cheapest to visit it EARLY, while the
+# drift is still small. A cycle 0 -> +A -> -A -> 0 under +T reaches +A a quarter
+# of the way through (worst excursion A + D/4); the same cycle reversed reaches
+# it three quarters of the way through (A + 3D/4). Aiming the first leg down-drift
+# is worth half a level's drift, for free.
+#
+# Get this wrong and the effect simply reverses -- it costs margin, it does not
+# point anything at a bumper -- but check it at the bench: the sign is the one
+# thing here that is asserted rather than measured at run time.
+INPUT_SIGN = +1
 # Once slip is measured, the slip hunt's own ceiling drops to this multiple of
 # it. There is no reason to be able to command 100 Nm at a contact that lets go
 # at 53, and a lower ceiling bounds a runaway.
@@ -228,6 +295,49 @@ def size_traverse(w_out, a_out, allowance, cfg):
     return peak, peak - d
 
 
+def efficiency_amplitude(levels, cfg, allowance, recentre=False, cycles=1):
+    """(amplitude, predicted worst drift) for an efficiency shuttle, output rad.
+
+    Speed does not appear: creep is a ratio of rolling distance, so what a
+    segment drifts depends on its amplitude, its torque and how many cycles it
+    runs -- not on how fast it runs them.
+
+    Creep drifts the shuttle's centre while the level is applied, in the
+    direction of the TORQUE -- confirmed on 2026-09-17, where the residual rose
+    monotonically through outbound and return traverses alike and never once
+    reversed. So the run wanders by the running sum of each level's drift, and
+    what has to fit the window is that wander PLUS the amplitude.
+
+    Drift during one level is rate * |T| * (time under it), and the time is
+    4A/w_out for a full bipolar cycle -- proportional to the amplitude. So the
+    whole thing scales with A and solves in closed form:
+
+        h >= A + A * worst_running_sum_per_unit_amplitude
+
+    With alternating signs the running sum returns to ~0 after every pair and
+    the worst case is a single level's drift. Without them it is the whole
+    sweep's, which is what made the +only run trip at the 25 Nm level. With
+    `recentre` it is a single level's either way, because the drift is undone
+    between them.
+    """
+    h = cfg['half_window'] - allowance
+    # Drift over one cycle of amplitude A at torque T is c*T*(4A) -- four
+    # quarter-traverses of rolling. Per unit amplitude that is 4*c*T*cycles.
+    k = CREEP_SAFETY * CREEP_RATIO_PER_NM * 4.0 * max(1, int(cycles))
+    if recentre:
+        # A recentre after every segment puts the output back on centre, so
+        # drift never accumulates across them: only ONE segment's worth has to
+        # fit alongside the throw.
+        worst = max((abs(k * float(v)) for v in levels), default=0.0)
+    else:
+        run = worst = 0.0
+        for level in levels:
+            run += k * float(level)
+            worst = max(worst, abs(run))
+    amp = min(OUTPUT_END_RAD, h / (1.0 + worst))
+    return amp, worst * amp          # (amplitude, predicted worst drift)
+
+
 def shuttle_accel(w_shaft, throw_shaft, limit):
     return min(ACCEL_USE * limit, max(w_shaft ** 2 / (2 * DECEL_SHARE * throw_shaft),
                                       0.02 * limit))
@@ -252,7 +362,7 @@ def shuttle_segment(seg_id, motor, w_shaft, amp_shaft, accel, cycles,
 
 
 def plan_shuttle(seg_id, motor, rpm_in, allowance, cfg, notes, cycles_cap,
-                 **segment_kw):
+                 amp_cap=None, amp_sign=1, **segment_kw):
     """A shuttle at input speed `rpm_in`, commanded on `motor`. None (with a
     note) when the window leaves too little constant-speed travel."""
     r = cfg['ratio']
@@ -263,17 +373,28 @@ def plan_shuttle(seg_id, motor, rpm_in, allowance, cfg, notes, cycles_cap,
     accel = shuttle_accel(w_out * shaft, OUTPUT_END_RAD * shaft,
                           lim['acceleration'])
     peak, const_half = size_traverse(w_out, accel / shaft, allowance, cfg)
+    window_peak = peak
+    if amp_cap is not None and amp_cap < peak:
+        # Creep budget is tighter than the window (see efficiency_amplitude).
+        # The caller has already said so once for the whole speed, so the
+        # per-segment note below stays quiet about it -- with one segment per
+        # level it would otherwise repeat 64 times.
+        peak = amp_cap
+        const_half = peak - w_out ** 2 / (2 * accel / shaft)
     if const_half < MIN_CONST_HALF_RAD:
         notes.append(f'{seg_id}: SKIPPED {rpm_in} rpm -- only {const_half:+.2f} rad of '
                      f'constant speed fits at stop_decel {cfg["stop_decel"]:g} '
                      f'(measure the STO coast, update the config, regenerate)')
         return None
-    if peak < OUTPUT_END_RAD - 1e-9:
-        notes.append(f'{seg_id}: {rpm_in} rpm turns at +/-{peak:.2f} rad, not '
+    if window_peak < OUTPUT_END_RAD - 1e-9:
+        notes.append(f'{seg_id}: {rpm_in} rpm turns at +/-{window_peak:.2f} rad, not '
                      f'{OUTPUT_END_RAD}, to clear the early trip')
     t_const = 2 * const_half / w_out
     cycles = max(1, min(cycles_cap, math.ceil(TARGET_CONST_S / t_const)))
-    return shuttle_segment(seg_id, motor, w_out * shaft, peak * shaft, accel,
+    # A negative amplitude runs the cycle 0 -> -A -> +A -> 0 (the pattern's two
+    # `move` calls just swap order), which is how the first leg gets aimed.
+    return shuttle_segment(seg_id, motor, w_out * shaft,
+                           peak * shaft * (1 if amp_sign >= 0 else -1), accel,
                            cycles, **segment_kw)
 
 
@@ -282,6 +403,20 @@ def alternating(step, top):
     cycles cancels creep drift (plan §4)."""
     n = int(round(top / step))
     return [v for k in range(1, n + 1) for v in (k * step, -k * step)]
+
+
+def recentre_segment(seg_id):
+    """Put the output back on centre, driving the input. Output at 0 Nm."""
+    return {
+        'id': seg_id,
+        'repeats': 1,
+        'lead_in_s': 0.0,
+        'primary': {'motor': 'input', 'control_mode': 'velocity'},
+        'secondary': {'control_mode': 'torque', 'levels': [0.0],
+                      'rate': 1.0, 'settle_s': 0.0},
+        'pattern': 'recentre',
+        'params': dict(RECENTRE_PARAMS),
+    }
 
 
 def breakaway_segment(seg_id, ramp_motor, ceiling, rate, release_s, rest_s,
@@ -304,6 +439,126 @@ def breakaway_segment(seg_id, ramp_motor, ceiling, rate, release_s, rest_s,
 
 
 # --- the plans -------------------------------------------------------------------
+
+def build_efficiency(cfg, shakedown, alternate, rpm_cap, cycles_cap, torque_scale):
+    """One efficiency plan, `alternate` choosing the level signs.
+
+    Each level is its own segment, and (with EFF_RECENTRE_BETWEEN_LEVELS) a
+    `recentre` segment follows each one. Both exist for the same reason: creep.
+    Per-level segments bound what a window trip costs -- a trip is resumable only
+    from the start of its segment, and the old one-segment-per-speed form made
+    that 15 minutes at 20 rpm. The recentres stop the drift accumulating at all,
+    which is what lets the +only variant keep its throw instead of paying for the
+    whole sweep's drift out of it.
+    """
+    notes, segs = [], []
+    allowance = TRIP_ALLOWANCE_RAD['loaded_fwd']
+    want_top = EFF_MAX_OUT_NM[UNIT]
+    top_out = min(want_top, output_ceiling(cfg))
+    # A measured slip torque overrides both: driving an efficiency level past the
+    # traction limit does not measure efficiency, it grinds the contact. Leave
+    # margin, and round down to a whole number of steps.
+    if T_SLIP_OUT_NM:
+        slip_top = EFF_SLIP_MARGIN * T_SLIP_OUT_NM
+        slip_top = EFF_STEP_OUT_NM * math.floor(slip_top / EFF_STEP_OUT_NM)
+        if slip_top < top_out:
+            notes.append(f'SLIP-LIMITED: measured slip is {T_SLIP_OUT_NM:g} Nm output, so '
+                         f'the sweep stops at {slip_top:g} Nm '
+                         f'({EFF_SLIP_MARGIN:g} x slip, rounded down to a step) instead of '
+                         f'{top_out:g} Nm. Levels above the traction limit would slip, not '
+                         'load')
+            notes.append(f'  the customer asked for {want_top:g} Nm; this unit cannot carry '
+                         f'it. Expect creep to break their 5 % limit from about '
+                         f'{T_CREEP_ONSET_OUT_NM:g} Nm upward')
+            top_out = slip_top
+    if (top_out < want_top - 1e-9
+            and not (T_SLIP_OUT_NM and top_out <= EFF_SLIP_MARGIN * T_SLIP_OUT_NM)):
+        notes.append(f'CAPPED: {UNIT} was requested to {want_top:g} Nm output but the '
+                     f"customer's {OUTPUT_TORQUE_CAP_NM:g} Nm limit stops the sweep at "
+                     f'{top_out:g} Nm -- the top of the requested efficiency range is '
+                     'not covered')
+    top_out *= torque_scale
+
+    if alternate:
+        levels = [round(v, 4) for v in alternating(EFF_STEP_OUT_NM, top_out)]
+        notes.append('ALTERNATING levels: all four quadrants, and creep cancels pair by '
+                     'pair even without the recentres (plan section 4)')
+    else:
+        n = int(round(top_out / EFF_STEP_OUT_NM))
+        levels = [round(k * EFF_STEP_OUT_NM, 4) for k in range(1, n + 1)]
+        notes.append('+ONLY levels: half the time, and half the quadrants -- one rotation '
+                     'sense only. Creep does not cancel here (it takes the sign of the '
+                     'TORQUE, not of the traverse: measured 2026-09-17, the residual rose '
+                     'through outbound and return alike and never reversed), so it is the '
+                     'recentres that keep this inside the window')
+
+    for rpm in EFF_RPM:
+        if rpm > rpm_cap:
+            continue
+        # Above EFF_RECENTRE_PER_CYCLE_RPM each level is split into one segment
+        # per cycle, so every segment carries exactly one cycle of drift and the
+        # throw solve below is the same at every speed.
+        per_cycle = rpm >= EFF_RECENTRE_PER_CYCLE_RPM
+        amp, drift = efficiency_amplitude(levels, cfg, allowance,
+                                          recentre=EFF_RECENTRE_BETWEEN_LEVELS,
+                                          cycles=1)
+        notes.append(f'E{rpm:04d}: throw +/-{amp:.2f} rad output'
+                     + ('' if amp >= OUTPUT_END_RAD - 1e-9 else
+                        f' (cut from {OUTPUT_END_RAD:g} to leave room for '
+                        f'{drift:.2f} rad of creep in one cycle)'))
+        for level in levels:
+            sid = f'E{rpm:04d}_{"P" if level >= 0 else "N"}{abs(level):02.0f}'
+            # First leg aimed the way this level's creep will drift, so the peak
+            # that eats the window is reached while the drift is smallest.
+            amp_sign = (1 if level >= 0 else -1) * INPUT_SIGN
+            seg = plan_shuttle(sid, 'input', rpm, allowance, cfg, notes,
+                               cycles_cap, amp_cap=amp, amp_sign=amp_sign,
+                               levels=[level], level_rate=50.0, settle_s=1.0)
+            if not seg:
+                continue
+            n_cycles = max(1, int(seg['params']['cycles']))
+            if per_cycle and n_cycles > 1:
+                for c in range(1, n_cycles + 1):
+                    sub = dict(seg, id=f'{sid}_C{c}',
+                               params=dict(seg['params'], cycles=1))
+                    segs.append(sub)
+                    segs.append(recentre_segment(sub['id'] + '_RC'))
+            else:
+                if n_cycles > 1:
+                    notes.append(f'  {sid}: {n_cycles} cycles in one segment, so its '
+                                 f'drift budget is {n_cycles}x the figure above -- raise '
+                                 'EFF_RECENTRE_PER_CYCLE_RPM coverage if it trips')
+                segs.append(seg)
+                if EFF_RECENTRE_BETWEEN_LEVELS:
+                    segs.append(recentre_segment(sid + '_RC'))
+
+    kind = 'alt' if alternate else 'pos'
+    notes.append(f'{UNIT}: {len(levels)} levels to '
+                 f'{"+/-" if alternate else "+"}{top_out:g} Nm across '
+                 f'{len([x for x in EFF_RPM if x <= rpm_cap])} speed(s), '
+                 f'{len(segs)} segment(s)')
+    notes.append('one segment PER LEVEL: a window trip costs one level, not one speed, '
+                 'and recentre-and-resume picks up at that level')
+    notes.append(f'each shuttle starts toward its own creep direction (INPUT_SIGN '
+                 f'{INPUT_SIGN:+d}), so the peak that eats the window is reached at a '
+                 'quarter of the level instead of three quarters -- worth half a '
+                 "level's drift. CHECK THE SIGN at the bench")
+    fast = [x for x in EFF_RPM if x <= rpm_cap and x >= EFF_RECENTRE_PER_CYCLE_RPM]
+    if fast:
+        notes.append(f'{EFF_RECENTRE_PER_CYCLE_RPM} rpm and above ({", ".join(str(x) for x in fast)}): '
+                     'one segment PER CYCLE, each with its own recentre. Creep per cycle '
+                     'does not fall with speed -- it is a ratio of rolling distance -- and '
+                     'those levels need 3 to 7 cycles each, so left whole they drift '
+                     'metres past the window')
+    if EFF_RECENTRE_BETWEEN_LEVELS:
+        notes.append(f'a recentre after every level: input drives the output back to '
+                     f'centre within {RECENTRE_PARAMS["tolerance_rad"]:g} rad, '
+                     f'{RECENTRE_PARAMS["velocity_rad_s"]:g} rad/s input, '
+                     f'{RECENTRE_PARAMS["timeout_s"]:g} s timeout. Where the output is '
+                     'already centred it costs only the settle')
+    return (f'EFF_{kind.upper()}',
+            {'name': f'archimedes_fwd_efficiency_{kind}', 'segments': segs}, notes)
+
 
 def build_plans(cfg, shakedown, include_backdrive=False):
     """Returns [(tag, recipe, notes)] in run order. Forward (input-driving)
@@ -501,54 +756,17 @@ def build_plans(cfg, shakedown, include_backdrive=False):
     plans.append(('VEL', {'name': 'archimedes_fwd_velocity_ramp', 'segments': segs},
                   notes))
 
-    # 5. Efficiency, forward only, all four speeds in one plan (one segment
-    # each). Levels alternate sign so creep drift cancels within the segment
-    # (plan §4). Each level runs full shuttle cycles, so the load resists the
-    # input on half the traverses and assists it on the other half: the resisting
-    # ones are the forward-efficiency data, the assisting ones are the return
-    # stroke and should be binned out. The input commands position throughout, so
-    # even on the assisting traverses the gearbox is never asked to back-drive --
-    # the input simply absorbs.
-    notes, segs = [], []
-    want_top = EFF_MAX_OUT_NM[UNIT]
-    top_out = min(want_top, output_ceiling(cfg))
-    # A measured slip torque overrides both: driving an efficiency level past the
-    # traction limit does not measure efficiency, it grinds the contact. Leave
-    # margin, and round down to a whole number of steps.
-    if T_SLIP_OUT_NM:
-        slip_top = EFF_SLIP_MARGIN * T_SLIP_OUT_NM
-        slip_top = EFF_STEP_OUT_NM * math.floor(slip_top / EFF_STEP_OUT_NM)
-        if slip_top < top_out:
-            notes.append(f'SLIP-LIMITED: measured slip is {T_SLIP_OUT_NM:g} Nm output, so '
-                         f'the sweep stops at {slip_top:g} Nm '
-                         f'({EFF_SLIP_MARGIN:g} x slip, rounded down to a step) instead of '
-                         f'{top_out:g} Nm. Levels above the traction limit would slip, not '
-                         'load')
-            notes.append(f'  the customer asked for {want_top:g} Nm; this unit cannot carry '
-                         f'it. Expect creep to break their 5 % limit from about '
-                         f'{T_CREEP_ONSET_OUT_NM:g} Nm upward')
-            top_out = slip_top
-    if top_out < want_top - 1e-9 and not (T_SLIP_OUT_NM and top_out <= EFF_SLIP_MARGIN * T_SLIP_OUT_NM):
-        notes.append(f'CAPPED: {UNIT} was requested to {want_top:g} Nm output but the '
-                     f'customer\'s {OUTPUT_TORQUE_CAP_NM:g} Nm limit stops the sweep at '
-                     f'{top_out:g} Nm -- the top of the requested efficiency range is '
-                     'not covered')
-    top_out *= torque_scale
-    levels = [round(v, 4) for v in alternating(EFF_STEP_OUT_NM, top_out)]
-    for rpm in EFF_RPM:
-        if rpm > rpm_cap:
-            continue
-        seg = plan_shuttle(f'E{rpm:04d}', 'input', rpm, TRIP_ALLOWANCE_RAD['loaded_fwd'],
-                           cfg, notes, cycles_cap, levels=levels,
-                           level_rate=50.0, settle_s=1.0)
-        if seg:
-            segs.append(seg)
-    notes.append(f'{UNIT}: {len(levels)} output-cell levels to +/-{top_out:g} Nm, '
-                 f'{len(segs)} speed(s) back to back')
-    notes.append('one plan per speed became one plan for all four: check output '
-                 'position between segments if creep runs, the window trip is the backstop')
-    plans.append(('EFF', {'name': 'archimedes_fwd_efficiency', 'segments': segs},
-                  notes))
+    # 5. Efficiency, forward only. TWO plans, written every run:
+    #   ..._efficiency_pos   +5, +10 ... only
+    #   ..._efficiency_alt   +5, -5, +10, -10 ...
+    # They are not interchangeable. A bipolar shuttle at one torque sign covers
+    # two of the four (rotation sense x power direction) quadrants; the other two
+    # need the opposite sign. So `pos` is half the time and half the coverage,
+    # and on a unit measurably direction-asymmetric (the breakaway ramps read
+    # +0.252 / -0.233 Nm, ~7 %) the missing half is not redundant.
+    for alternate in (False, True):
+        plans.append(build_efficiency(cfg, shakedown, alternate, rpm_cap,
+                                      cycles_cap, torque_scale))
 
     # Slip runs LAST. Plan §7 put it first because stiffness needed its number;
     # that number is now a measured constant, and a slip hunt degrades the
@@ -750,7 +968,9 @@ def main():
         test_file, worst, duration, ok = result
         failed |= not ok
         written.append(test_file)
-        if not tag.startswith(BACKDRIVE_TAG) and tag not in MEGABATCH_EXCLUDE:
+        dropped = MEGABATCH_EXCLUDE + (
+            'EFF_ALT' if MEGABATCH_EFFICIENCY == 'pos' else 'EFF_POS',)
+        if not tag.startswith(BACKDRIVE_TAG) and tag not in dropped:
             forward.append((tag, recipe, notes))
             total_s += duration
             worst_all = max(worst_all, worst)
@@ -787,6 +1007,19 @@ def main():
                 for name in left:
                     print(f'  NOT in the batch: {name} -- it ends in a slip that no safety '
                           'on this rig stops. Run it on its own, watching, afterwards')
+            other = 'EFF_ALT' if MEGABATCH_EFFICIENCY == 'pos' else 'EFF_POS'
+            why = ('all four quadrants' if MEGABATCH_EFFICIENCY == 'alt'
+                   else 'half the time, one rotation sense')
+            for name in [r['name'] for t_, r, _ in plans if t_ == other and r]:
+                print(f'  NOT in the batch: {name} -- the batch carries the '
+                      f'{MEGABATCH_EFFICIENCY!r} variant ({why}). Flip '
+                      'MEGABATCH_EFFICIENCY to swap them; running both would measure '
+                      'efficiency twice')
+            print('  duration is a LOWER bound wherever recentres are involved: the '
+                  'expansion has no\n  sensor, so every recentre takes its '
+                  f'"nothing to do" path and costs {RECENTRE_PARAMS["settle_s"]:g} s. On '
+                  f'the rig each one that has to move adds up to\n  '
+                  f'{RECENTRE_PARAMS["timeout_s"]:g} s more')
 
     if not args.bench:
         report_stale(tests_dir, written, args.shakedown)

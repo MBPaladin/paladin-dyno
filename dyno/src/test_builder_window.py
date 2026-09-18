@@ -892,6 +892,10 @@ class TestBuilderWindow(QWidget):
                     # Drawn as the no-breakaway case, so the preview is the
                     # worst case rather than a guess (see the function).
                     cols, rows = test_builder.breakaway_preview_rows(seg)
+                elif test_builder.is_recentre(seg):
+                    # Drawn as a still shaft for the timeout: where creep has
+                    # left the output is not knowable until it runs.
+                    cols, rows = test_builder.recentre_preview_rows(seg)
                 else:
                     cols, rows = test_builder.compile_segment(seg)
             except Exception as e:

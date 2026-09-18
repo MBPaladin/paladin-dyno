@@ -231,6 +231,20 @@ PATTERNS = {
         'debounce_cycles':    ('Debounce [control cycles]', 5, int),
         'arm_fraction':       ('Arm above (fraction of ceiling)', 0.05, float),
     },
+    # Compiles to a real `recentre` behavior (not a trace): it drives the INPUT
+    # in velocity mode until the OUTPUT is back at the declared centre, which
+    # needs live feedback and so cannot be precomputed. See test_manager.Recentre
+    # -- in particular why velocity mode is the only mode that makes the move
+    # stick across a segment boundary.
+    'recentre': {
+        'tolerance_rad':             ('Centred within [rad]', 0.02, float),
+        'slow_within_rad':           ('Slow down within [rad]', 0.10, float),
+        'velocity_rad_s':            ('Input speed [rad/s]', 4.0, float),
+        'approach_velocity_rad_s':   ('Input approach speed [rad/s]', 1.0, float),
+        'acceleration_rad_s2':       ('Input acceleration [rad/s^2]', 20.0, float),
+        'timeout_s':                 ('Give up after [s]', 30.0, float),
+        'settle_s':                  ('Settle after arriving [s]', 0.5, float),
+    },
     'gridpoint': {
         'levels':               ('Pattern-motor levels (comma separated)',
                                  [15.0, 30.0, 60.0, 100.0], list),
@@ -355,7 +369,7 @@ def generate_levels(start, stop, n, spacing='linear', mirror=False):
 # command stream only exists at run time -- a grid search walks its own
 # setpoints, a breakaway ramp ends on an event nobody can precompute -- so
 # there is no csv to write, compare against, or plot exactly.
-GENERATIVE_PATTERNS = ('gridpoint', 'breakaway')
+GENERATIVE_PATTERNS = ('gridpoint', 'breakaway', 'recentre')
 
 
 def is_generative(segment):
@@ -458,6 +472,83 @@ def breakaway_preview_rows(segment):
     cols = ['time', f"{primary['motor']}_motor_torque",
             f'{sec_motor}_motor_{sec_mode}']
     return cols, rows
+
+
+def is_recentre(segment):
+    return segment.get('pattern') == 'recentre'
+
+
+def recentre_settings(segment):
+    """The `recentre` behavior settings a recentre segment compiles to.
+
+    The primary motor is ignored -- a recentre always drives the input and always
+    in velocity mode, because that is the only arrangement that both needs live
+    feedback and survives the next segment's position-mode re-zero. The secondary
+    carries what the OUTPUT holds while it happens, which for an efficiency sweep
+    is 0 Nm.
+    """
+    params = segment.get('params', {})
+    secondary = segment.get('secondary', {})
+    p = lambda key: _param(params, 'recentre', key)
+    levels = [float(v) for v in secondary.get('levels', [0.0])] or [0.0]
+    return {
+        'hold_mode': secondary.get('control_mode', 'torque'),
+        'hold_level': levels[0],
+        'tolerance_rad': abs(float(p('tolerance_rad'))),
+        'slow_within_rad': abs(float(p('slow_within_rad'))),
+        'velocity_rad_s': abs(float(p('velocity_rad_s'))),
+        'approach_velocity_rad_s': abs(float(p('approach_velocity_rad_s'))),
+        'acceleration_rad_s2': abs(float(p('acceleration_rad_s2'))),
+        'timeout_s': abs(float(p('timeout_s'))),
+        'settle_s': abs(float(p('settle_s'))),
+    }
+
+
+def recentre_preview_rows(segment):
+    """Preview keyframes: a still shaft. The real move depends on where creep
+    has left the output, which nothing precomputed can know -- so the preview
+    shows the one thing that is certain, that this segment commands no torque
+    and ends at rest. Its DURATION in the preview is the timeout, the worst case,
+    for the same reason ramp_break previews every ramp running to its ceiling."""
+    s = recentre_settings(segment)
+    cols = ['time', 'input_motor_velocity', 'output_motor_' + s['hold_mode']]
+    return cols, [[0.0, 0.0, s['hold_level']],
+                  [s['timeout_s'] + s['settle_s'], 0.0, s['hold_level']]]
+
+
+def _validate_recentre(segment, limits=None):
+    """Mirrors the Recentre asserts so problems surface while editing."""
+    issues = []
+    s = recentre_settings(segment)
+    if s['hold_mode'] not in ('torque', 'velocity'):
+        issues.append('recentre holds the output in torque or velocity, not '
+                      f"{s['hold_mode']}: it is the shaft being moved")
+    if s['tolerance_rad'] <= 0:
+        issues.append('Centred-within must be > 0')
+    if s['velocity_rad_s'] <= 0 or s['approach_velocity_rad_s'] <= 0:
+        issues.append('Input speeds must be > 0')
+    if s['acceleration_rad_s2'] <= 0:
+        issues.append('Input acceleration must be > 0')
+    if s['timeout_s'] <= 0:
+        issues.append('Timeout must be > 0')
+    if limits:
+        lim = limits['input']
+        if s['velocity_rad_s'] > lim['velocity']:
+            issues.append(f"input speed {s['velocity_rad_s']:g} rad/s exceeds the "
+                          f"input motor velocity limit {lim['velocity']:g}")
+        if s['acceleration_rad_s2'] > lim['acceleration']:
+            issues.append(f"input acceleration {s['acceleration_rad_s2']:g} rad/s^2 "
+                          f"exceeds the input motor acceleration limit "
+                          f"{lim['acceleration']:g}")
+        if s['hold_mode'] == 'torque':
+            peak = abs(s['hold_level'])
+            if peak > limits['output']['torque']:
+                issues.append(f"hold level {peak:g} Nm exceeds the output motor "
+                              f"torque limit {limits['output']['torque']:g}")
+            reaction = reaction_torque_issue(peak, limits)
+            if reaction:
+                issues.append(f'hold level: {reaction}')
+    return issues
 
 
 def gridpoint_torque_motor(segment):
@@ -825,6 +916,8 @@ def validate_segment(segment, limits=None):
         return _validate_gridpoint(segment, limits)
     if is_breakaway(segment):
         return _validate_breakaway(segment, limits)
+    if is_recentre(segment):
+        return _validate_recentre(segment, limits)
     issues = []
     primary = segment['primary']
     secondary = segment['secondary']
@@ -1042,6 +1135,17 @@ def build_yaml_dict(recipe):
             # Repeats are ignored (the UI pins them to 1 for gridpoints).
             behaviors.append({'id': seg['id'], 'type': 'grid_search',
                               'settings': gridpoint_settings(seg)})
+            continue
+        if is_recentre(seg):
+            # Real recentre behavior: drives the input off live output position.
+            behavior = {'id': seg['id'], 'type': 'recentre',
+                        'settings': recentre_settings(seg)}
+            repeats = int(seg.get('repeats', 1))
+            if repeats > 1:
+                behavior = {'id': seg['id'] + '_LOOP', 'type': 'loop',
+                            'settings': {'loop_count': repeats},
+                            'behaviors': [behavior]}
+            behaviors.append(behavior)
             continue
         if is_breakaway(seg):
             # Real ramp_break behavior: releases on live velocity, no trace csv.

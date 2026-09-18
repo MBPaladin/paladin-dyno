@@ -2295,6 +2295,11 @@ class Controller(Master):
         self._safe_default_command['output_mode'] = 'torque'
         self._safe_default_command['input_command'] = 0
         self._safe_default_command['output_command'] = 0
+        # A jog has just moved a shaft, so the ratio-break reference is stale:
+        # re-zero it here. That covers return-to-centre and touch-off, which is
+        # what 'reset the slip watch on a centre' means outside a test. Inside
+        # one, the recentre behavior's `ratio_reset` does the same job.
+        self._latch_ratio_reference()
         self._window_say(message)
         return self._safe_default_command
 
@@ -2316,7 +2321,15 @@ class Controller(Master):
                     'input': float(getattr(self.devices.DUT, 'position', 0.0) or 0.0)}
         velocity = {'output': float(getattr(self.devices.LOAD, 'velocity', 0.0) or 0.0),
                     'input': float(getattr(self.devices.DUT, 'velocity', 0.0) or 0.0)}
-        return {'torque': torque, 'position': position, 'velocity': velocity}
+        # `centre` and `input_sign` are what a recentre behavior needs and
+        # cannot work out for itself: where the operator declared centre, and
+        # which way the output turns for a positive input command. Both are
+        # None until declared / measured by touch-off, and a behavior that
+        # cannot read them must refuse to move rather than guess a direction.
+        return {'torque': torque, 'position': position, 'velocity': velocity,
+                'centre': self._window_centre,
+                'input_sign': self._input_sign,
+                'ratio': self._ratio_value()}
 
     def _get_limits(self):
         # Per-motor, keyed by the command stream's motor names (DUT -> 'input',
@@ -2445,6 +2458,14 @@ class Controller(Master):
         # Breakaway marker for the 'breakaway_torque' log key; NaN on every
         # sample except the one a ramp_break detection fired on.
         self.breakaway_torque = self.current_cmd.get('breakaway', float('nan'))
+
+        # A recentre behavior that reached centre asks for the ratio-break watch
+        # to be re-zeroed here (test_manager.Recentre). It is idempotent -- the
+        # flag rides every sample of the settle -- and it is the only thing that
+        # clears accumulated creep, since a recentre turns both shafts together
+        # and so leaves the ratio error exactly where it found it.
+        if self.current_cmd.get('ratio_reset'):
+            self._latch_ratio_reference()
 
         ff_ratio = self._feedforward_ratio
 

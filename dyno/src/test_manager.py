@@ -829,6 +829,198 @@ class Multisine:
         self.run += 1
 
 
+class Recentre:
+    """Drive the output back to the declared centre using the INPUT shaft
+    (behavior type 'recentre').
+
+    WHY THIS EXISTS. Creep walks the output a little every traverse under load,
+    always in the direction of the applied torque (measured 2026-09-17: the ratio
+    residual rose through outbound and return traverses alike and never
+    reversed). Over an efficiency sweep that drift eats the position window --
+    two runs died at exactly +1.500 rad, 8 and 4 minutes in. Alternating the
+    torque sign cancels it; putting one of these between levels cures it
+    instead, and costs a level's worth of throw rather than half the sweep.
+
+    WHY IT DRIVES IN VELOCITY MODE, NOT POSITION. Two reasons, and the second is
+    the one that bites. A position command would have to be computed from a
+    live error, which is what a behavior generator is for -- fine. But position
+    commands are relative to `pos_cmd_offset`, captured only when the drive
+    ENTERS position mode (devices.py). A recentre that left the input in
+    position mode would be silently undone by the next segment, whose trace
+    starts at 0 and would drag the shaft straight back to where this started.
+    Running in velocity mode forces the next segment's entry into position mode
+    to re-zero against wherever this leaves the shaft, which is exactly the
+    trick RampBreak already uses on its way out.
+
+    NO DIRECTION = NO MOTION. `input_sign` (which way the output turns for a
+    positive input command) is measured by touch-off, not assumed from the
+    config ratio -- see the log's finding 21 for why that sign is not to be
+    trusted. With it unknown, or with no centre declared, or with no
+    sensor_reader at all (preview, offline expansion), this yields a still
+    shaft for `settle_s` and ends. It never guesses: a recentre that picks the
+    wrong way drives the output at the bumper it was trying to move away from.
+
+    The position window stays armed throughout and is the backstop. On top of
+    it this gives up on `timeout_s`, and on an error that grows instead of
+    shrinking -- the cheap self-check that catches a sign that is wrong in a
+    way `input_sign` did not predict.
+    """
+
+    def __init__(self, parameters, mode, limits, sensor_reader=None):
+        self.parameters = parameters
+        self.settings = parameters['settings']
+        self.mode = mode
+        self.limits = limits
+        self.sensor_reader = sensor_reader
+        self.log_id_base = parameters['id'] + '-RUN'
+        self.run = 0
+
+        s = self.settings
+        self.tolerance = abs(float(s.get('tolerance_rad', 0.02)))
+        self.slow_within = abs(float(s.get('slow_within_rad', 0.10)))
+        self.velocity = abs(float(s.get('velocity_rad_s', 4.0)))
+        self.approach = abs(float(s.get('approach_velocity_rad_s', 1.0)))
+        self.accel = abs(float(s.get('acceleration_rad_s2', 20.0)))
+        self.timeout_s = abs(float(s.get('timeout_s', 30.0)))
+        self.settle_s = abs(float(s.get('settle_s', 0.5)))
+        self.hold_mode = s.get('hold_mode', 'torque')
+        self.hold_level = float(s.get('hold_level', 0.0))
+        assert self.hold_mode in ('torque', 'velocity'), \
+            ('recentre hold_mode %r must be torque or velocity: the output is the'
+             ' shaft being moved, so it cannot hold a position' % (self.hold_mode,))
+        assert self.tolerance > 0, 'recentre tolerance_rad must be > 0'
+        assert self.velocity > 0 and self.approach > 0, \
+            'recentre velocities must be > 0'
+        assert self.accel > 0, 'recentre acceleration_rad_s2 must be > 0'
+
+        lim = self.limits['input']
+        assert self.velocity <= lim['velocity'], \
+            ('recentre velocity_rad_s %g exceeds the input motor velocity limit %g'
+             % (self.velocity, lim['velocity']))
+        assert self.accel <= lim['acceleration'], \
+            ('recentre acceleration_rad_s2 %g exceeds the input motor acceleration'
+             ' limit %g' % (self.accel, lim['acceleration']))
+        if self.hold_mode == 'torque':
+            hold_limit = self.limits['output']['torque']
+            assert abs(self.hold_level) <= hold_limit, \
+                ('recentre hold_level %g exceeds the output motor torque limit %g'
+                 % (self.hold_level, hold_limit))
+
+        with open(dyno_paths.dyno_config_directory + '/master_config.yaml') as f:
+            self.dt = yaml.safe_load(f)['cycle_time_us'] / 1e6
+
+        self.repeats = 1
+        self.repeat = 0
+
+    def _cmd(self, input_velocity, flag=None, ratio_reset=False):
+        cmd = {'input_mode': 'velocity', 'input_command': float(input_velocity),
+               'output_mode': self.hold_mode, 'output_command': self.hold_level}
+        if flag is not None:
+            cmd['log_flag'] = flag
+        if ratio_reset:
+            # Tells the controller to re-zero the ratio-break watch HERE. A
+            # recentre moves both shafts together, so it does not reduce the
+            # accumulated ratio error at all -- only this does. Without it the
+            # error carries every level's creep forward and trips `ratio_break`
+            # partway through a sweep that is behaving perfectly.
+            cmd['ratio_reset'] = True
+        return cmd
+
+    def _reading(self):
+        if self.sensor_reader is None:
+            return None
+        try:
+            return self.sensor_reader() or None
+        except Exception:
+            return None
+
+    def _error(self, reading):
+        """How far the output is from centre, output rad, or None if unknown."""
+        if not reading:
+            return None
+        centre = reading.get('centre')
+        position = (reading.get('position') or {}).get('output')
+        if centre is None or position is None:
+            return None
+        try:
+            error = float(centre) - float(position)
+        except (TypeError, ValueError):
+            return None
+        return None if math.isnan(error) else error
+
+    def commands(self):
+        flag = self.log_id_base + str(self.run)
+        self.repeat = 1
+        # Mode-set command first, before any timing, exactly as the others do.
+        yield self._cmd(0.0, flag)
+
+        reading = self._reading()
+        error = self._error(reading)
+        sign = (reading or {}).get('input_sign')
+        if error is None or not sign:
+            why = ('no sensor_reader' if self.sensor_reader is None else
+                   'no centre declared or output position unreadable'
+                   if error is None else 'input_sign not measured (run touch-off)')
+            if self.sensor_reader is not None:
+                # Silent with no reader at all: that is offline expansion, where
+                # every recentre in the plan would say it, and a 480-segment
+                # efficiency sweep would bury the generator's own summary.
+                print('Recentre: skipped -- %s' % (why,))
+            # No reset on this path: nothing was recentred, so the watch must
+            # keep whatever it had rather than forgive drift it never undid.
+            for _ in range(int(round(self.settle_s / self.dt))):
+                yield self._cmd(0.0, flag)
+            self.run += 1
+            return
+
+        start_error = error
+        best = abs(error)
+        speed = 0.0
+        step = self.accel * self.dt
+        n_max = int(round(self.timeout_s / self.dt))
+        outcome = 'timed out'
+        for _ in range(n_max):
+            error = self._error(self._reading())
+            if error is None:
+                outcome = 'feedback lost'
+                break
+            if abs(error) <= self.tolerance:
+                outcome = 'centred'
+                break
+            # Growing error means the direction is wrong in a way input_sign did
+            # not predict. Stop rather than drive on toward a bumper.
+            if abs(error) > best + max(self.tolerance, 0.05):
+                outcome = 'error grew -- direction wrong, stopped'
+                break
+            best = min(best, abs(error))
+            target = (self.approach if abs(error) <= self.slow_within
+                      else self.velocity)
+            # Command sign: `sign` is the output direction a POSITIVE input
+            # command produces, so moving the output toward centre by `error`
+            # wants an input command of sign(error) * input_sign.
+            target *= 1.0 if error > 0 else -1.0
+            target *= 1.0 if sign > 0 else -1.0
+            speed += max(-step, min(step, target - speed))
+            yield self._cmd(speed, flag)
+
+        # Ramp the speed command back to zero rather than dropping it: a step to
+        # zero in velocity mode is the drive's own decel ramp, not ours.
+        while abs(speed) > 1e-9:
+            speed -= max(-step, min(step, speed))
+            yield self._cmd(speed, flag)
+        # Reset only where the output actually ended up centred: a timeout or a
+        # wrong-direction abort leaves it displaced, and forgiving that would
+        # hide exactly the drift the watch exists to catch.
+        reset = outcome == 'centred'
+        for _ in range(int(round(self.settle_s / self.dt))):
+            yield self._cmd(0.0, flag, ratio_reset=reset)
+        final = self._error(self._reading())
+        print('Recentre: %s (%+.4f -> %s rad of centre)'
+              % (outcome, start_error,
+                 'unknown' if final is None else '%+.4f' % (final,)))
+        self.run += 1
+
+
 class RampBreak:
     """Event-terminated torque ramp: the stiction / breakaway test
     (behavior type 'ramp_break').
@@ -1174,6 +1366,9 @@ class TestManager:
                 behavior, self.mode, self.limits, self.sensor_reader)
         elif behavior['type'] == 'ramp_break' and behavior['id'] not in self.behaviors:
             self.behaviors[behavior['id']] = RampBreak(
+                behavior, self.mode, self.limits, self.sensor_reader)
+        elif behavior['type'] == 'recentre' and behavior['id'] not in self.behaviors:
+            self.behaviors[behavior['id']] = Recentre(
                 behavior, self.mode, self.limits, self.sensor_reader)
         elif behavior['type'] == 'loop':
             for looped_behavior in behavior['behaviors']:
