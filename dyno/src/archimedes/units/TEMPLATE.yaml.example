@@ -47,3 +47,12 @@ ratio: 43.88
 # customer's raw data is uncorrected, so a pack meant to match it verbatim
 # wants this off. Default true.
 # correct_zero: true
+
+# Optional report sections. The 1.2.2 Paladin Test Request's test list marks
+# 'Slip torque' and 'Stiffness' No for 1.2.0 and 1.2.1 and Yes for 1.2.2, so
+# neither section is in this unit's report. Both analyzers still run and the
+# pack still carries their figures, CSVs and findings. Set either true on the
+# 1.2.2 unit file. Note that the slip section also carries the breakaway
+# results.
+report_slip: false
+report_stiffness: false

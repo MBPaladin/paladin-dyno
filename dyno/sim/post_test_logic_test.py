@@ -34,7 +34,10 @@ POST = {'log_tail_s': 2.0,
                   'verify_s': 0.010, 'verify_rise_frac': 0.10}}
 
 def stub(post=POST, flip_torque=False, flip_dir=True, mode='torque',
-         v_out=4.0, v_in=175.0, torque_limit=15.0):
+         v_out=4.0, v_in=175.0, torque_limit=15.0,
+         load_mode='position', load_flip_torque=True, load_flip_dir=True,
+         load_torque_limit=100.0, load_position_command_frame=2.5,
+         load_position_command=math.nan):
     c = Controller.__new__(Controller)
     c.mode = 'inhouse_archimedes'
     c.dyno_params = {}
@@ -54,8 +57,13 @@ def stub(post=POST, flip_torque=False, flip_dir=True, mode='torque',
                                'input_command': 0, 'output_command': 0}
     c.devices = types.SimpleNamespace(
         LOAD=types.SimpleNamespace(position=0.0, velocity=v_out, fault=False,
-                                   sw_enable=True, mode='position',
+                                   sw_enable=True, mode=load_mode,
                                    switching_modes=False,
+                                   torque_limit=load_torque_limit,
+                                   flip_torque_sign=load_flip_torque,
+                                   flip_direction_sign=load_flip_dir,
+                                   position_command_frame=load_position_command_frame,
+                                   position_command=load_position_command,
                                    command_operating_mode=lambda m: None),
         # position 10.0 with a command-frame origin of 1.9: the shaft reads
         # 10.0 rad from bring-up, but the command that HOLDS it there is 8.1,
@@ -494,6 +502,99 @@ try:
     check(False, 'post_test.brake accepted load_only')
 except ValueError as e:
     print(f'  load_only + brake -> refused at compile: {e}')
+
+# --- post_test.brake.drive: output --------------------------------------------
+# Braking through LOAD instead of DUT -- meant for a back-drive plan, where
+# LOAD (not DUT) is the one holding position at the trip.
+print('--- brake.drive: output ---')
+OUTPOST = {'log_tail_s': 2.0, 'brake': dict(POST['brake'], drive='output')}
+
+c = Controller.__new__(Controller); c.mode = 'x'; c._load_only = False
+check(c._compile_post_test(OUTPOST)['brake']['drive'] == 'output',
+      'drive: output was not carried through _compile_post_test')
+
+# A bad drive value is refused at compile, same as a bad polarity.
+try:
+    cc = Controller.__new__(Controller); cc.mode = 'x'; cc._load_only = False
+    cc._compile_post_test({'brake': dict(POST['brake'], drive='sideways')})
+    check(False, 'a bad brake.drive was accepted')
+except ValueError as e:
+    print(f'  bad drive refused at compile: {e}')
+
+# load_only has no DUT to brake with, but CAN brake through LOAD.
+cc = Controller.__new__(Controller); cc.mode = 'x'; cc._load_only = True
+check(cc._compile_post_test(OUTPOST)['brake']['drive'] == 'output',
+      'load_only refused a brake.drive: output, which does not need DUT')
+
+# _stop_test with drive: output keeps LOAD energised and drops DUT immediately
+# -- the mirror image of the default (drive: input) case tested above.
+c = stub(post=OUTPOST, load_mode='torque')
+c._stop_test({'kind': 'position_window', 'detail': 'x'})
+check(c._post_test is not None and c._post_test['stage'] == 'brake',
+      'drive: output did not enter the brake stage')
+check(c._post_test['brake']['drive'] == 'output', 'brake phase drive not recorded')
+check(not c.devices.DUT.sw_enable, 'drive: output left the input drive enabled')
+check(c.devices.LOAD.sw_enable, 'drive: output disabled the absorber before it could brake')
+
+# polarity derives from LOAD's own flags, not DUT's.
+for lft, lfd, want in [(False, False, +1), (True, True, +1),
+                       (False, True, -1), (True, False, -1)]:
+    got = stub(post=OUTPOST, load_flip_torque=lft, load_flip_dir=lfd)._brake_polarity('output')
+    check(got == want, f'output polarity for ({lft},{lfd}) was {got}, expected {want}')
+
+# torque-mode output brake opposes LOAD's own motion, in the output command.
+c = stub(post=OUTPOST, load_mode='torque', v_out=4.26)
+c._stop_test({'kind': 'position_window', 'detail': 'x'})
+cmd = c._post_test_step()
+pol = c._brake_polarity('output')
+accel_dir = math.copysign(1, cmd['output_command']) * pol
+check(accel_dir == -math.copysign(1, 4.26),
+      'output brake command does not oppose LOAD motion')
+check('input_command' not in cmd or cmd.get('input_mode') != 'torque' or cmd['input_command'] == 0,
+      'output brake wrote a nonzero input command')
+
+# position-mode output brake holds LOAD's own command-frame position, sign-free.
+c = stub(post=OUTPOST, load_mode='position', load_position_command_frame=2.5)
+c._stop_test({'kind': 'position_window', 'detail': 'x'})
+cmd = c._post_test_step()
+check(cmd['output_mode'] == 'position' and cmd['output_command'] == 2.5,
+      'position-mode output brake did not hold LOAD at its command-frame position')
+check(cmd['input_mode'] == 'torque' and cmd['input_command'] == 0,
+      'position-mode output brake left a stale input command standing')
+
+# _end_brake resets LOAD back to torque mode, not DUT, and only zeroes the
+# output side of the safe default -- the input side was already handled when
+# the drive that is not braking came off immediately in _stop_test.
+modes = []
+c = stub(post=OUTPOST, load_mode='position')
+c.devices.LOAD.command_operating_mode = lambda m: modes.append(m)
+c._stop_test({'kind': 'position_window'})
+c._end_brake(c._post_test, time.perf_counter())
+check('torque' in modes, 'output brake handover did not ask LOAD for torque mode')
+check(not c.devices.LOAD.sw_enable, 'output brake left LOAD enabled after ending')
+check(c._safe_default_command['output_mode'] == 'torque', 'output_mode not reset after the brake')
+
+# _load_command_for_mode mirrors _dut_command_for_mode: while LOAD is mid a
+# position-mode hold, a command written for another mode must not reach it as
+# a raw "position 0" (the same failure _dut_command_for_mode exists to catch).
+print('--- _load_command_for_mode ---')
+c = stub()
+c.devices.LOAD.mode = 'position'
+c.devices.LOAD.switching_modes = True
+c.devices.LOAD.position_command_frame = 2.5
+sent = c._load_command_for_mode({'output_mode': 'torque', 'output_command': 0})
+check(sent == 2.5, f'a stale zero of {sent} reached LOAD still in position mode')
+c.devices.LOAD.mode = 'torque'
+c.devices.LOAD.switching_modes = False
+check(c._load_command_for_mode({'output_mode': 'torque', 'output_command': 0}) == 0,
+      'torque-mode zero was rewritten for LOAD; it must pass through')
+c.devices.LOAD.mode = 'position'
+check(c._load_command_for_mode({'output_mode': 'position', 'output_command': 42.0}) == 42.0,
+      'a genuine LOAD position command was overridden')
+c.devices.LOAD.position_command_frame = math.nan
+c.devices.LOAD.position_command = 7.25
+check(c._load_command_for_mode({'output_mode': 'torque', 'output_command': 0}) == 7.25,
+      'NaN LOAD position feedback fell through to a raw 0 in position mode')
 
 print('\nPASS' if ok else '\nFAILURES ABOVE')
 sys.exit(0 if ok else 1)

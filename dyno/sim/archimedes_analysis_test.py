@@ -486,9 +486,19 @@ text = '\n'.join(open(os.path.join(PACK, 'report', 'sections', f'{n}.tex')).read
                  for n in sections)
 
 check(os.path.isfile(driver), 'the report driver must be written')
-for want in ('conditions', 'velocity_ramp', 'efficiency', 'slip', 'stiffness',
+for want in ('conditions', 'velocity_ramp', 'efficiency', 'slip',
              'measurement_notes'):
     check(want in sections, f'section {want!r} should have been written')
+
+# Stiffness is deliberately not in the customer report -- the analyzer still
+# runs and the pack still carries its outputs, but `report.build` does not
+# wire the section. Asserted rather than just omitted above, so that putting
+# it back is a decision someone makes on purpose.
+check('stiffness' not in sections,
+      'the stiffness section is intentionally not in the report')
+check(not os.path.isfile(os.path.join(PACK, 'report', 'sections',
+                                      'stiffness.tex')),
+      'a stale stiffness.tex must not be left in sections/')
 
 # Braces must balance or pdflatex will not build the document.
 _t = re.sub(r'\\[{}]', '', open(driver).read() + text)

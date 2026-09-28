@@ -23,6 +23,15 @@ log_root: dyno/logs/archimedes/gbx_1p2p1
 exclude:
   - initial_setup
   - troubleshooting_initial
+  # post_backdriving_abort holds bench spins taken AFTER the back-driving
+  # failure on 2026-09-18, at V0600/V0900/V1200/V1500/V1800. Those five speeds
+  # are also in the real fwd_drive/velocity_ramp run, at identical length, so
+  # the duplicate rule ('equal length means the sweep was re-run, later file
+  # wins') handed all five to the troubleshooting copy -- five post-failure
+  # points dropped into the middle of the customer's forward drag curve, with
+  # nothing in the report to say so. Excluded by component, like 1.2.0's
+  # bring-up folder.
+  - troubleshooting
 
 # Customer's hard limit for this unit (1.2.0/1.2.1 = 100 Nm, 1.2.2 = 140 Nm).
 torque_cap_nm: 100.0
@@ -33,6 +42,21 @@ rated_torque_nm: 100.0
 # These ran 2026-09-18 15:03-15:17, after the raise to 1.60 (see the config).
 position_half_window_rad: 1.6
 
-# Nameplate. This unit has no no-load velocity sweep yet, so the ratio cannot be
-# measured off the data and this value is the one that gets used.
+# Nameplate ratio as stamped on the drive. Reported as the nominal ratio in the
+# test-conditions table; the ratio the report refers quantities through is the
+# one measured from the no-load sweep, where there is one.
+ratio_nameplate: 43
+
+# Nameplate, used only if the no-load sweep is missing and the ratio cannot be
+# measured. This unit does have a forward no-load sweep (fwd_drive/velocity_ramp),
+# so the ratio in the report is measured, not this.
 ratio: 43.88
+
+# Optional report sections. The 1.2.2 Paladin Test Request's test list marks
+# 'Slip torque' and 'Stiffness' No for 1.2.0 and 1.2.1 and Yes for 1.2.2, so
+# neither section is in this unit's report. Both analyzers still run and the
+# pack still carries their figures, CSVs and findings. Set either true on the
+# 1.2.2 unit file. Note that the slip section also carries the breakaway
+# results.
+report_slip: false
+report_stiffness: false

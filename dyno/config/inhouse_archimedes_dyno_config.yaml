@@ -82,7 +82,7 @@ position_window:
   # look-ahead on, the trip fires far enough ahead of the boundary that the
   # braked stop lands INSIDE the window, and this margin stops being the thing
   # the top of the speed range depends on.
-  half_window_rad: 1.60           # Half window: 91.7 deg
+  half_window_rad: 1.50           # Half window
   # Early trip: moving outward at v, trip when |pos| + v^2/(2*stop_decel) passes
   # the window, so the stopped output lands inside it.
   #
@@ -146,9 +146,9 @@ position_window:
   #     the throw it picked for every speed -- read that list after regenerating,
   #     because a speed whose constant-speed run gets too short is SKIPPED
   #     rather than shortened.
-  stop_decel_rad_s2: 150
+  stop_decel_rad_s2: 100
   velocity_source: devices.LOAD.velocity
-  require_touch_off: true
+  require_touch_off: false
   touch_off:
     # Which shaft touch-off drives, from the blocks below. input: the DUT motor
     # turns the input with the output free. output: the absorber backdrives the
@@ -196,9 +196,9 @@ position_window:
       torque_sources:
         - devices.adc_1.input_torque
         - [devices.DUT.current, 0.983]  # A x kt: backup if the cell reads dead
-      drag_nm: 0.3                  # starting baseline, replaced by the measured drag
-      contact_rise_nm: 0.35
-      ceiling_nm: 0.75
+      drag_nm: .5                  # starting baseline, replaced by the measured drag
+      contact_rise_nm: .5
+      ceiling_nm: 2.0
       arm_input_rad: 1.0            # rise check waits this much input travel into each move (breakaway)
       drag_tau_s: 0.5               # baseline averaging time constant
       trip_samples: 10
@@ -458,32 +458,37 @@ post_test:
   # takes 105 ms to reach that, by which time the output has moved 0.92 rad.
   brake:
     enabled: true
-    # Input frame. Only used when the input is already in torque mode; in
-    # velocity or position mode the brake commands zero speed / hold position
-    # and the drive's own loop does it (no mode switch -- an AKD de-enables to
-    # change mode, which would drop all torque for the duration).
-    #
-    # MEASURED on the rig 2026-09-17 (brake_checks/) at this 0.5 Nm: 2012
-    # rad/s^2 at the input, 47 at the output -- 2.6x the free coast, and 89% of
-    # what the J/drag fit predicts, so the model scales. 4.0 would give ~241
-    # rad/s^2 at the output. NOTE it only moves the TORQUE-mode path: the
-    # velocity-mode brake is the drive's own ramp and measured 33 rad/s^2
-    # whatever this is set to.
-    torque_nm: 4.0
+    # Which physical drive brakes: `input` (DUT, default) or `output` (LOAD,
+    # direct on the output shaft, no gearbox). ARMED at `input` -- everything
+    # measured below is the input brake. `output` exists for a back-drive
+    # plan, where LOAD (not DUT) is the one holding position at the trip: it
+    # then holds LOAD's own commanded position directly (sign-free, same as
+    # the position-mode case below) instead of opposing it through the input
+    # via the gearbox. NOT YET MEASURED on this rig -- do not switch to
+    # `output` without a tail-logged stop the way the input figures below
+    # were measured (dyno_controller.py, post_test.brake block comment).
+    drive: output
+    # Torque/velocity/position frame of whichever drive is braking. Only used
+    # when that drive is already in torque mode; in velocity or position mode
+    # the brake commands zero speed / hold position and the drive's own loop
+    # does it (no mode switch -- an AKD de-enables to change mode, which
+    # would drop all torque for the duration).
+    torque_nm: 0.5
     # Braked to rest in the OUTPUT frame, because the output is what the window
     # and the bumpers are about.
     velocity_source: devices.LOAD.velocity
-    stop_velocity_rad_s: 0.05   # at or under this, held for settle_s, = stopped
+    stop_velocity_rad_s: 0.1   # at or under this, held for settle_s, = stopped
     settle_s: 0.05
-    min_velocity_rad_s: 0.05    # already this slow: skip the brake, go to tail
-    timeout_s: 0.5             # hard cap; the rig took 90 ms at 0.5 Nm
-    # Which way a positive torque command moves the LOGGED dut_velocity.
-    # `auto` derives it from the DUT's flip_torque_sign / flip_direction_sign
-    # pair; both of this rig's flag combinations have been measured and agree
-    # with the derivation (finding 21). Pin to 1 or -1 only for a drive whose
-    # current loop does not follow the usual convention.
+    min_velocity_rad_s: 0.1    # already this slow: skip the brake, go to tail
+    timeout_s: 0.25             # hard cap; the rig took 90 ms at 0.5 Nm
+    # Which way a positive torque command moves the braking drive's OWN
+    # logged velocity. `auto` derives it from that drive's flip_torque_sign /
+    # flip_direction_sign pair; both of DUT's flag combinations have been
+    # measured and agree with the derivation (finding 21) -- LOAD's have not.
+    # Pin to 1 or -1 only for a drive whose current loop does not follow the
+    # usual convention.
     polarity: auto
-    # Backstop on that polarity. If the input speeds UP by more than
+    # Backstop on that polarity. If the braking drive speeds UP by more than
     # verify_rise_frac over verify_s, the sign was wrong: the brake aborts to a
     # plain de-energise and says so in the stop_reason. It should never fire --
     # if it does, read finding 21 before touching anything here.

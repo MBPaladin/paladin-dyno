@@ -54,6 +54,14 @@ DEFAULTS = {
     'correct_zero': True,
     'position_half_window_rad': None,
     'duplicates': 'longest',
+    # Which of the customer's optional tests the REPORT carries. Both
+    # analyzers always run and the pack always carries their figures, CSVs and
+    # findings; these switch only the customer-facing section. The 1.2.2
+    # Paladin Test Request marks slip torque and stiffness 'No' for 1.2.0 and
+    # 1.2.1 and 'Yes' for 1.2.2, so the default is off and 1.2.2's unit file
+    # turns them on.
+    'report_slip': False,
+    'report_stiffness': False,
 }
 
 

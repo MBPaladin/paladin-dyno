@@ -15,11 +15,19 @@ forward efficiency with a back-driven one and lands between them, which is a
 number that describes nothing.
 
 So legs are measured separately and binned by where the power actually flowed
-(physics.classify_leg). The forward sweep therefore yields a back-driven
-efficiency too, at no extra bench time. It is reported under its own heading
-and never merged with a dedicated back-drive run: here the INPUT is still the
-shaft holding the traverse, so it is the drive's back-driven loss measured
-under a position-controlled input, not under the customer's back-drive plan.
+(physics.classify_leg), and only the legs whose flow MATCHES their sweep are
+reported: the forward sweep's forward-driving legs, the back-drive sweep's
+back-driven ones.
+
+The cross terms fall out of the same data for free, and were reported for a
+while, but they are not a measurement of the unit. In a forward sweep's
+back-driven legs the INPUT is still the shaft holding the traverse, so what is
+measured is the drive being pushed backwards by a position-controlled input
+rather than driven by its output under the customer's back-drive plan -- a
+different boundary condition, and one whose numbers do not stand up next to the
+dedicated run. They stay in efficiency__per_leg.csv and
+efficiency__per_point.csv as raw data (`flow` against `span_direction`) and are
+kept out of every figure and out of the report.
 
 Two corrections matter at the low end and are applied explicitly:
 
@@ -133,17 +141,25 @@ def analyze(ds, cfg):
     res.tables.append(('efficiency__per_point', plotting.csv(
         [[p.get(k) for k in _PT_COLS] for p in points], _PT_COLS)))
 
+    # Only the legs whose power flow MATCHES the sweep that produced them are
+    # reported. The cross terms -- the back-driven legs of the forward sweep,
+    # the forward-driving legs of the back-drive sweep -- are measured with the
+    # wrong shaft holding the traverse: the drive is being pushed by a shaft
+    # under position control rather than by the shaft the customer's plan
+    # drives it with, and the efficiencies that come out of them do not
+    # describe the unit. They stay in the CSVs as raw data and are kept out of
+    # every figure. `shown` is what the report reads.
+    shown = [p for p in points if p['flow'] == p['span_direction']]
     for direction in ('forward', 'backdrive'):
-        sel = [p for p in points if p['flow'] == direction]
+        sel = [p for p in shown if p['flow'] == direction]
         if not sel:
             continue
+        res.figures.append((f'efficiency_map_{direction}',
+                            _fig_map(sel, direction, cfg)))
         res.figures.append((f'efficiency_vs_torque_{direction}',
                             _fig_efficiency(sel, direction, cfg)))
         res.figures.append((f'loss_vs_torque_{direction}',
                             _fig_loss(sel, direction, cfg)))
-    if len({p['flow'] for p in points}) > 1:
-        res.figures.append(('efficiency_both_directions',
-                            _fig_both(points, cfg)))
 
     creep = _creep(spans, ratio, cfg)
     if creep:
@@ -160,12 +176,12 @@ def analyze(ds, cfg):
     if detail:
         res.figures.append(('cell_zero_and_drag', _fig_zero(detail, cfg)))
 
-    res.figures.append(('coverage', _fig_coverage(points, cfg)))
-    _findings(res, legs, usable, points, creep, detail, cfg, cov, hyst)
+    res.figures.append(('coverage', _fig_coverage(shown, cfg)))
+    _findings(res, legs, usable, shown, creep, detail, cfg, cov, hyst)
     res.metrics['points'] = {
         f'{p["flow"]}_{p["rpm"]:.0f}rpm_{p["t_out_nm"]:+.0f}Nm': {
             'eta': p['eta'], 'n_legs': p['n_legs'], 'spread': p['eta_spread'],
-        } for p in points}
+        } for p in shown}
     return res
 
 
@@ -265,17 +281,21 @@ def _fig_efficiency(points, direction, cfg):
     fig, ax = plotting.figure(
         f'{cfg["unit_label"]}  --  efficiency vs output torque '
         f'({plotting.DIR_LABEL[direction]})',
-        'median over repeat legs; bars span the legs at that point')
+        'median over repeat legs; the band spans the legs at that point')
     colors = _speed_colors(_speeds(points))
     for rpm in _speeds(points):
         sel = sorted((p for p in points if p['rpm'] == rpm),
                      key=lambda p: p['t_out_nm'])
-        ax.errorbar([p['t_out_nm'] for p in sel],
-                    [p['eta'] * 100 for p in sel],
-                    yerr=[[max((p['eta'] - p['eta_lo']) * 100, 0) for p in sel],
-                          [max((p['eta_hi'] - p['eta']) * 100, 0) for p in sel]],
-                    marker='o', ms=4, capsize=2, lw=1.4, color=colors[rpm],
-                    label=f'{rpm:g} rpm in')
+        x = [p['t_out_nm'] for p in sel]
+        # Band from the actual leg extremes, as the ripple figure does: an
+        # efficiency is bounded above by 100% and a symmetric spread about the
+        # median puts the top of the band past it.
+        plotting.band(ax, x, [p['eta_lo'] * 100 for p in sel],
+                      [p['eta_hi'] * 100 for p in sel], colors[rpm],
+                      alpha=0.10)
+        ax.plot(x, [p['eta'] * 100 for p in sel],
+                marker='o', ms=4, lw=1.4, color=colors[rpm],
+                label=f'{rpm:g} rpm in')
     ax.set_xlabel('output torque (Nm, measured)')
     ax.set_ylabel('efficiency (%)')
     ax.set_ylim(0, 105)
@@ -302,30 +322,34 @@ def _fig_loss(points, direction, cfg):
     return plotting.finish(fig)
 
 
-def _fig_both(points, cfg):
+def _fig_map(points, direction, cfg):
+    """Efficiency over the swept grid, as a map rather than a table.
+
+    Speed along x and torque up y, both increasing the way they are read, and
+    the colour scale pinned to 0-100% so the eye can carry a level between this
+    figure, the back-driving one and the next unit's pack. A cell the sweep
+    never reached is grey, not dark blue.
+    """
     speeds = _speeds(points)
-    fig, axes = plotting.grid_figure(
-        1, len(speeds),
-        f'{cfg["unit_label"]}  --  forward vs back-driven efficiency',
-        'both halves of the same shuttle: the held torque opposes the traverse '
-        'on one leg and assists on the other')
-    for ax, rpm in zip(axes.ravel(), speeds):
-        for flow in ('forward', 'backdrive'):
-            sel = sorted((p for p in points
-                          if p['rpm'] == rpm and p['flow'] == flow),
-                         key=lambda p: p['t_out_nm'])
-            if not sel:
-                continue
-            ax.plot([p['t_out_nm'] for p in sel], [p['eta'] * 100 for p in sel],
-                    marker='o', ms=3.5, lw=1.3,
-                    color=plotting.DIR_COLOR[flow],
-                    label=plotting.DIR_LABEL[flow])
-        ax.set_title(f'{rpm:g} rpm input', fontsize=10)
-        ax.set_xlabel('output torque (Nm)')
-        ax.set_ylim(0, 105)
-    axes.ravel()[0].set_ylabel('efficiency (%)')
-    axes.ravel()[0].legend(fontsize=8)
-    return plotting.finish_grid(fig)
+    levels = sorted({p['t_cmd_nm'] for p in points})
+    grid = np.full((len(levels), len(speeds)), np.nan)
+    for p in points:
+        grid[levels.index(p['t_cmd_nm']), speeds.index(p['rpm'])] = \
+            p['eta'] * 100
+    fig, ax = plotting.figure(
+        f'{cfg["unit_label"]}  --  efficiency map '
+        f'({plotting.DIR_LABEL[direction]})',
+        'median over repeat legs; grey cells were not measured',
+        size=(7.2, 6.2))
+    im = plotting.heatmap(ax, speeds, levels, grid, vmin=0.0, vmax=100.0)
+    fig.colorbar(im, ax=ax, label='efficiency (%)')
+    ax.set_xlabel('input speed (rpm, commanded)')
+    ax.set_ylabel('output torque (Nm, commanded)')
+    # Below the axes, not inside them: on a filled map the corner stamp the
+    # line plots use lands on top of a measured cell and hides its number.
+    ax.text(0.0, -0.10, _zero_note(cfg), transform=ax.transAxes, fontsize=7,
+            ha='left', va='top', color='#555555')
+    return plotting.finish(fig)
 
 
 def _creep(spans, ratio, cfg):

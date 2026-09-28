@@ -369,32 +369,54 @@ class Controller(Master):
         was_active = self._test_active
         self._test_active = False
 
-        # The absorber comes off immediately in every case. It is at zero
+        # Which physical drive might brake this run. post_test.brake.drive
+        # (default 'input') decides; brake not configured at all falls
+        # through the same 'input' path, matching the old input-only
+        # behaviour exactly.
+        brake_drive = (self._post['brake'] or {}).get('drive', 'input')
+
+        # The drive that is NOT braking comes off immediately. It is at zero
         # command by now and nothing past this point wants it pushing on the
-        # output; only the input drive brakes.
-        self.devices.LOAD.sw_enable = False
-        self.devices.LOAD.command_operating_mode('torque')
-        self._safe_default_command['output_mode'] = 'torque'
-        self._safe_default_command['output_command'] = 0
+        # shaft; only the braking drive stays energised, and only for as long
+        # as _begin_post_test below decides a brake phase is warranted.
+        if brake_drive == 'output':
+            self.devices.DUT.sw_enable = False
+            self.devices.DUT.command_operating_mode('torque')
+            self._safe_default_command['input_mode'] = 'torque'
+            self._safe_default_command['input_command'] = 0
+        else:
+            self.devices.LOAD.sw_enable = False
+            self.devices.LOAD.command_operating_mode('torque')
+            self._safe_default_command['output_mode'] = 'torque'
+            self._safe_default_command['output_command'] = 0
 
         self._post_test = self._begin_post_test(reason) if was_active else None
 
-        # A braking phase is the one case that keeps the input drive energised,
-        # and _post_test_step drops it the moment the brake ends. Note the input
-        # is deliberately NOT switched to torque mode here: an AKD de-energises
-        # to change mode, so a switch would cut the torque exactly when the
-        # brake needs it. The brake works in whatever mode the run left behind.
-        # In both branches the input's standing command goes to zero. The
-        # brake overrides it with its own every cycle, but _brake_step has one
-        # path that falls through to the default (torque mode, velocity still
-        # reading exactly zero, no direction to oppose yet) -- and there the
-        # last command the TEST issued must not keep being applied.
-        self._safe_default_command['input_command'] = 0
-        if self._post_test is not None and self._post_test['stage'] == 'brake':
-            self._safe_default_command['input_mode'] = self.devices.DUT.mode
+        # A braking phase is the one case that keeps the braking drive
+        # energised, and _post_test_step drops it the moment the brake ends.
+        # Note it is deliberately NOT switched to torque mode here: an AKD
+        # de-energises to change mode, so a switch would cut the torque
+        # exactly when the brake needs it. The brake works in whatever mode
+        # the run left behind. In both branches the standing command goes to
+        # zero. The brake overrides it with its own every cycle, but
+        # _brake_step has one path that falls through to the default (torque
+        # mode, velocity still reading exactly zero, no direction to oppose
+        # yet) -- and there the last command the TEST issued must not keep
+        # being applied.
+        if brake_drive == 'output':
+            self._safe_default_command['output_command'] = 0
+            if self._post_test is not None and self._post_test['stage'] == 'brake':
+                self._safe_default_command['output_mode'] = self.devices.LOAD.mode
+            else:
+                self.devices.LOAD.sw_enable = False
+                self._safe_default_command['output_mode'] = 'torque'
         else:
-            self.devices.DUT.sw_enable = False
-            self._safe_default_command['input_mode'] = 'torque'
+            self._safe_default_command['input_command'] = 0
+            if self._post_test is not None and self._post_test['stage'] == 'brake':
+                self._safe_default_command['input_mode'] = self.devices.DUT.mode
+            else:
+                self.devices.DUT.sw_enable = False
+                self._safe_default_command['input_mode'] = 'torque'
 
     def _start_test(self, start_segment=1):
         """The Start button, and the resume path with start_segment > 1."""
@@ -459,21 +481,36 @@ class Controller(Master):
         other mode is replaced with "hold where you are". Torque and velocity
         modes need no equivalent: zero is genuinely zero in both.
         """
-        command = cmd['input_command']
-        dut = self.devices.DUT
-        if dut.mode != 'position' or cmd.get('input_mode') == 'position':
+        return self._command_for_mode(self.devices.DUT, cmd['input_command'],
+                                      cmd.get('input_mode'))
+
+    def _load_command_for_mode(self, cmd):
+        """The output command to actually send, given the mode LOAD is IN.
+
+        Same gap as _dut_command_for_mode, on the output drive instead: it was
+        never hit because LOAD only ran torque and velocity mode, where a
+        stale zero is genuinely harmless. post_test.brake.drive: output
+        commands LOAD's own position hold at the end of a back-drive plan --
+        the same plan shape that puts LOAD in position mode in the first
+        place -- so the same in-flight-mode-switch gap applies here now.
+        """
+        return self._command_for_mode(self.devices.LOAD, cmd['output_command'],
+                                      cmd.get('output_mode'))
+
+    def _command_for_mode(self, dev, command, written_for):
+        if dev.mode != 'position' or written_for == 'position':
             return command
         # getattr, because only AKD and ELMO have had their command-frame
         # arithmetic worked out (each differs -- see their properties). A drive
         # class without it falls through to the behaviour it has today rather
         # than being held at a position derived from a frame nobody checked.
-        hold = getattr(dut, 'position_command_frame', math.nan)
+        hold = getattr(dev, 'position_command_frame', math.nan)
         if not math.isnan(hold):
             return hold
         # No readable position to hold at. Repeating the last position command
         # keeps the drive where it was last told to be, which is within a
         # following error of the shaft -- still bounded, unlike 0.
-        last = getattr(dut, 'position_command', math.nan)
+        last = getattr(dev, 'position_command', math.nan)
         return command if math.isnan(last) else last
 
     def _control_state(self):
@@ -1103,6 +1140,17 @@ class Controller(Master):
     # torque while the train's inertia is mostly its own rotor. See the
     # measurement in the config block and log section 1.
     #
+    # Which drive brakes is `post_test.brake.drive`: 'input' (default, the DUT
+    # -- everything above is measured on it) or 'output' (LOAD, direct on the
+    # output shaft with no gearbox multiplying its torque). 'output' is meant
+    # for a back-drive plan, where LOAD -- not DUT -- is the one holding
+    # position at the trip; braking through the drive that is already in
+    # position mode means a plain sign-free hold (_brake_step's position
+    # branch) instead of DUT's torque-mode bang-bang with its polarity
+    # derivation and backstop. Not yet measured on this rig -- arm it only
+    # after a tail-logged stop like the one section 1 records for the input
+    # brake.
+    #
     # Why the tail exists: _test_active gates logging, so the file used to close
     # on the sample that ended the run. The coast after a trip -- the one thing
     # a stopping-distance safety is betting on -- was never recorded, and an
@@ -1138,12 +1186,23 @@ class Controller(Master):
         b = spec.get('brake') or {}
         if not b.get('enabled', False):
             return post
-        if self._load_only:
+        # Which physical drive brakes. `input` (default) is what this rig is
+        # measured on -- see the block comment above. `output` commands the
+        # absorber instead, for a plan that leaves the OUTPUT holding position
+        # at the trip (every back-drive plan) rather than the input.
+        drive = b.get('drive', 'input')
+        if drive not in ('input', 'output'):
+            raise ValueError(f'post_test.brake.drive in {self.mode}_dyno_'
+                             f'config.yaml must be input or output, got '
+                             f'{drive!r}')
+        if drive == 'input' and self._load_only:
             raise ValueError(f'post_test.brake in {self.mode}_dyno_config.yaml '
                              'brakes with the input drive, but load_only is set '
-                             '-- that drive is never commanded')
+                             '-- that drive is never commanded. Set '
+                             'post_test.brake.drive: output instead')
         source = b.get('velocity_source') or 'devices.LOAD.velocity'
         post['brake'] = {
+            'drive': drive,
             'torque_nm': abs(float(b['torque_nm'])),
             'velocity_source': source,
             'velocity_get': attrgetter(source),
@@ -1153,10 +1212,10 @@ class Controller(Master):
             'timeout_s': max(0.0, float(b.get('timeout_s', 0.5))),
             'verify_s': max(0.0, float(b.get('verify_s', 0.010))),
             'verify_rise': abs(float(b.get('verify_rise_frac', 0.10))),
-            # 'auto' derives it from the drive's own two sign flags, which is
-            # what the rig is verified on. +1/-1 pins it, for a drive whose
-            # current loop does not follow the usual convention or a sim that
-            # models the flags differently.
+            # 'auto' derives it from the braking drive's own two sign flags,
+            # which is what the rig is verified on for the input drive. +1/-1
+            # pins it, for a drive whose current loop does not follow the
+            # usual convention or a sim that models the flags differently.
             'polarity': b.get('polarity', 'auto'),
         }
         if post['brake']['polarity'] not in ('auto', 1, -1):
@@ -1168,9 +1227,17 @@ class Controller(Master):
                              'needs timeout_s > 0, or the brake can never run')
         return post
 
-    def _brake_polarity(self):
-        """Which way a DUT *torque* command moves DUT.velocity as the log reads
-        it: +1 when a positive command speeds the reported velocity up.
+    def _brake_polarity(self, drive='input'):
+        """Which way a *torque* command on the braking drive moves its own
+        velocity as the log reads it: +1 when a positive command speeds the
+        reported velocity up.
+
+        `drive` is 'input' (DUT, the default and the only case measured on
+        this rig so far) or 'output' (LOAD, post_test.brake.drive: output).
+        The derivation below is generic -- each drive's own flip_torque_sign /
+        flip_direction_sign pair describes only itself -- but the table of
+        measured values is DUT-specific; re-derive it for LOAD before relying
+        on `auto` there.
 
         flip_torque_sign and flip_direction_sign are independent knobs on
         different signals -- current goes through the first (devices.py, in
@@ -1205,11 +1272,11 @@ class Controller(Master):
         pinned = self._post['brake']['polarity']
         if pinned != 'auto':
             return int(pinned)
-        dut = self.devices.DUT
+        dev = self.devices.LOAD if drive == 'output' else self.devices.DUT
         polarity = 1
-        if getattr(dut, 'flip_torque_sign', False):
+        if getattr(dev, 'flip_torque_sign', False):
             polarity = -polarity
-        if getattr(dut, 'flip_direction_sign', False):
+        if getattr(dev, 'flip_direction_sign', False):
             polarity = -polarity
         return polarity
 
@@ -1225,6 +1292,8 @@ class Controller(Master):
 
         brake = None
         if b is not None and kind not in self._NO_BRAKE_KINDS:
+            drive = b['drive']
+            dev = self.devices.LOAD if drive == 'output' else self.devices.DUT
             try:
                 speed = abs(float(b['velocity_get'](self)))
             except (TypeError, ValueError, AttributeError):
@@ -1236,11 +1305,10 @@ class Controller(Master):
                 # uses. An AKD drops to Ready to Switch On to change mode, which
                 # would de-energise it for the duration -- the shaft would coast
                 # exactly when it must not.
-                mode = self.devices.DUT.mode
-                torque = min(b['torque_nm'],
-                             abs(float(self.devices.DUT.torque_limit)))
-                # The input's own feedback has to be readable, or there is
-                # nothing to brake against and nothing to check the polarity
+                mode = dev.mode
+                torque = min(b['torque_nm'], abs(float(dev.torque_limit)))
+                # The braking drive's own feedback has to be readable, or there
+                # is nothing to brake against and nothing to check the polarity
                 # with. A NaN entry speed would make the speed-up backstop
                 # compare against NaN, which is False forever -- the brake
                 # would push at the bumper with its one safeguard silently
@@ -1250,20 +1318,21 @@ class Controller(Master):
                 # sign is wrong) from one that the brake drove through zero and
                 # out the other side (the sign is right and the brake is
                 # strong). Those look identical in |v|.
-                entry_input_signed = float(self.devices.DUT.velocity)
-                entry_input = abs(entry_input_signed)
+                entry_signed = float(dev.velocity)
+                entry = abs(entry_signed)
                 # In the COMMAND frame, not the feedback frame. These differ by
                 # the shaft position at the last position-mode entry, and
                 # commanding the feedback value steps the shaft by that gap
                 # instead of holding it -- see AKD.position_command_frame.
-                hold = float(self.devices.DUT.position_command_frame)
-                if math.isnan(entry_input) or (mode == 'position'
-                                               and math.isnan(hold)):
-                    print('Post-test brake skipped: input drive feedback reads '
-                          'NaN, so there is nothing to brake against')
+                hold = float(dev.position_command_frame)
+                if math.isnan(entry) or (mode == 'position'
+                                         and math.isnan(hold)):
+                    print(f'Post-test brake skipped: {drive} drive feedback '
+                          'reads NaN, so there is nothing to brake against')
                     return {'reason': reason, 'stage': 'tail', 'brake': None,
                             'tail_s': tail, 'tail_ends': now + tail} if tail > 0 else None
-                brake = {'mode': mode,
+                brake = {'drive': drive,
+                         'mode': mode,
                          # 'slowing' while it is taking energy out, 'settling'
                          # once the output has been seen at rest. See
                          # _brake_step.
@@ -1271,10 +1340,12 @@ class Controller(Master):
                          'slowed_at': None,
                          'torque_nm': torque,
                          'clipped': torque < b['torque_nm'],
-                         'polarity': self._brake_polarity(),
+                         'polarity': self._brake_polarity(drive),
                          'entry_speed': None if math.isnan(speed) else speed,
-                         'entry_input_speed': entry_input,
-                         'entry_input_signed': entry_input_signed,
+                         # Named for the input-brake case this rig is measured
+                         # on; with drive: output these describe LOAD instead.
+                         'entry_input_speed': entry,
+                         'entry_input_signed': entry_signed,
                          'hold_position': hold,
                          'started': now,
                          'deadline': now + b['timeout_s'],
@@ -1331,9 +1402,11 @@ class Controller(Master):
         the stop_reason so the log says what the stop actually did.
         """
         b, st = self._post['brake'], phase['brake']
-        dut = self.devices.DUT
+        drive = st['drive']
+        dev = self.devices.LOAD if drive == 'output' else self.devices.DUT
+        mode_key, cmd_key = f'{drive}_mode', f'{drive}_command'
 
-        if dut.fault or not dut.sw_enable:
+        if dev.fault or not dev.sw_enable:
             st['outcome'] = 'drive came off mid-brake'
             return None
         if now >= st['deadline']:
@@ -1342,8 +1415,8 @@ class Controller(Master):
 
         # A mode switch would de-energise the drive, so if the mode moved out
         # from under us there is nothing safe left to command.
-        if dut.switching_modes or dut.mode != st['mode']:
-            st['outcome'] = 'input drive changed mode mid-brake'
+        if dev.switching_modes or dev.mode != st['mode']:
+            st['outcome'] = f'{drive} drive changed mode mid-brake'
             return None
 
         try:
@@ -1391,28 +1464,28 @@ class Controller(Master):
             # it does not scale with torque_nm: raising that leaves this path
             # where it is, which is why stop_decel_rad_s2 has to be set from
             # this weaker number unless the drive's own decel ramp is raised.
-            return dict(self._safe_default_command, input_mode='velocity',
-                        input_command=0.0)
+            return dict(self._safe_default_command,
+                        **{mode_key: 'velocity', cmd_key: 0.0})
         if st['mode'] == 'position':
             # Also sign-free: hold where the shaft was when the run ended.
-            return dict(self._safe_default_command, input_mode='position',
-                        input_command=st['hold_position'])
+            return dict(self._safe_default_command,
+                        **{mode_key: 'position', cmd_key: st['hold_position']})
 
         # Torque mode. Settling: command nothing. Velocity and position mode
         # need no equivalent -- their commands (zero speed, hold position) are
         # closed by the drive's own loop and do not chatter, which the rig
         # confirmed: the velocity-mode check stopped cleanly in 127 ms.
         if st['phase'] == 'settling':
-            return dict(self._safe_default_command, input_mode='torque',
-                        input_command=0.0)
+            return dict(self._safe_default_command,
+                        **{mode_key: 'torque', cmd_key: 0.0})
 
-        # Oppose the input's own motion -- same shaft the command acts on, and
-        # 43.88x the resolution of the output channel.
-        v_in = float(dut.velocity)
-        if math.isnan(v_in):
-            st['outcome'] = 'input velocity read NaN'
+        # Oppose the braking drive's own motion -- same shaft the command
+        # acts on.
+        v = float(dev.velocity)
+        if math.isnan(v):
+            st['outcome'] = f'{drive} velocity read NaN'
             return None
-        if v_in == 0.0:
+        if v == 0.0:
             # No direction to oppose yet; wait rather than guess one.
             return self._safe_default_command
 
@@ -1441,10 +1514,10 @@ class Controller(Master):
         if elapsed >= b['verify_s']:
             entry_signed = st.get('entry_input_signed', 0.0)
             direction = math.copysign(1.0, entry_signed) if entry_signed else 0.0
-            along = v_in * direction        # speed in the entry direction
+            along = v * direction        # speed in the entry direction
             rise = along - st['entry_input_speed'] * (1 + b['verify_rise'])
             if direction and rise > 0:
-                st['outcome'] = (f'aborted: input sped up from '
+                st['outcome'] = (f'aborted: {drive} sped up from '
                                  f'{st["entry_input_speed"]:.1f} to {along:.1f} '
                                  f'rad/s in the direction it was already turning, '
                                  f'under braking torque -- polarity '
@@ -1453,13 +1526,15 @@ class Controller(Master):
                 print(f'POST-TEST BRAKE {st["outcome"]}')
                 return None
 
-        command = -st['polarity'] * math.copysign(st['torque_nm'], v_in)
-        return dict(self._safe_default_command, input_mode='torque',
-                    input_command=command)
+        command = -st['polarity'] * math.copysign(st['torque_nm'], v)
+        return dict(self._safe_default_command,
+                    **{mode_key: 'torque', cmd_key: command})
 
     def _end_brake(self, phase, now):
         """Drop the drives and fold the brake's outcome into the stop_reason."""
         st = phase['brake']
+        drive = st['drive'] if st is not None else 'input'
+        dev = self.devices.LOAD if drive == 'output' else self.devices.DUT
         self.devices.DUT.sw_enable = False
         self.devices.LOAD.sw_enable = False
         # Back to torque mode before a zero command is left standing, the same
@@ -1467,9 +1542,9 @@ class Controller(Master):
         # "go to position 0", which on a shaft resting at 10 rad is a lurch --
         # and the position-mode brake was deliberately holding it where it
         # stopped right up to this point.
-        if self.devices.DUT.mode != 'torque' or self.devices.DUT.switching_modes:
-            self.devices.DUT.command_operating_mode('torque')
-        self._safe_default_command['input_mode'] = 'torque'
+        if dev.mode != 'torque' or dev.switching_modes:
+            dev.command_operating_mode('torque')
+        self._safe_default_command[f'{drive}_mode'] = 'torque'
         self._safe_default_command['input_command'] = 0
         self._safe_default_command['output_command'] = 0
         phase['stage'] = 'tail'
@@ -1478,7 +1553,8 @@ class Controller(Master):
         phase['tail_ends'] = now + phase['tail_s']
 
         if st is not None and isinstance(self._stop_reason, dict):
-            record = {'mode': st['mode'],
+            record = {'drive': st['drive'],
+                      'mode': st['mode'],
                       'torque_nm': st['torque_nm'],
                       'polarity': st['polarity'],
                       'entry_velocity_rad_s': st['entry_speed'],
@@ -1495,7 +1571,7 @@ class Controller(Master):
                 record['slowing_s'] = round(st['slowed_at'] - st['started'], 4)
             self._stop_reason['brake'] = record
             print(f'Post-test brake: {record["outcome"]} '
-                  f'({st["mode"]} mode, {st["torque_nm"]:g} Nm)')
+                  f'({drive}, {st["mode"]} mode, {st["torque_nm"]:g} Nm)')
 
     # Operator commands that end a logging tail early instead of being refused
     # by it. Read in _cmd_check, before the command is acted on.
@@ -2504,11 +2580,12 @@ class Controller(Master):
         # cancel, so LOAD is commanded plain and DUT is not written at all --
         # this is the one place that would otherwise actuate a drive the
         # operator was told stays dormant.
+        load_command = self._load_command_for_mode(self.current_cmd)
         if not self._load_only and self.devices.DUT.mode == 'torque' and not self.devices.LOAD.mode == 'torque':
             torque_ff = ff_ratio*self.current_cmd['input_command'] * self.devices.DUT.params['gear_ratio']
-            self.devices.LOAD.send_command(self.current_cmd['output_command'], torque_ff)
+            self.devices.LOAD.send_command(load_command, torque_ff)
         else:
-            self.devices.LOAD.send_command(self.current_cmd['output_command'])
+            self.devices.LOAD.send_command(load_command)
 
         if not self._load_only:
             dut_command = self._dut_command_for_mode(self.current_cmd)
