@@ -741,6 +741,13 @@ class TestBuilderWindow(QWidget):
             self._loading = True
             self.primary_mode.setCurrentText('torque')
             self._loading = False
+        elif pattern == 'throw':
+            # The primary motor drives in velocity mode and the secondary holds
+            # a torque; both are fixed by the behavior.
+            self._loading = True
+            self.primary_mode.setCurrentText('velocity')
+            self.secondary_mode.setCurrentText('torque')
+            self._loading = False
         self._apply_field_states(seg)
         self._rebuild_param_widgets(seg)
         item = self.seg_list.currentItem()
@@ -898,6 +905,10 @@ class TestBuilderWindow(QWidget):
                     # Drawn as a still shaft for the timeout: where creep has
                     # left the output is not knowable until it runs.
                     cols, rows = test_builder.recentre_preview_rows(seg)
+                elif test_builder.is_throw(seg):
+                    # The nominal throws; live position moves the real
+                    # turnaround points a little.
+                    cols, rows = test_builder.throw_preview_rows(seg, self.limits)
                 else:
                     cols, rows = test_builder.compile_segment(seg)
             except Exception as e:
@@ -969,7 +980,24 @@ class TestBuilderWindow(QWidget):
         widget = self._param_widgets.get('continuous_torque')
         if widget is not None:
             widget.setStyleSheet('background-color: #fff3b0;' if stale else '')
+        if seg is not None and test_builder.is_throw(seg):
+            warning = self._throw_note(seg)
         self.warn_label.setText(warning)
+
+    def _throw_note(self, seg):
+        """Editor line for a throw segment: where it turns round against the
+        window, plus a warning when the next segment is not a recentre (a throw
+        ends wherever its last stop left the shaft, near an edge)."""
+        lines = []
+        info = test_builder.throw_info(seg, self.limits)
+        if info:
+            lines.append(info)
+        idx = self.segments.index(seg)
+        if idx + 1 < len(self.segments) and not test_builder.is_recentre(
+                self.segments[idx + 1]):
+            lines.append('the next segment does not start with a recentre; a '
+                         'throw ends near an edge of the window')
+        return '\n'.join(lines)
 
     def _check_dirty(self):
         """Announce (once) that the recipe no longer matches the armed file."""

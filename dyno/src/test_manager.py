@@ -7,7 +7,8 @@ import time
 from deployment import dyno_paths
 # test_builder imports nothing from this package, so this stays acyclic. The
 # shared check lives there because the builder must run without numpy/pandas.
-from dyno.src.test_builder import design_multisine, reaction_torque_issue
+from dyno.src.test_builder import (design_multisine, reaction_torque_issue,
+                                   throw_rig_from_config, throw_window_reach)
 
 # PROGRESS CONTRACT. Every behavior class carries two plain ints that the
 # controller reads (on its own thread, inside step()) and republishes for the
@@ -1021,6 +1022,290 @@ class Recentre:
         self.run += 1
 
 
+class Throw:
+    """Limit-to-limit throws: run one motor in velocity mode, stop it on a
+    predicted turnaround angle, reverse (behavior type 'throw').
+
+    See docs/archimedes_throw_mode_design.md. The shape:
+
+      * `drive_motor` (input or output) is commanded in VELOCITY mode. The same
+        motor does the braking. The other motor holds `hold_level` Nm.
+      * Every cycle the output angle and velocity are read from the OUTPUT
+        encoder, whichever motor drives -- position, velocity, target and
+        `stop_decel` are all output-shaft quantities. Only the command sent to
+        the drive is in the drive motor's own frame (via the measured
+        `input_sign` and the gear ratio).
+      * Fire when   x + max(v, 0)^2 / (2 * stop_decel)  >=  target_rad,  with x
+        and v measured along the throw direction. `v` is the LIVE velocity, not
+        the commanded one: in velocity mode the shaft swings well past its
+        command (a 3.0 rad/s command reached 4.2 in velocity_mode_6).
+      * On fire, command velocity 0 and wait for rest, re-zero the slip
+        reference (`ratio_reset`), then throw the other way.
+
+    DRIFT NEEDS NO HANDLING. The trigger reads live position, so creep just
+    shortens the next throw.
+
+    `stop_decel` is MEASURED, one figure per drive motor, in the rig config
+    (`throw.stop_decel_rad_s2: {input:, output:}`). A null entry refuses the
+    plan: a guessed value is unsafe in the direction that matters (too high
+    shortens the predicted stop). `stop_decel_rad_s2` in the settings overrides
+    it, for calibration runs.
+
+    The position window stays armed behind all this as the abort. The one thing
+    tying them together is the load-time check in __init__ that a nominal throw
+    cannot reach the window's own early-trip boundary.
+
+    NO FEEDBACK = NO MOTION when a sensor_reader exists but cannot say where the
+    output is (no centre, NaN, or -- input drive only -- no input_sign). With NO
+    sensor_reader at all (preview, offline expansion) the behavior dead-reckons
+    the output from its own commands, so the preview shows the nominal throws.
+
+    Log flags: only the steady-speed part of each throw is tagged,
+    <id>-RUN<r>-SETPOINT<k>. Ramp-up, braking and rest are untagged, so
+    post-processing excludes the transients exactly.
+    """
+
+    STOP_TIMEOUT_S = 3.0
+
+    def __init__(self, parameters, mode, limits, sensor_reader=None):
+        self.parameters = parameters
+        self.settings = parameters['settings']
+        self.mode = mode
+        self.limits = limits
+        self.sensor_reader = sensor_reader
+        self.log_id_base = parameters['id'] + '-RUN'
+        self.run = 0
+
+        s = self.settings
+        self.drive = s.get('drive_motor')
+        assert self.drive in ('input', 'output'), \
+            "throw drive_motor must be 'input' or 'output', got %r" % (self.drive,)
+        self.hold = 'output' if self.drive == 'input' else 'input'
+        self.speed = abs(float(s['speed_rad_s']))
+        self.target = abs(float(s['target_rad']))
+        self.ramp_accel = abs(float(s.get('ramp_accel', 20.0)))
+        self.n_throws = int(s.get('n_throws', 4))
+        self.start_dir = 1.0 if float(s.get('start_dir', 1)) >= 0 else -1.0
+        self.hold_level = float(s.get('hold_level', 0.0))
+        self.hold_follows_dir = bool(s.get('hold_follows_dir', False))
+        self.settle_s = abs(float(s.get('settle_s', 0.2)))
+        self.rest_velocity = abs(float(s.get('rest_velocity_rad_s', 0.05)))
+        self.window_margin = abs(float(s.get('window_margin_rad', 0.05)))
+        assert self.speed > 0, 'throw speed_rad_s must be > 0'
+        assert self.target > 0, 'throw target_rad must be > 0'
+        assert self.ramp_accel > 0, 'throw ramp_accel must be > 0'
+        assert self.n_throws >= 1, 'throw n_throws must be >= 1'
+
+        lim = self.limits[self.drive]
+        assert self.speed <= lim['velocity'], \
+            ('throw speed_rad_s %g exceeds the %s motor velocity limit %g'
+             % (self.speed, self.drive, lim['velocity']))
+        assert self.ramp_accel <= lim['acceleration'], \
+            ('throw ramp_accel %g exceeds the %s motor acceleration limit %g'
+             % (self.ramp_accel, self.drive, lim['acceleration']))
+        hold_limit = self.limits[self.hold]['torque']
+        assert abs(self.hold_level) <= hold_limit, \
+            ('throw hold_level %g exceeds the %s motor torque limit %g'
+             % (self.hold_level, self.hold, hold_limit))
+        if self.hold == 'output':
+            reaction = reaction_torque_issue(abs(self.hold_level), self.limits)
+            assert reaction is None, 'throw hold_level: %s' % (reaction,)
+
+        # Everything below is in OUTPUT-shaft units.
+        ratio = abs(self.limits['input'].get('gear_ratio') or 0)
+        if self.drive == 'input':
+            assert ratio > 0, 'throw with the input driving needs a gear_ratio'
+            self.v_out = self.speed / ratio
+            self.accel_out = self.ramp_accel / ratio
+        else:
+            self.v_out = self.speed
+            self.accel_out = self.ramp_accel
+
+        rig = self._load_rig()
+        decel = s.get('stop_decel_rad_s2') or None
+        if decel is None:
+            decel = (rig.get('stop_decel') or {}).get(self.drive)
+        assert decel is not None and float(decel) > 0, \
+            ('throw: no stop_decel_rad_s2 for drive_motor %r. Measure it (v=0 stops '
+             'across a speed ladder, same drive/mode/torque) and put it under '
+             '`throw.stop_decel_rad_s2` in the rig config.' % (self.drive,))
+        self.stop_decel = float(decel)
+
+        # A nominal throw must not be aborted by the window it runs inside:
+        # target + the window's own predicted stop at this speed + margin has to
+        # sit inside half_window. Refused rather than clipped, so the plan says
+        # what it does.
+        if rig.get('window_enabled') and rig.get('half_window'):
+            window_decel = float(rig.get('window_decel') or 0.0)
+            reach = throw_window_reach(self.target, self.window_margin, self.v_out,
+                                       window_decel)
+            assert reach < float(rig['half_window']), \
+                ('throw target %g rad + margin %g + window look-ahead %.3f (at %g rad/s, '
+                 'window stop_decel %g) = %.3f reaches half_window_rad %g: lower the '
+                 'target or the speed'
+                 % (self.target, self.window_margin, reach - self.target - self.window_margin,
+                    self.v_out, window_decel, reach, float(rig['half_window'])))
+
+        with open(dyno_paths.dyno_config_directory + '/master_config.yaml') as f:
+            self.dt = yaml.safe_load(f)['cycle_time_us'] / 1e6
+
+        # A throw that never fires (frozen feedback) must still end.
+        self.throw_timeout_s = 3.0 * (2.0 * self.target / self.v_out
+                                      + self.v_out / self.accel_out) + 1.0
+
+        self.repeats = self.n_throws
+        self.repeat = 0
+        self.stops = []             # one record per stop, for the decel fit
+
+        self._sign = 1.0            # output direction per +drive command
+        self._last_speed = 0.0      # last commanded speed, driven-shaft frame
+        self._sim = {'rel': 0.0, 'v': 0.0}     # offline dead-reckoning state
+
+    def _load_rig(self):
+        """Rig-config values the throw depends on. Its own method so the sim can
+        substitute them without touching a config file."""
+        with open('%s/%s_dyno_config.yaml'
+                  % (dyno_paths.dyno_config_directory, self.mode)) as f:
+            return throw_rig_from_config(yaml.safe_load(f))
+
+    def _cmd(self, speed, hold_dir, flag=None, ratio_reset=False):
+        """`speed` is signed in OUTPUT direction, in the driven shaft's units."""
+        self._last_speed = speed
+        hold = self.hold_level * (hold_dir if self.hold_follows_dir else 1.0)
+        cmd = {'input_mode': 'velocity' if self.drive == 'input' else 'torque',
+               'output_mode': 'velocity' if self.drive == 'output' else 'torque',
+               'input_command': speed * self._sign if self.drive == 'input' else hold,
+               'output_command': speed if self.drive == 'output' else hold}
+        if flag is not None:
+            cmd['log_flag'] = flag
+        if ratio_reset:
+            cmd['ratio_reset'] = True
+        return cmd
+
+    def _read(self):
+        """(rel, v, input_sign) in output coordinates, or None if unknown.
+        Offline (no sensor_reader) this also advances the dead-reckoned plant one
+        cycle from the last command."""
+        if self.sensor_reader is None:
+            sim = self._sim
+            target = self._last_speed / (abs(self.limits['input'].get('gear_ratio') or 1)
+                                         if self.drive == 'input' else 1.0)
+            braking = abs(target) < abs(sim['v']) or target * sim['v'] < 0
+            rate = (self.stop_decel if braking else self.accel_out) * self.dt
+            sim['v'] += max(-rate, min(rate, target - sim['v']))
+            sim['rel'] += sim['v'] * self.dt
+            return sim['rel'], sim['v'], 1.0
+        try:
+            r = self.sensor_reader() or {}
+            centre = r.get('centre')
+            pos = (r.get('position') or {}).get('output')
+            v = (r.get('velocity') or {}).get('output')
+            rel = float(pos) - float(centre)
+            v = float(v)
+        except (TypeError, ValueError):
+            return None
+        if math.isnan(rel) or math.isnan(v):
+            return None
+        return rel, v, r.get('input_sign')
+
+    def _still(self, flag=None):
+        for _ in range(max(1, int(round(self.settle_s / self.dt)))):
+            yield self._cmd(0.0, 1.0, flag)
+
+    def commands(self):
+        say = self.sensor_reader is not None
+        self.repeat = 0
+        yield self._cmd(0.0, self.start_dir)      # mode-set, before any timing
+
+        first = self._read()
+        if first is None or (self.drive == 'input' and not first[2]):
+            if say:
+                print('Throw: skipped -- %s' % (
+                    'no centre declared or output position unreadable' if first is None
+                    else 'input_sign not measured (run touch-off)'))
+            yield from self._still()
+            self.run += 1
+            return
+        if self.drive == 'input':
+            self._sign = 1.0 if first[2] > 0 else -1.0
+
+        direction = self.start_dir
+        if direction * first[0] >= self.target:
+            direction = -direction          # already at that end: go the other way
+        step = self.ramp_accel * self.dt
+        n_timeout = int(round(self.throw_timeout_s / self.dt))
+        n_rest = max(1, int(round(self.settle_s / self.dt)))
+        n_stop_timeout = int(round(self.STOP_TIMEOUT_S / self.dt))
+        speed = 0.0
+        ok = True
+
+        for k in range(1, self.n_throws + 1):
+            self.repeat = k
+            flag = '%s%d-SETPOINT%d' % (self.log_id_base, self.run, k)
+            goal = direction * self.speed
+            fired = None
+            for _ in range(n_timeout):
+                reading = self._read()
+                if reading is None:
+                    break
+                rel, v, _s = reading
+                x, vx = direction * rel, max(direction * v, 0.0)
+                if x + vx * vx / (2.0 * self.stop_decel) >= self.target:
+                    fired = (rel, v)
+                    break
+                speed += max(-step, min(step, goal - speed))
+                steady = abs(speed - goal) < 1e-9
+                yield self._cmd(speed, direction, flag if steady else None)
+            if fired is None:
+                if say:
+                    print('Throw %d: no turnaround (feedback lost or timed out) -- ended' % k)
+                ok = False
+                break
+
+            # Fire: velocity 0, then wait for rest.
+            speed = 0.0
+            peak = direction * fired[0]
+            at_rest, outcome = 0, 'stopped'
+            for i in range(n_stop_timeout):
+                yield self._cmd(0.0, direction)
+                reading = self._read()
+                if reading is None:
+                    outcome = 'feedback lost'
+                    break
+                peak = max(peak, direction * reading[0])
+                at_rest = at_rest + 1 if abs(reading[1]) < self.rest_velocity else 0
+                if at_rest >= n_rest:
+                    break
+            else:
+                outcome = 'did not come to rest'
+            if outcome != 'stopped':
+                if say:
+                    print('Throw %d: %s after the stop command -- ended' % (k, outcome))
+                ok = False
+                break
+
+            # At rest: the slip reference is re-zeroed here, once per stop.
+            yield self._cmd(0.0, direction, ratio_reset=True)
+            vx_fire = max(direction * fired[1], 0.0)
+            self.stops.append({
+                'throw': k, 'direction': direction,
+                'fire_rel': fired[0], 'fire_v': fired[1],
+                'peak_rel': direction * peak, 'rest_rel': reading[0],
+                'travel': peak - direction * fired[0],
+                'predicted_travel': vx_fire ** 2 / (2.0 * self.stop_decel),
+            })
+            if say:
+                print('Throw %d (%+d): fired at %+.4f rad, %.2f rad/s; peak %+.4f, rest %+.4f '
+                      '(travel %.4f, predicted %.4f)'
+                      % (k, direction, fired[0], fired[1], direction * peak, reading[0],
+                         peak - direction * fired[0], vx_fire ** 2 / (2.0 * self.stop_decel)))
+            direction = -direction
+
+        if not ok:
+            yield from self._still()
+        self.run += 1
+
+
 class RampBreak:
     """Event-terminated torque ramp: the stiction / breakaway test
     (behavior type 'ramp_break').
@@ -1372,6 +1657,9 @@ class TestManager:
                 behavior, self.mode, self.limits, self.sensor_reader)
         elif behavior['type'] == 'recentre' and behavior['id'] not in self.behaviors:
             self.behaviors[behavior['id']] = Recentre(
+                behavior, self.mode, self.limits, self.sensor_reader)
+        elif behavior['type'] == 'throw' and behavior['id'] not in self.behaviors:
+            self.behaviors[behavior['id']] = Throw(
                 behavior, self.mode, self.limits, self.sensor_reader)
         elif behavior['type'] == 'loop':
             for looped_behavior in behavior['behaviors']:

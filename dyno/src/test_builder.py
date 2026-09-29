@@ -183,6 +183,7 @@ GENERATED_TRACE_DIR = 'ui_generated'        # under tests/traces/
 # to +1. Step 2 so the arrows walk -1 <-> +1 without stopping at 0.
 SIGNED_INT_PARAMS = {
     'direction': (-1, 1, 2),
+    'start_dir': (-1, 1, 2),
 }
 DEFAULT_INT_RANGE = (1, 100000, 1)
 
@@ -267,6 +268,28 @@ PATTERNS = {
         'acceleration_rad_s2':       ('Input acceleration [rad/s^2]', 20.0, float),
         'timeout_s':                 ('Give up after [s]', 30.0, float),
         'settle_s':                  ('Settle after arriving [s]', 0.5, float),
+    },
+    # Compiles to a real `throw` behavior (not a trace): the PRIMARY motor runs
+    # in velocity mode and stops on a turnaround angle predicted from live
+    # OUTPUT-encoder position and velocity, then reverses; the SECONDARY holds a
+    # torque (its first level). See test_manager.Throw and
+    # docs/archimedes_throw_mode_design.md. The abort angle is the rig config's
+    # position_window.half_window_rad, and the stop decel is the measured
+    # `throw.stop_decel_rad_s2` for the primary motor -- neither is a param here.
+    'throw': {
+        'speed_rad_s':       ('Drive speed [rad/s, driven shaft]', 3.0, float),
+        'target_rad':        ('Turnaround angle [rad, output, from centre]', 1.0, float),
+        'ramp_accel':        ('Speed-up accel [rad/s^2, driven shaft]', 20.0, float),
+        'n_throws':          ('Throws', 4, int),
+        'start_dir':         ('First throw direction (+1 / -1)', 1, int),
+        'hold_follows_dir':  ('Hold torque sign follows throw direction', False, bool),
+        'settle_s':          ('Rest confirmation [s]', 0.2, float),
+        'window_margin_rad': ('Margin to the window boundary [rad]', 0.05, float),
+        # 0 = use the measured value in the rig config. Set it for calibration
+        # runs (deliberately low, so the throw fires early and safely) and for a
+        # drive that has no measured value yet.
+        'stop_decel_rad_s2': ('Stop decel override [rad/s^2, output; 0 = rig config]',
+                              0.0, float),
     },
     'gridpoint': {
         'levels':               ('Pattern-motor levels (comma separated)',
@@ -392,7 +415,7 @@ def generate_levels(start, stop, n, spacing='linear', mirror=False):
 # command stream only exists at run time -- a grid search walks its own
 # setpoints, a breakaway ramp ends on an event nobody can precompute -- so
 # there is no csv to write, compare against, or plot exactly.
-GENERATIVE_PATTERNS = ('gridpoint', 'breakaway', 'recentre')
+GENERATIVE_PATTERNS = ('gridpoint', 'breakaway', 'recentre', 'throw')
 
 
 def is_generative(segment):
@@ -933,6 +956,197 @@ def reaction_torque_issue(output_torque_peak, limits):
             f'(limit {dut:g}) through gear_ratio {ratio:g}')
 
 
+# --- throw -------------------------------------------------------------------
+
+def is_throw(segment):
+    return segment.get('pattern') == 'throw'
+
+
+def throw_rig_from_config(cfg):
+    """The rig-config values a throw depends on, from a parsed rig config dict:
+    the window it must stay inside and the measured stop decel per drive motor.
+    Shared by the behavior (which reads the file) and the builder (which
+    validates against the same numbers while editing)."""
+    window = cfg.get('position_window') or {}
+    return {
+        'window_enabled': bool(window.get('enabled', False)),
+        'half_window': window.get('half_window_rad'),
+        'window_decel': float(window.get('stop_decel_rad_s2') or 0.0),
+        'stop_decel': (cfg.get('throw') or {}).get('stop_decel_rad_s2') or {},
+    }
+
+
+def throw_window_reach(target, margin, v_out, window_decel):
+    """How far out a nominal throw reaches as the WINDOW sees it: the target,
+    the margin, and the window's own predicted stop distance at this speed. It
+    has to stay under half_window_rad, or the abort fires on a nominal throw."""
+    reach = target + margin
+    if window_decel > 0:
+        reach += v_out ** 2 / (2.0 * window_decel)
+    return reach
+
+
+def throw_settings(segment):
+    """The `throw` behavior settings a throw segment compiles to. The primary
+    motor drives (and brakes); the secondary's first level is the hold torque."""
+    params = segment.get('params', {})
+    primary = segment['primary']
+    secondary = segment.get('secondary', {})
+    p = lambda key: _param(params, 'throw', key)
+    levels = [float(v) for v in secondary.get('levels', [0.0])] or [0.0]
+    settings = {
+        'drive_motor': primary['motor'],
+        'speed_rad_s': abs(float(p('speed_rad_s'))),
+        'target_rad': abs(float(p('target_rad'))),
+        'ramp_accel': abs(float(p('ramp_accel'))),
+        'n_throws': int(p('n_throws')),
+        'start_dir': 1 if float(p('start_dir')) >= 0 else -1,
+        'hold_level': levels[0],
+        'hold_follows_dir': bool(p('hold_follows_dir')),
+        'settle_s': abs(float(p('settle_s'))),
+        'window_margin_rad': abs(float(p('window_margin_rad'))),
+    }
+    if abs(float(p('stop_decel_rad_s2'))) > 0:
+        settings['stop_decel_rad_s2'] = abs(float(p('stop_decel_rad_s2')))
+    return settings
+
+
+def _throw_frame(s, limits):
+    """(k, decel_out, accel_out, v_out) for the throw's numbers: `k` converts
+    driven-shaft units to output units (the gear ratio for an input drive), and
+    decel_out is the measured stop decel (None if not measured)."""
+    k = 1.0
+    if s['drive_motor'] == 'input':
+        k = abs(((limits or {}).get('input') or {}).get('gear_ratio') or 0) or None
+    rig = (limits or {}).get('throw_rig') or {}
+    decel = s.get('stop_decel_rad_s2') or (rig.get('stop_decel') or {}).get(
+        s['drive_motor'])
+    if k is None:
+        return None, decel, None, None
+    return k, decel, s['ramp_accel'] / k, s['speed_rad_s'] / k
+
+
+def throw_info(segment, limits):
+    """One line for the editor: where the throw turns round, and how close that
+    sits to the window. None when the numbers it needs are not known."""
+    s = throw_settings(segment)
+    k, decel, accel_out, v_out = _throw_frame(s, limits)
+    rig = (limits or {}).get('throw_rig') or {}
+    if k is None or not decel or not rig.get('half_window'):
+        return None
+    reach = throw_window_reach(s['target_rad'], s['window_margin_rad'], v_out,
+                               rig.get('window_decel') or 0.0)
+    return (f"throw: turns at +/-{s['target_rad']:g} rad, predicted stop "
+            f"{v_out ** 2 / (2 * decel):.3f} rad at {v_out:g} rad/s (output), "
+            f"window reach {reach:.3f} of {float(rig['half_window']):g} rad")
+
+
+def throw_preview_rows(segment, limits=None):
+    """Nominal keyframes: the driven channel's speed and the hold torque.
+
+    Each throw is a ramp up, a constant-speed run, and the stop, with the stop
+    decel from the rig config (the ramp accel stands in when it is unmeasured).
+    The first throw starts at centre so covers `target`; the rest cover the full
+    2 x target. Where a throw is too short to reach speed the profile is a
+    triangle. Live position moves the real turnaround points, so this is the
+    nominal shape, and the post-save expansion shows the exact stream."""
+    s = throw_settings(segment)
+    drive = s['drive_motor']
+    hold = 'output' if drive == 'input' else 'input'
+    k, decel, accel_out, v_out = _throw_frame(s, limits)
+    k = k or 1.0
+    accel_out = accel_out or s['ramp_accel']
+    v_out = v_out or s['speed_rad_s']
+    decel = decel or accel_out
+    eps = 1e-3
+
+    rows = [(0.0, 0.0, 0.0)]
+    t, direction = 0.0, s['start_dir']
+    for i in range(s['n_throws']):
+        travel = s['target_rad'] if i == 0 else 2.0 * s['target_rad']
+        hold_now = s['hold_level'] * (direction if s['hold_follows_dir'] else 1.0)
+        peak = v_out
+        if peak ** 2 / (2 * accel_out) + peak ** 2 / (2 * decel) > travel:
+            peak = math.sqrt(2.0 * travel / (1.0 / accel_out + 1.0 / decel))
+        t_up, t_down = peak / accel_out, peak / decel
+        run = (travel - peak ** 2 / (2 * accel_out) - peak ** 2 / (2 * decel)) / peak
+        rows.append((t + eps, 0.0, hold_now))
+        t += eps
+        rows.append((t + t_up, direction * peak * k, hold_now))
+        t += t_up
+        if run > 0:
+            t += run
+            rows.append((t, direction * peak * k, hold_now))
+        t += t_down
+        rows.append((t, 0.0, hold_now))
+        t += s['settle_s']
+        rows.append((t, 0.0, hold_now))
+        direction = -direction
+    cols = ['time', f'{drive}_motor_velocity', f'{hold}_motor_torque']
+    return cols, rows
+
+
+def _validate_throw(segment, limits=None):
+    """Mirrors the Throw asserts so problems surface while editing."""
+    issues = []
+    primary, secondary = segment['primary'], segment['secondary']
+    s = throw_settings(segment)
+    if primary['control_mode'] != 'velocity':
+        issues.append('throw drives in velocity mode: put the primary motor in '
+                      'velocity mode')
+    if secondary['control_mode'] != 'torque':
+        issues.append('throw holds the other motor in torque mode: put the '
+                      'secondary motor in torque mode')
+    if s['speed_rad_s'] <= 0:
+        issues.append('Drive speed must be > 0')
+    if s['target_rad'] <= 0:
+        issues.append('Turnaround angle must be > 0')
+    if s['ramp_accel'] <= 0:
+        issues.append('Speed-up accel must be > 0')
+    if s['n_throws'] < 1:
+        issues.append('Throws must be >= 1')
+    if not limits:
+        return issues
+    lim = limits[s['drive_motor']]
+    hold = 'output' if s['drive_motor'] == 'input' else 'input'
+    if s['speed_rad_s'] > lim['velocity']:
+        issues.append(f"drive speed {s['speed_rad_s']:g} rad/s exceeds the "
+                      f"{s['drive_motor']} motor velocity limit {lim['velocity']:g}")
+    if s['ramp_accel'] > lim['acceleration']:
+        issues.append(f"speed-up accel {s['ramp_accel']:g} rad/s^2 exceeds the "
+                      f"{s['drive_motor']} motor acceleration limit "
+                      f"{lim['acceleration']:g}")
+    peak = abs(s['hold_level'])
+    if peak > limits[hold]['torque']:
+        issues.append(f"hold level {peak:g} Nm exceeds the {hold} motor torque "
+                      f"limit {limits[hold]['torque']:g}")
+    if hold == 'output':
+        reaction = reaction_torque_issue(peak, limits)
+        if reaction:
+            issues.append(f'hold level: {reaction}')
+
+    k, decel, accel_out, v_out = _throw_frame(s, limits)
+    if k is None:
+        issues.append('throw with the input driving needs the input gear_ratio')
+        return issues
+    rig = limits.get('throw_rig')
+    if rig is None:
+        return issues
+    if not decel or decel <= 0:
+        issues.append(f"no measured stop decel for the {s['drive_motor']} motor "
+                      '(throw.stop_decel_rad_s2 in the rig config): measure it '
+                      'before running this drive')
+    if rig.get('window_enabled') and rig.get('half_window'):
+        reach = throw_window_reach(s['target_rad'], s['window_margin_rad'], v_out,
+                                   rig.get('window_decel') or 0.0)
+        if reach >= float(rig['half_window']):
+            issues.append(f"throw reaches {reach:.3f} rad as the window sees it "
+                          f"(target + margin + look-ahead at {v_out:g} rad/s), at or "
+                          f"past half_window_rad {float(rig['half_window']):g}: "
+                          'lower the target or the speed')
+    return issues
+
+
 def validate_segment(segment, limits=None):
     """Return a list of human-readable issues (empty = clean). Mirrors the
     TestTrace asserts so problems surface while editing, not at load time."""
@@ -942,6 +1156,8 @@ def validate_segment(segment, limits=None):
         return _validate_breakaway(segment, limits)
     if is_recentre(segment):
         return _validate_recentre(segment, limits)
+    if is_throw(segment):
+        return _validate_throw(segment, limits)
     issues = []
     primary = segment['primary']
     secondary = segment['secondary']
@@ -1166,6 +1382,17 @@ def build_yaml_dict(recipe):
             # Real recentre behavior: drives the input off live output position.
             behavior = {'id': seg['id'], 'type': 'recentre',
                         'settings': recentre_settings(seg)}
+            repeats = int(seg.get('repeats', 1))
+            if repeats > 1:
+                behavior = {'id': seg['id'] + '_LOOP', 'type': 'loop',
+                            'settings': {'loop_count': repeats},
+                            'behaviors': [behavior]}
+            behaviors.append(behavior)
+            continue
+        if is_throw(seg):
+            # Real throw behavior: velocity-mode drive, live turnaround.
+            behavior = {'id': seg['id'], 'type': 'throw',
+                        'settings': throw_settings(seg)}
             repeats = int(seg.get('repeats', 1))
             if repeats > 1:
                 behavior = {'id': seg['id'] + '_LOOP', 'type': 'loop',

@@ -5,31 +5,6 @@
 # archimedes_gearbox_implementation_log.md. Launch with
 # ./launch/inhouse_archimedes.sh. Kept separate from inhouse_dyno_config.yaml so
 # day-to-day edits there cannot disturb this setup.
-#
-# CONFIRMED ON THE DYNO 2026-09-14 (bus_scan.sh + drive_status.sh, both inert):
-#   - 5 slaves on enp86s0: EK1100, EL3208, ELM3004, AKD, AKD. The Elmo MAC
-#     drive is off the chain, as this config requires.
-#   - Slave 3 reports DRV.NAME "RTC-0020" (small, 20 Nm / 600 rad/s) = DUT =
-#     input motor. Slave 4 reports "RTC-0200" (large, 220 Nm) = LOAD =
-#     absorber. That is the order below.
-#   - BOTH names have an absorbers.yaml entry, so that file WOULD have
-#     overridden the limits below (it did exactly that on the 2026-09-03 run --
-#     see its resolved_config provenance). Each AKD now sets
-#     `absorber_library: false`, which opts it out. Check the bring-up
-#     provenance print still says "dyno config" for every motor_limits value.
-#
-# STILL TO VERIFY ON THE DYNO (see the log's open items):
-#   - The 20 Nm input cell is fitted and wired on the small AKD's shaft.
-#     `load_torque` (the 500 Nm output cell) is confirmed live and agrees with
-#     load_current * kt to ~2%; `input_torque` has read a dead -0.03 Nm in
-#     every recent log, but the input motor never drove in any of them, so
-#     that is not yet evidence either way.
-#   - Torque and direction signs (flip_torque_sign), Step 1 of the plan.
-#
-# DIRECT-COUPLE RUNS (no gearbox): set DUT gear_ratio to 1 and
-# position_window.enabled to false. Leaving -43 lets the test builder allow 43x
-# the torque through the input cell's shaft; the input_torque safety is the only
-# backstop then.
 
 load_only: false
 
@@ -51,102 +26,8 @@ feedforward_ratio: 0.0
 position_window:
   enabled: true
   source: devices.LOAD.position   # absorber encoder, direct to output
-  # 1.60 rad = 91.7 deg (operator call, 2026-09-18). Raised from 1.50 to open
-  # the gap between the commanded throw and the trip: the back-drive runs in
-  # logs/archimedes/gbx_1p2p0/bkw_passes overshoot their OWN command at the
-  # turnaround, and that overshoot grows with speed --
-  #
-  #     rpm_in   command   actual peak   overshoot
-  #        300    1.330       1.320       -0.010
-  #        600    1.330       1.390       +0.060
-  #        900    1.330       1.448       +0.118
-  #       1200    1.330       1.491       +0.161
-  #       1500    1.330       1.499       +0.169  <- tripped the 1.50 window
-  #
-  # so the trips were the absorber's position loop overshooting the corner, not
-  # the command going anywhere near the limit. The commanded throw is unchanged
-  # at 1.33 rad (generate_archimedes_tests.OUTPUT_END_RAD).
-  #
-  # WHAT THIS COSTS, in the one place it matters. Touch-off measures the bumpers
-  # at +/-1.7511 rad from centre (2026-09-18, both sides agree), so the window
-  # leaves 0.1511 rad (8.7 deg) for a trip to stop in -- down from 0.245 rad at
-  # 1.50. The braked stop is now MEASURED rather than expected: 148 rad/s^2 at
-  # the output (bkw_passes/velocity_ramp_3 tail; the comment below predicted
-  # ~270, so the real figure is well under the guess). Unbraked-look-ahead, that
-  # distance is only good to ~2820 rpm at the input:
-  #
-  #     3000 rpm in  ->  0.171 rad   past 0.1511
-  #     3600 rpm in  ->  0.246 rad   past 0.1511
-  #
-  # which is why stop_decel_rad_s2 below is now ARMED at 150. With the
-  # look-ahead on, the trip fires far enough ahead of the boundary that the
-  # braked stop lands INSIDE the window, and this margin stops being the thing
-  # the top of the speed range depends on.
-  half_window_rad: 1.50           # Half window
-  # Early trip: moving outward at v, trip when |pos| + v^2/(2*stop_decel) passes
-  # the window, so the stopped output lands inside it.
-  #
-  # 20.3 is MEASURED, not a placeholder: it is the free-coast deceleration at
-  # the output from the 2026-09-17 coastdowns (see post_test.brake below for the
-  # fit). The old 50 was a placeholder guessed HIGH, which is the unsafe
-  # direction -- initial_1nm_test tripped on it at -0.817 rad and still reached
-  # the bumper at 5.6 rad/s.
-  #
-  # 20.3 is honest but crippling: it caps the test's OWN deceleration at
-  # ~23 rad/s^2 at the output, so no brisk traverse can run without false
-  # tripping. The fix is post_test.brake, not a bigger number here. Once a
-  # braked trip has been recorded (the logging tail now captures one), raise
-  # this to the braked deceleration actually measured -- expect ~270 rad/s^2 at
-  # torque_nm 4.0, which clears finding 9's 3600 rpm requirement with room to
-  # spare. Do not raise it above what a tail-logged stop demonstrates.
-  #
-  # 0 = EARLY TRIP OFF (operator call, 2026-09-17). The hard check stays: the
-  # test still stops the moment |output - centre| passes half_window_rad. What
-  # is switched off is the look-ahead that added v^2/(2*stop_decel) to the
-  # reading. That look-ahead is what ended all three long runs in
-  # logs/archimedes/gbx_1p2p0/troubleshooting_initial -- at -1.181, +1.201 and
-  # -1.182 rad, against a 1.5 limit, on a sawtooth whose amplitude is
-  # 57.19/43.88 = 1.303 rad at the output. The shaft was never going to leave
-  # the window; 20.3 is the FREE-COAST figure and was being applied while the
-  # input drive was still under closed-loop control and commanding 31-49
-  # rad/s^2 of deceleration itself.
-  #
-  # WHAT THIS COSTS: a real excursion is now caught at the boundary rather than
-  # ahead of it, so the stop has to work in the distance left between the window
-  # (now 1.60) and the bumpers (1.7511 measured) -- 0.1511 rad; the figures in
-  # this paragraph are the 1.50/0.245 ones it was written against.
-  # Free-coasting at 20.3 rad/s^2
-  # that is only good to 3.15 rad/s at the output (~2100 rpm at the input); the
-  # 2026-09-17 tail coast measured 23.5 rad/s^2, so this is not optimistic.
-  # Below that speed the coast fits; above it, the stop has to be the brake
-  # holding position rather than a de-energise, which is what post_test.brake
-  # now does correctly (the launch-to-zero on every stop is fixed -- see
-  # dyno_controller._dut_command_for_mode). Before running the _high traces
-  # (2100-3600 rpm = 4.5-8.6 rad/s at the output, coasting 0.5-1.8 rad),
-  # re-measure the braked stop from a tail log and set this from it.
-  #
-  # THAT TAIL LOG NOW EXISTS (2026-09-18, bkw_passes/velocity_ramp_3): a braked
-  # trip pulled the input 37.6 -> 2.7 rad/s in 4.9 ms, which is 148 rad/s^2 at
-  # the output, and the output moved 0.013 rad doing it. So 150 is the braked
-  # figure this asks for, not the free-coast 20.3 that made the look-ahead
-  # unusable -- a 12x difference, and the reason it can be armed at all.
-  #
-  # ARMED at 150 (operator call, 2026-09-18).
-  #
-  # Two things to keep honest about it:
-  #
-  #  1. 150 is 1.4% ABOVE the 148 that was measured, which is the optimistic
-  #     direction -- the same mistake the old 50 placeholder made. It is small:
-  #     at 3600 rpm the real stop is 0.249 rad against the 0.246 assumed, a
-  #     0.003 rad error, and the 0.1511 rad window->bumper margin covers it many
-  #     times over. Do not round it UP again without another tail log.
-  #  2. It re-sizes traverses. generate_archimedes_tests reads this value and
-  #     shrinks each throw until |x| + v^2/(2*stop_decel) fits the window, so
-  #     the high-speed points now turn short of 1.33 rad. The generator prints
-  #     the throw it picked for every speed -- read that list after regenerating,
-  #     because a speed whose constant-speed run gets too short is SKIPPED
-  #     rather than shortened.
-  stop_decel_rad_s2: 100
+  half_window_rad: 1.60           # Half window
+  stop_decel_rad_s2: 70
   velocity_source: devices.LOAD.velocity
   require_touch_off: false
   touch_off:
@@ -198,7 +79,7 @@ position_window:
         - [devices.DUT.current, 0.983]  # A x kt: backup if the cell reads dead
       drag_nm: .5                  # starting baseline, replaced by the measured drag
       contact_rise_nm: .5
-      ceiling_nm: 2.0
+      ceiling_nm: 1.5
       arm_input_rad: 1.0            # rise check waits this much input travel into each move (breakaway)
       drag_tau_s: 0.5               # baseline averaging time constant
       trip_samples: 10
@@ -214,6 +95,17 @@ position_window:
       velocity_rad_s: 0.05          # outward speed beyond slow_from_rad
       approach_velocity_rad_s: 0.25 # speed inside slow_from_rad and toward centre
       arm_distance_rad: 0.03        # torque cap waived for this far when backing off a bumper
+
+# --- Throw mode (test_manager.Throw) ---
+# Measured decel of a velocity-0 stop, in OUTPUT-encoder coordinates, one per
+# drive motor (the same motor drives the throw and brakes it). null = not yet
+# measured, and a throw driven by that motor is refused at load. Fit from
+# logged v=0 stops across a speed ladder with the same drive/mode/torque and
+# assisting secondary torque; see docs/archimedes_throw_mode_design.md.
+throw:
+  stop_decel_rad_s2:
+    output: 70      
+    input: 40
 
 # --- 0. PORTS ---
 ports:
@@ -333,10 +225,6 @@ expected_slave_layout:
   - model: AKD
     name: LOAD
     params:
-      # DRV.NAME is RTC-0200, which HAS an absorbers.yaml entry (confirmed on
-      # the bench 2026-09-14). That entry would override the limits below --
-      # acceleration 150 -> 20 (the plan's 3600 rpm shuttles need ~116 at the
-      # output) and velocity 12 -> 50, undoing the deliberate output-speed cap.
       absorber_library: false
       flip_torque_sign: true
       # Hand test 2026-09-14, output bolted to the lockout plate: rotating the
@@ -467,7 +355,7 @@ post_test:
     # via the gearbox. NOT YET MEASURED on this rig -- do not switch to
     # `output` without a tail-logged stop the way the input figures below
     # were measured (dyno_controller.py, post_test.brake block comment).
-    drive: output
+    drive: input
     # Torque/velocity/position frame of whichever drive is braking. Only used
     # when that drive is already in torque mode; in velocity or position mode
     # the brake commands zero speed / hold position and the drive's own loop

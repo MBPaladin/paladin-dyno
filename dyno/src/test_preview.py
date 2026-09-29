@@ -31,7 +31,7 @@ import numpy as np
 import yaml
 
 from deployment import dyno_paths
-from dyno.src import test_manager
+from dyno.src import test_builder, test_manager
 
 MODES = ('torque', 'velocity', 'position')
 
@@ -121,6 +121,10 @@ def limits_from_config(mode):
     # load_only means the DUT side has no motor or coupling fitted, so the load
     # motor's torque is not reacted anywhere. See reaction_torque_issue.
     limits['coupled'] = not cfg.get('load_only', False)
+    # Not a motor limit: the window and measured stop decel a throw segment is
+    # validated against (test_builder._validate_throw). Ignored by everything
+    # that only reads the per-motor entries.
+    limits['throw_rig'] = test_builder.throw_rig_from_config(cfg)
     return limits
 
 
