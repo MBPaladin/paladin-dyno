@@ -54,6 +54,16 @@ DEFAULTS = {
     'correct_zero': True,
     'position_half_window_rad': None,
     'duplicates': 'longest',
+    # Per-span cuts a whole-folder `exclude` cannot make; see
+    # dataset.span_dropper for the conditions a rule may use.
+    'span_rules': [],
+    # Path components of logs read ONLY for the torque-cell zero (they may also
+    # be in `exclude`, which keeps them out of every result). Empty = the zero
+    # comes from the campaign's own no-load spans.
+    'cell_zero_sources': [],
+    # The customer's creep ceiling, drawn on the creep figure and counted in
+    # its finding. The 1.2.2 request says 5%.
+    'creep_limit_pct': 5.0,
     # Which of the customer's optional tests the REPORT carries. Both
     # analyzers always run and the pack always carries their figures, CSVs and
     # findings; these switch only the customer-facing section. The 1.2.2
@@ -103,7 +113,8 @@ def run(cfg, out_dir=None, only=None, make_report=False):
     print(f'Excluding: {", ".join(cfg["exclude"]) or "(nothing)"}')
 
     with dataset.load(cfg['log_root'], exclude=cfg['exclude'],
-                      duplicates=cfg['duplicates']) as ds:
+                      duplicates=cfg['duplicates'],
+                      drop=dataset.span_dropper(cfg['span_rules'])) as ds:
         if not ds.spans:
             print('\nNo recognised test segments found. Check log_root and '
                   'exclude.', file=sys.stderr)
@@ -115,7 +126,20 @@ def run(cfg, out_dir=None, only=None, make_report=False):
         print(f'\nRatio:    {ratio:.4f} '
               f'({"measured on the no-load sweep" if measured else "from the unit file"})')
 
-        offsets, detail = physics.cell_offsets(ds.spans, ratio)
+        zero_spans = ds.spans
+        if cfg.get('cell_zero_sources'):
+            # The cell zero is read from the no-load traverses, and the only
+            # true bidirectional ones can be logs the report itself excludes
+            # (a warm-up shuttle is not part of the velocity ramp). Read them
+            # for the zero alone.
+            with dataset.load(cfg['log_root'], exclude=(),
+                              include=cfg['cell_zero_sources'],
+                              duplicates='all') as zds:
+                zero_spans = [s for s in zds.spans if s.kind == naming.VELOCITY]
+                offsets, detail = physics.cell_offsets(zero_spans, ratio)
+                print(f'Cell zero read from: {", ".join(cfg["cell_zero_sources"])}')
+        else:
+            offsets, detail = physics.cell_offsets(zero_spans, ratio)
         cfg['cell_offsets'] = (offsets, detail)
         if offsets:
             print('Cell zero: ' + ', '.join(
@@ -403,7 +427,8 @@ def main(argv=None):
 
     if args.list:
         with dataset.load(cfg['log_root'], exclude=cfg['exclude'],
-                          duplicates=cfg['duplicates']) as ds:
+                          duplicates=cfg['duplicates'],
+                          drop=dataset.span_dropper(cfg['span_rules'])) as ds:
             _print_inventory(ds)
             for span in sorted(ds.spans, key=lambda s: (s.kind, s.direction,
                                                         s.point.raw)):

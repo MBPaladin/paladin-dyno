@@ -193,7 +193,11 @@ def _fig_hysteresis(spans, fits, ratio, cfg):
             # bottom-right corner, which is the thing a reader most needs on
             # the ramp where the fit is meaningless.
             ax.legend(fontsize=8, loc='upper left')
-        ax.set_title(f'{span.point.raw}  ({f["target_pct"]}% of slip)',
+        # Two ramps can carry the same ID when they were run in both
+        # directions, so the panel says which one it is.
+        way = (f', {plotting.DIR_LABEL[span.direction]}'
+               if len({s.direction for s in spans}) > 1 else '')
+        ax.set_title(f'{span.point.raw}  ({f["target_pct"]}% of slip){way}',
                      fontsize=10)
         ax.set_xlabel('wind-up (mrad, output-referred)')
         ax.set_ylabel('output torque (Nm)')

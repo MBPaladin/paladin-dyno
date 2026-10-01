@@ -57,7 +57,9 @@ CREEP_LIMIT_PCT = 5.0
 # reversing divides two numbers that are not yet describing the same motion and
 # reports thousands of percent. It is therefore measured only on legs that held
 # for this long, and from the leg's MEAN speeds rather than sample by sample.
-CREEP_MIN_LEG_S = 0.25
+# Was 0.25 s through 1.2.1; 0.1 s from 1.2.2, where the throw-mode plateaus at
+# 1500-3000 rpm input are only 0.15-0.3 s and 0.25 s left nothing to measure.
+CREEP_MIN_LEG_S = 0.1
 
 # Creep only means anything while the two shafts are still coupled. Past this
 # deviation from the kinematic ratio they are not creeping, they have come
@@ -160,6 +162,33 @@ def analyze(ds, cfg):
                             _fig_efficiency(sel, direction, cfg)))
         res.figures.append((f'loss_vs_torque_{direction}',
                             _fig_loss(sel, direction, cfg)))
+
+    # The legs of the FORWARD sweep on which power flowed output -> input. Not
+    # in `shown` (the input is still the shaft holding the traverse, so it is
+    # not the back-drive test), but the operator asks for it as its own map; the
+    # report places it only when the unit file says so.
+    cross = [p for p in points if p['flow'] == 'backdrive'
+             and p['span_direction'] == 'forward']
+    if cross:
+        res.figures.append(('efficiency_map_backdriven_in_forward_test',
+                            _fig_map(cross, 'backdrive', cfg,
+                                     label='forward test, output-to-input legs')))
+        res.figures.append(('efficiency_vs_torque_backdriven_in_forward_test',
+                            _fig_efficiency(cross, 'backdrive', cfg,
+                                            label='forward test, output-to-input '
+                                                  'legs')))
+    # The fourth quadrant: the back-drive test (output commanded in velocity
+    # mode), on the legs where the INPUT motor was supplying the power.
+    cross2 = [p for p in points if p['flow'] == 'forward'
+              and p['span_direction'] == 'backdrive']
+    if cross2:
+        res.figures.append(('efficiency_map_forward_flow_in_backdrive_test',
+                            _fig_map(cross2, 'forward', cfg,
+                                     label='back-drive test, input-to-output legs')))
+        res.figures.append(('efficiency_vs_torque_forward_flow_in_backdrive_test',
+                            _fig_efficiency(cross2, 'forward', cfg,
+                                            label='back-drive test, '
+                                                  'input-to-output legs')))
 
     creep = _creep(spans, ratio, cfg)
     if creep:
@@ -277,10 +306,10 @@ def _speed_colors(speeds):
     return {s: cmap(i / n * 0.85) for i, s in enumerate(speeds)}
 
 
-def _fig_efficiency(points, direction, cfg):
+def _fig_efficiency(points, direction, cfg, label=None):
     fig, ax = plotting.figure(
         f'{cfg["unit_label"]}  --  efficiency vs output torque '
-        f'({plotting.DIR_LABEL[direction]})',
+        f'({label or plotting.DIR_LABEL[direction]})',
         'median over repeat legs; the band spans the legs at that point')
     colors = _speed_colors(_speeds(points))
     for rpm in _speeds(points):
@@ -322,7 +351,7 @@ def _fig_loss(points, direction, cfg):
     return plotting.finish(fig)
 
 
-def _fig_map(points, direction, cfg):
+def _fig_map(points, direction, cfg, label=None):
     """Efficiency over the swept grid, as a map rather than a table.
 
     Speed along x and torque up y, both increasing the way they are read, and
@@ -338,7 +367,7 @@ def _fig_map(points, direction, cfg):
             p['eta'] * 100
     fig, ax = plotting.figure(
         f'{cfg["unit_label"]}  --  efficiency map '
-        f'({plotting.DIR_LABEL[direction]})',
+        f'({label or plotting.DIR_LABEL[direction]})',
         'median over repeat legs; grey cells were not measured',
         size=(7.2, 6.2))
     im = plotting.heatmap(ax, speeds, levels, grid, vmin=0.0, vmax=100.0)
@@ -391,6 +420,9 @@ def _creep(spans, ratio, cfg):
             'creep_pct': float(np.median(tracking)) if tracking else None,
             'creep_pct_max': float(np.max(tracking)) if tracking else None,
             'source_channel': 'leg-mean velocities',
+            # Every tracking leg, for the figure's mean and spread. Not a CSV
+            # column: the table keeps the per-level median.
+            'leg_vals': tracking,
         })
     return out
 
@@ -505,26 +537,40 @@ def _coverage(spans, ratio):
 
 
 def _fig_creep(creep, cfg):
+    # The creep figure is the forward-driving measurement (input commanded,
+    # output held). Back-drive legs are evaluated against the output shaft's
+    # commanded speed instead, and pooling them into the same curves, as the
+    # figure did once back-drive efficiency data was in the campaign, mixed two
+    # measurements into one mean and its band. They stay in efficiency__creep.csv.
+    fwd = [c for c in creep if c['direction'] == 'forward']
+    creep = fwd or creep
     fig, ax = plotting.figure(
         f'{cfg["unit_label"]}  --  creep ratio vs output torque',
-        'creep = 1 - (ratio x output speed) / input speed, on the '
-        'constant-speed legs; ratio from the no-load sweep')
+        'creep = 1 - (ratio x output speed) / input speed; '
+        'mean over legs, band is +/-1 std dev')
     speeds = sorted({c['rpm_cmd'] for c in creep})
     colors = _speed_colors(speeds)
     for rpm in speeds:
-        sel = sorted((c for c in creep if c['rpm_cmd'] == rpm
-                      and c['creep_pct'] is not None),
-                     key=lambda c: abs(c['t_cmd_nm']))
-        if not sel:
+        # Pool every tracking leg at one (speed, |torque|) point: the level
+        # is run at both signs and, in throw mode, as several segments.
+        pooled = {}
+        for c in creep:
+            if c['rpm_cmd'] == rpm and c.get('leg_vals'):
+                pooled.setdefault(abs(c['t_cmd_nm']), []).extend(c['leg_vals'])
+        if not pooled:
             continue
-        ax.plot([abs(c['t_cmd_nm']) for c in sel],
-                [c['creep_pct'] for c in sel],
-                marker='o', ms=4, lw=1.4, color=colors[rpm],
+        x = sorted(pooled)
+        mean = np.array([np.mean(pooled[t]) for t in x])
+        std = np.array([np.std(pooled[t]) for t in x])
+        plotting.band(ax, x, mean - std, mean + std, colors[rpm], alpha=0.10)
+        ax.plot(x, mean, marker='o', ms=4, lw=1.4, color=colors[rpm],
                 label=f'{rpm:g} rpm in')
-    ax.axhline(CREEP_LIMIT_PCT, ls='--', lw=1.4, color=plotting.BACKDRIVE_C)
-    ax.text(0.01, CREEP_LIMIT_PCT, f'  customer limit {CREEP_LIMIT_PCT:g}%',
-            transform=ax.get_yaxis_transform(), va='bottom', fontsize=8,
-            color=plotting.BACKDRIVE_C)
+    limit = cfg.get('creep_limit_pct', CREEP_LIMIT_PCT)
+    if cfg.get('creep_limit_line', True):
+        ax.axhline(limit, ls='--', lw=1.4, color=plotting.BACKDRIVE_C)
+        ax.text(0.01, limit, f'  customer limit {limit:g}%',
+                transform=ax.get_yaxis_transform(), va='bottom', fontsize=8,
+                color=plotting.BACKDRIVE_C)
     ax.set_xlabel('commanded output torque (Nm)')
     ax.set_ylabel('creep ratio (%)')
     ax.legend(title='input speed', fontsize=8)
@@ -554,8 +600,9 @@ def _fig_coverage(points, cfg):
     """Which of the customer's grid points this campaign actually reached."""
     fig, ax = plotting.figure(
         f'{cfg["unit_label"]}  --  efficiency grid coverage',
-        'one mark per measured operating point; the cap is what the sweep '
-        'stopped at')
+        'one mark per measured operating point'
+        + ('; the cap is what the sweep stopped at'
+           if cfg.get('coverage_cap_line', True) else ''))
     for flow, marker in (('forward', 'o'), ('backdrive', 'x')):
         sel = [p for p in points if p['flow'] == flow]
         if not sel:
@@ -564,7 +611,7 @@ def _fig_coverage(points, cfg):
                    marker=marker, s=28, color=plotting.DIR_COLOR[flow],
                    label=plotting.DIR_LABEL[flow])
     cap = cfg.get('torque_cap_nm')
-    if cap:
+    if cap and cfg.get('coverage_cap_line', True):
         ax.axvline(cap, ls='--', lw=1.2, color='#444444')
         ax.text(cap, 0.02, f' customer limit {cap:g} Nm', rotation=90,
                 transform=ax.get_xaxis_transform(), fontsize=8, va='bottom')
@@ -688,13 +735,14 @@ def _findings(res, legs, usable, points, creep, detail, cfg, cov=(), hyst=None):
                       'not follow, so no creep figure is quoted for them')
         rated = [c for c in creep if c['creep_pct'] is not None]
         if rated:
-            over = [c for c in rated if c['creep_pct'] > CREEP_LIMIT_PCT]
+            limit = cfg.get('creep_limit_pct', CREEP_LIMIT_PCT)
+            over = [c for c in rated if c['creep_pct'] > limit]
             worst = max(rated, key=lambda c: c['creep_pct'])
             res.add('warn' if over else 'info', 'creep',
                     f'creep ratio peaks at {worst["creep_pct"]:.2f}% '
                     f'({worst["direction"]}, {worst["rpm_cmd"]:g} rpm, '
                     f'{worst["t_cmd_nm"]:+g} Nm); {len(over)} of {len(rated)} '
-                    f'levels exceed the customer\'s {CREEP_LIMIT_PCT:g}% '
+                    f'levels exceed the customer\'s {limit:g}% '
                     'limit')
     cap = cfg.get('torque_cap_nm')
     if cap and points:

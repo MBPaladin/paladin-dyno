@@ -284,12 +284,27 @@ PATTERNS = {
         'start_dir':         ('First throw direction (+1 / -1)', 1, int),
         'hold_follows_dir':  ('Hold torque sign follows throw direction', False, bool),
         'settle_s':          ('Rest confirmation [s]', 0.2, float),
+        # 0 = the hold torque is a step at the start and just stops at the end.
+        # > 0 ramps it 0 -> hold before the first throw and hold -> 0 after the
+        # last, then holds 0 Nm for zero_hold_s, so consecutive segments meet at
+        # zero torque instead of stepping +T -> -T at a resting edge.
+        'hold_ramp_nm_s':    ('Hold torque ramp at the ends [Nm/s, hold motor; 0 = step]', 0.0, float),
+        'zero_hold_s':       ('Zero-torque hold after the ramp down [s]', 0.0, float),
+        # 0 = the drive sits at velocity 0 through those ramps, which lets the
+        # shaft walk ~ dT / Ki_eff (0.0115 rad/Nm on the LOAD AKD) whatever the
+        # ramp rate. > 0 holds the output angle instead: the drive is commanded
+        # kp * (x_hold - x) in velocity mode. Start near 4.
+        'hold_position_kp':  ('Position hold gain during hold-torque ramps [1/s; 0 = velocity 0]', 0.0, float),
         'window_margin_rad': ('Margin to the window boundary [rad]', 0.05, float),
         # 0 = use the measured value in the rig config. Set it for calibration
         # runs (deliberately low, so the throw fires early and safely) and for a
         # drive that has no measured value yet.
         'stop_decel_rad_s2': ('Stop decel override [rad/s^2, output; 0 = rig config]',
                               0.0, float),
+        # A stop whose travel grows linearly with speed (the output drive) is
+        # predicted as lag x v instead of v^2 / (2a). 0 = the rig config's
+        # `throw.stop_lag_s` for the drive, if it has one.
+        'stop_lag_s':        ('Stop lag override [s, output; 0 = rig config]', 0.0, float),
     },
     'gridpoint': {
         'levels':               ('Pattern-motor levels (comma separated)',
@@ -973,6 +988,7 @@ def throw_rig_from_config(cfg):
         'half_window': window.get('half_window_rad'),
         'window_decel': float(window.get('stop_decel_rad_s2') or 0.0),
         'stop_decel': (cfg.get('throw') or {}).get('stop_decel_rad_s2') or {},
+        'stop_lag': (cfg.get('throw') or {}).get('stop_lag_s') or {},
     }
 
 
@@ -1005,9 +1021,14 @@ def throw_settings(segment):
         'hold_follows_dir': bool(p('hold_follows_dir')),
         'settle_s': abs(float(p('settle_s'))),
         'window_margin_rad': abs(float(p('window_margin_rad'))),
+        'hold_ramp_nm_s': abs(float(p('hold_ramp_nm_s'))),
+        'zero_hold_s': abs(float(p('zero_hold_s'))),
+        'hold_position_kp': abs(float(p('hold_position_kp'))),
     }
     if abs(float(p('stop_decel_rad_s2'))) > 0:
         settings['stop_decel_rad_s2'] = abs(float(p('stop_decel_rad_s2')))
+    if abs(float(p('stop_lag_s'))) > 0:
+        settings['stop_lag_s'] = abs(float(p('stop_lag_s')))
     return settings
 
 
@@ -1026,18 +1047,34 @@ def _throw_frame(s, limits):
     return k, decel, s['ramp_accel'] / k, s['speed_rad_s'] / k
 
 
+def _throw_stop(s, limits):
+    """(lag_s, decel) the throw's stop is predicted with, at most one set: a
+    lag replaces the constant decel, as in test_manager.Throw. A decel in the
+    settings (a calibration override) wins over the rig's lag."""
+    rig = (limits or {}).get('throw_rig') or {}
+    drive = s['drive_motor']
+    decel, lag = s.get('stop_decel_rad_s2') or None, s.get('stop_lag_s') or None
+    if decel is None and lag is None:
+        lag = (rig.get('stop_lag') or {}).get(drive) or None
+    if decel is None and lag is None:
+        decel = (rig.get('stop_decel') or {}).get(drive) or None
+    return lag, (None if lag else decel)
+
+
 def throw_info(segment, limits):
     """One line for the editor: where the throw turns round, and how close that
     sits to the window. None when the numbers it needs are not known."""
     s = throw_settings(segment)
-    k, decel, accel_out, v_out = _throw_frame(s, limits)
+    k, _decel, accel_out, v_out = _throw_frame(s, limits)
+    lag, decel = _throw_stop(s, limits)
     rig = (limits or {}).get('throw_rig') or {}
-    if k is None or not decel or not rig.get('half_window'):
+    if k is None or not (decel or lag) or not rig.get('half_window'):
         return None
     reach = throw_window_reach(s['target_rad'], s['window_margin_rad'], v_out,
                                rig.get('window_decel') or 0.0)
     return (f"throw: turns at +/-{s['target_rad']:g} rad, predicted stop "
-            f"{v_out ** 2 / (2 * decel):.3f} rad at {v_out:g} rad/s (output), "
+            f"{lag * v_out if lag else v_out ** 2 / (2 * decel):.3f} rad at "
+            f"{v_out:g} rad/s (output), "
             f"window reach {reach:.3f} of {float(rig['half_window']):g} rad")
 
 
@@ -1057,11 +1094,19 @@ def throw_preview_rows(segment, limits=None):
     k = k or 1.0
     accel_out = accel_out or s['ramp_accel']
     v_out = v_out or s['speed_rad_s']
-    decel = decel or accel_out
+    lag, decel = _throw_stop(s, limits)
+    # A lag stop covers lag x v, which is what a constant decel of v / (2 lag)
+    # covers from this speed, so the triangle/trapezoid below stays the same.
+    decel = (v_out / (2.0 * lag)) if lag else (decel or accel_out)
     eps = 1e-3
 
     rows = [(0.0, 0.0, 0.0)]
     t, direction = 0.0, s['start_dir']
+    ramp = s['hold_ramp_nm_s']
+    if ramp > 0 and s['hold_level']:
+        hold0 = s['hold_level'] * (direction if s['hold_follows_dir'] else 1.0)
+        t += abs(hold0) / ramp
+        rows.append((t, 0.0, hold0))
     for i in range(s['n_throws']):
         travel = s['target_rad'] if i == 0 else 2.0 * s['target_rad']
         hold_now = s['hold_level'] * (direction if s['hold_follows_dir'] else 1.0)
@@ -1082,6 +1127,13 @@ def throw_preview_rows(segment, limits=None):
         t += s['settle_s']
         rows.append((t, 0.0, hold_now))
         direction = -direction
+    if ramp > 0 and s['hold_level']:
+        last = rows[-1][2]
+        t += abs(last) / ramp
+        rows.append((t, 0.0, 0.0))
+        if s['zero_hold_s'] > 0:
+            t += s['zero_hold_s']
+            rows.append((t, 0.0, 0.0))
     cols = ['time', f'{drive}_motor_velocity', f'{hold}_motor_torque']
     return cols, rows
 
@@ -1116,6 +1168,9 @@ def _validate_throw(segment, limits=None):
         issues.append(f"speed-up accel {s['ramp_accel']:g} rad/s^2 exceeds the "
                       f"{s['drive_motor']} motor acceleration limit "
                       f"{lim['acceleration']:g}")
+    if s['hold_ramp_nm_s'] > (limits[hold].get('rotatum') or float('inf')):
+        issues.append(f"hold ramp {s['hold_ramp_nm_s']:g} Nm/s exceeds the {hold} motor "
+                      f"rotatum limit {limits[hold]['rotatum']:g}")
     peak = abs(s['hold_level'])
     if peak > limits[hold]['torque']:
         issues.append(f"hold level {peak:g} Nm exceeds the {hold} motor torque "
@@ -1125,17 +1180,18 @@ def _validate_throw(segment, limits=None):
         if reaction:
             issues.append(f'hold level: {reaction}')
 
-    k, decel, accel_out, v_out = _throw_frame(s, limits)
+    k, _decel, accel_out, v_out = _throw_frame(s, limits)
+    lag, decel = _throw_stop(s, limits)
     if k is None:
         issues.append('throw with the input driving needs the input gear_ratio')
         return issues
     rig = limits.get('throw_rig')
     if rig is None:
         return issues
-    if not decel or decel <= 0:
-        issues.append(f"no measured stop decel for the {s['drive_motor']} motor "
-                      '(throw.stop_decel_rad_s2 in the rig config): measure it '
-                      'before running this drive')
+    if not lag and (not decel or decel <= 0):
+        issues.append(f"no measured stop decel or lag for the {s['drive_motor']} motor "
+                      '(throw.stop_decel_rad_s2 / throw.stop_lag_s in the rig config): '
+                      'measure it before running this drive')
     if rig.get('window_enabled') and rig.get('half_window'):
         reach = throw_window_reach(s['target_rad'], s['window_margin_rad'], v_out,
                                    rig.get('window_decel') or 0.0)

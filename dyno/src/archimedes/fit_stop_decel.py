@@ -24,6 +24,12 @@ Reported per drive motor and hold-torque condition:
     a_safe          the lowest a_eff among stops at >= half the top speed. A
                     lookahead using this is at least as conservative as every
                     observed fast stop.
+    t_lag (safe)    travel = v0 * t_lag: the stop as a pure lag, for a drive whose
+                    travel grows LINEARLY with speed so that a_eff climbs with
+                    it (the output drive under a PI velocity loop). The safe
+                    figure is the largest travel / v0 among stops at >= half the
+                    top speed. Use it as `throw.stop_lag_s.<drive>` when a_eff
+                    rises several-fold across the ladder; it replaces the decel.
 
 WHICH NUMBER TO USE. Size from the worst hold condition, not the zero-torque
 one: assisting torque lengthens the stop. Take a_safe of the worst group, round
@@ -35,6 +41,7 @@ assisting one.
 import argparse
 import csv
 import glob
+import math
 import os
 import sys
 
@@ -113,6 +120,8 @@ def fit(rows):
     out['a'] = 1.0 / (2.0 * ((d * v * v).sum() / (v ** 4).sum()))
     fast = v >= 0.5 * v.max()
     out['a_safe'] = float((v[fast] ** 2 / (2.0 * d[fast])).min())
+    out['t_lag'] = float((d * v).sum() / (v * v).sum())
+    out['t_lag_safe'] = float((d[fast] / v[fast]).max())
     out['t_d'] = out['a_lag'] = None
     if len(rows) >= 4 and len(set(np.round(v, 1))) >= 3:
         (td, k), *_ = np.linalg.lstsq(np.column_stack([v, v * v]), d, rcond=None)
@@ -142,8 +151,9 @@ def main(argv=None):
             w.writerows(rows)
 
     print(f"\n{'drive':7s} {'condition':9s} {'n':>3s} {'v range':>13s} {'a':>7s} "
-          f"{'t_d [ms]':>9s} {'a (lag)':>8s} {'a_safe':>7s}")
-    worst = {}
+          f"{'t_d [ms]':>9s} {'a (lag)':>8s} {'a_safe':>7s} {'t_lag [ms]':>10s} "
+          f"{'safe':>6s}")
+    worst, worst_lag = {}, {}
     for drive in ('output', 'input'):
         mine = [r for r in rows if r['drive'] == drive]
         for cond in sorted({hold_class(r) for r in mine}):
@@ -151,8 +161,10 @@ def main(argv=None):
             r = fit(grp)
             lag = '' if r['t_d'] is None else f"{r['t_d'] * 1e3:9.1f} {r['a_lag']:8.1f}"
             print(f"{drive:7s} {cond:9s} {r['n']:3d} {r['vmin']:5.2f}-{r['vmax']:5.2f} "
-                  f"{r['a']:7.1f} {lag if lag else '        -        -'} {r['a_safe']:7.1f}")
+                  f"{r['a']:7.1f} {lag if lag else '        -        -'} {r['a_safe']:7.1f} "
+                  f"{r['t_lag'] * 1e3:10.1f} {r['t_lag_safe'] * 1e3:6.1f}")
             worst[drive] = min(worst.get(drive, 1e18), r['a_safe'])
+            worst_lag[drive] = max(worst_lag.get(drive, 0.0), r['t_lag_safe'])
     print('\nSpeed ladder (all conditions pooled, by drive):')
     for drive in ('output', 'input'):
         mine = [r for r in rows if r['drive'] == drive]
@@ -165,6 +177,13 @@ def main(argv=None):
     for drive in ('output', 'input'):
         if drive in worst:
             print(f'  {drive}: {int(worst[drive])}')
+    print('\nAlternative, when a_eff climbs with speed in the ladder above '
+          '(travel ~ proportional to v):')
+    print('Suggested throw.stop_lag_s (worst hold condition, fast stops, rounded UP to 1 ms;')
+    print('it replaces the decel for that drive):')
+    for drive in ('output', 'input'):
+        if drive in worst_lag:
+            print(f'  {drive}: {math.ceil(worst_lag[drive] * 1e3) / 1e3:g}')
 
 
 if __name__ == '__main__':

@@ -86,6 +86,10 @@ def analyze(ds, cfg):
     _number(events)
     res.tables.append(('slip__events', plotting.csv(
         [[e.get(k) for k in _COLS] for e in events], _COLS)))
+    summary = _ramp_summary(spans, events, ratio, cfg)
+    if summary:
+        res.tables.append(('slip__ramp_summary', plotting.csv(
+            [[r.get(k) for k in _SUMMARY_COLS] for r in summary], _SUMMARY_COLS)))
 
     # One figure per direction rather than one for the campaign. With the
     # back-drive ramps in, a single grid is twelve panels and comes out three
@@ -107,6 +111,71 @@ def analyze(ds, cfg):
         'event': e['event'], 'slip_torque_out_nm': e['t_out_at_event_nm'],
         'breakaway_in_nm': e['t_in_at_event_nm']} for e in events}
     return res
+
+
+_SUMMARY_COLS = ['direction', 'ramped_shaft', 'source', 'ramp', 'cmd_peak_nm',
+                 'out_cell_peak_nm', 'windup_rad', 'outcome', 'slip_out_nm']
+
+# A ramp that ends with the shafts further apart than this has come uncoupled.
+# The held shaft winds the drive up by about 0.01-0.12 rad over a ramp to 150 Nm
+# on this unit; a slip walks off by whole radians (2.07 on 2026-09-30).
+SUMMARY_SLIP_RAD = 0.5
+
+
+def _ramp_summary(spans, events, ratio, cfg):
+    """Every ramp in every slip log, whether or not the bench flagged it.
+
+    The per-event table above sees only what the log SEGMENTED, and a ramp
+    plan that stops on the slip safety flags just the ramp that slipped: the
+    ramps before it, which reached their target and never slipped, are in the
+    raw record but not in any segment. For 'how many ramps ran, how high did
+    they get, did any slip' they have to be read from the record itself.
+
+    Each ramp starts where the ramped shaft's torque command leaves zero. Its
+    peak is the largest |output cell| reading before the next ramp starts, and
+    `windup_rad` is how far (output angle - input angle / ratio) moved from the
+    ramp's start -- small on a drive that held, whole radians on one that
+    slipped.
+    """
+    import os
+    import h5py
+    rows = []
+    for source in sorted({s.source for s in spans}):
+        direction = next(s.direction for s in spans if s.source == source)
+        cmd_key = ('dut_torque_command' if direction == dataset.FORWARD
+                   else 'load_torque_command')
+        try:
+            with h5py.File(os.path.join(cfg['log_root'], source), 'r') as f:
+                cmd = np.nan_to_num(f[cmd_key][:].astype(float))
+                cell = f['load_torque'][:].astype(float)
+                pin = f['dut_output_position'][:].astype(float)
+                pout = f['load_position'][:].astype(float)
+        except (KeyError, OSError):
+            continue
+        if not np.any(np.abs(cmd) > 0):
+            continue
+        on = np.abs(cmd) > 0.02 * np.abs(cmd).max()
+        starts = np.flatnonzero(np.diff(on.astype(int)) == 1) + 1
+        stops = list(starts[1:]) + [len(cmd)]
+        slips = [e for e in events if e['source'] == source and e['event'] == 'slip']
+        for k, (a, b) in enumerate(zip(starts, stops), 1):
+            wind = pout[a:b] - pin[a:b] / ratio
+            rise = float(np.nanmax(np.abs(wind - wind[0])))
+            slipped = rise > SUMMARY_SLIP_RAD
+            hit = None
+            if slipped and len(slips) == 1:
+                hit = slips[0]['t_out_at_event_nm']
+            rows.append({
+                'direction': direction,
+                'ramped_shaft': 'input' if direction == dataset.FORWARD else 'output',
+                'source': source, 'ramp': k,
+                'cmd_peak_nm': float(np.abs(cmd[a:b]).max()),
+                'out_cell_peak_nm': float(np.nanmax(np.abs(cell[a:b]))),
+                'windup_rad': rise,
+                'outcome': 'slip' if slipped else 'no slip',
+                'slip_out_nm': hit,
+            })
+    return rows
 
 
 _COLS = ['ramp', 'ramp_no', 'segment', 'kind', 'lock_side', 'far_shaft_mode', 'direction',

@@ -68,6 +68,14 @@ FIGURES = {
     'efficiency__efficiency_map_forward.png': 'efficiency_map_forward.png',
     'efficiency__efficiency_map_backdrive.png':
         'efficiency_map_backdrive.png',
+    'efficiency__efficiency_map_backdriven_in_forward_test.png':
+        'efficiency_map_backdriven_forward_test.png',
+    'efficiency__efficiency_map_forward_flow_in_backdrive_test.png':
+        'efficiency_map_forward_flow_backdrive_test.png',
+    'efficiency__efficiency_vs_torque_backdriven_in_forward_test.png':
+        'efficiency_curve_backdriven_forward_test.png',
+    'efficiency__efficiency_vs_torque_forward_flow_in_backdrive_test.png':
+        'efficiency_curve_forward_flow_backdrive_test.png',
     'efficiency__efficiency_vs_torque_forward.png': 'efficiency_forward.png',
     'efficiency__efficiency_vs_torque_backdrive.png': 'efficiency_backdrive.png',
     'efficiency__loss_vs_torque_forward.png': 'loss_forward.png',
@@ -247,7 +255,7 @@ def _conditions(results, cfg, pack):
         rows.append(['Output position window, half width',
                      T.si(half, r'\radian')])
     cap = cfg.get('torque_cap_nm')
-    if cap:
+    if cap and cfg.get('report_torque_cap', True):
         rows.append(['Output torque limit applied during testing',
                      T.si(cap, NM)])
     out.append(_table('Test conditions.', ['Quantity', 'Value'], rows,
@@ -288,12 +296,21 @@ def _inventory(results, cfg, pack):
     # made the table twice as long without saying anything the Direction column
     # does not already say.
     by_test = {}
+    skip = set(_INVENTORY_SKIP)
+    if cfg.get('report_stiffness'):
+        # The report has a stiffness section, so the inventory lists the test.
+        skip.discard('stiffness')
+    if not cfg.get('report_slip'):
+        # No slip section, so no slip row: the breakaway runs ride with it.
+        skip |= {naming.SLIP, naming.BREAKAWAY}
     for key in sorted(inv):
         kind, _, direction = key.partition('/')
-        if kind in _INVENTORY_SKIP:
+        if kind in skip:
             continue
         title = naming.KIND_TITLES.get(
             kind, kind.replace('_', ' ').capitalize())
+        if kind == naming.STIFFNESS:
+            title = 'Torsional stiffness'
         by_test.setdefault(title, []).append(direction)
     rows = []
     for title in sorted(by_test):
@@ -321,7 +338,16 @@ def _inventory(results, cfg, pack):
             'Section~\\ref{sec:velocity} gives the method and the results.'))
 
     dups = results.get('duplicates') or []
-    if dups:
+    if dups and _throws(cfg):
+        out.append(_para(
+            'Some tests were recorded across more than one file. '
+            '%d operating point%s recorded in more than one file, and the '
+            'longest recording was used in each case. The efficiency sweep was '
+            'recorded in several runs; where a level was recorded in more than '
+            'one, every leg is included and the reported value is the median '
+            'across them.'
+            % (len(dups), ' was' if len(dups) == 1 else 's were')))
+    elif dups:
         # The affected segment names used to be listed out here, inside a
         # \sloppypar because a long comma-separated run of \texttt identifiers
         # gives TeX almost no break points. Both are gone: the names are the
@@ -338,6 +364,14 @@ def _inventory(results, cfg, pack):
     return '\n'.join(out)
 
 
+def _throws(cfg):
+    """True when the unit's tests were run as velocity-mode THROWS (limit to
+    limit at one constant speed, each steady leg logged separately) rather than
+    as a bipolar position sawtooth. The unit file says so: `test_shape: throws`.
+    It changes how the test is DESCRIBED, never how it is analysed."""
+    return cfg.get('test_shape') == 'throws'
+
+
 def _velocity(results, cfg, pack):
     rows_csv = _read_csv(pack, 'velocity_ramp__per_step.csv')
     if not rows_csv:
@@ -349,9 +383,13 @@ def _velocity(results, cfg, pack):
         'no load, with the shaft not being commanded held at '
         '\\SI{0}{\\newton\\meter}. Steps were \\SI{30}{\\rpm} apart up to '
         '\\SI{300}{\\rpm} and \\SI{300}{\\rpm} apart from there to '
-        '\\SI{3600}{\\rpm}, referred to the input shaft. Each step is a '
-        'bipolar traverse, so it holds its speed over several separate '
-        'constant-speed legs.'))
+        '\\SI{3600}{\\rpm}, referred to the input shaft. '
+        + ('Each step is a series of throws: the commanded shaft is driven at '
+           'the step speed to a turnaround angle on the output, stopped, and '
+           'driven back the other way, so each step holds its speed over '
+           'several separate constant-speed legs.' if _throws(cfg) else
+           'Each step is a bipolar traverse, so it holds its speed over '
+           'several separate constant-speed legs.')))
     if len({r['direction'] for r in rows_csv}) > 1:
         # Two tables follow and they were taken under different control
         # configurations. Saying so here is the difference between a reader
@@ -394,7 +432,10 @@ def _velocity(results, cfg, pack):
         out.append(_fig('speed_tracking.png',
                         'Measured input speed against commanded input speed.',
                         'tracking'))
-    if _have(pack, 'velocity_ramp__output_travel.png'):
+    # `report_output_travel: false` in the unit file leaves the end-stop travel
+    # figure and its paragraph out; the figure is still written to the pack.
+    if (cfg.get('report_output_travel', True)
+            and _have(pack, 'velocity_ramp__output_travel.png')):
         out.append('')
         out.append(_para(
             'The Archimedes drive has an internal end stop on the output '
@@ -525,23 +566,139 @@ def _drag_block(cfg, pack):
     return '\n'.join(out)
 
 
+def _efficiency_quadrants(cfg, pack):
+    """The efficiency section laid out as the four combinations of which shaft
+    was commanded (the test) and which way power flowed (the legs).
+
+    Every throw is classified by the direction power actually flowed, so each
+    test yields both: the legs where the held torque opposed the motion and
+    the legs where it assisted. The plain section reports only the legs whose
+    flow matches their test; this one reports all four, each under its own
+    heading with its own statement of what the shafts were doing. Switched by
+    `efficiency_quadrants: true` in the unit file.
+    """
+    allpts = _read_csv(pack, 'efficiency__per_point.csv')
+    speeds = sorted({_f(r, 'rpm') for r in allpts if _f(r, 'rpm') is not None})
+    step = cfg.get('torque_step_nm', 5.0)
+    out = [r'\section{Efficiency}', '']
+    out.append(_para(
+        'Efficiency was measured at input speeds of %s, in output torque steps '
+        'of \\SI{%s}{\\newton\\meter}. Two tests were run. In the forward-driving '
+        'test the input (high-speed) shaft was commanded through constant-speed '
+        'throws to a turnaround angle on the output, reversing direction between '
+        'throws, while the output (low-speed) shaft held a constant torque. In '
+        'the back-driving test the output shaft was commanded through the same '
+        'kind of throws, at the output speed that corresponds to the stated '
+        'input speed through the measured gear ratio, while the input shaft held '
+        'a constant torque.'
+        % (_and_list([_rpm(s) for s in speeds]),
+           T.raw(int(step) if float(step).is_integer() else step, 2))))
+    out.append(_para(
+        'Because the motion reverses and the held torque keeps one sign through '
+        'a segment, the held torque opposes the motion during the throws in one '
+        'direction and assists it during the throws in the other. Power '
+        'therefore flows from input to output during some throws and from '
+        'output to input during others. Each throw was measured separately and '
+        'classified by the direction in which power flowed. The results are '
+        'presented in four subsections: each of the two tests, split by the '
+        'direction of power flow.'))
+    out.append(_para(
+        'Efficiency is the ratio of the two measured shaft powers, output over '
+        'input where power flowed from input to output and input over output '
+        'where it flowed from output to input. Shaft power is the product of '
+        'the measured torque and the measured speed on that shaft. Values are '
+        'the median over the repeat legs at each point. Legs where the two '
+        'shaft powers did not share a sign were excluded, as no power was being '
+        'transmitted through the drive on those legs. Every map uses the same '
+        'grid of commanded input speed and commanded output torque and a '
+        'colour scale fixed at \\SIrange{0}{100}{\\percent}; grey cells were not '
+        'measured.'))
+
+    def have(name):
+        return _have(pack, 'efficiency__' + name + '.png')
+
+    def sub(title, label, text, map_name, map_alias, curve=None, loss=None):
+        if not have(map_name):
+            return
+        out.append(r'\subsection{%s}' % title)
+        out.append(_para(text))
+        lc = title[0].lower() + title[1:]
+        out.append(_fig(map_alias,
+                        'Efficiency (\\si{\\percent}), %s.' % lc,
+                        'eff_map_' + label, width=0.78))
+        if curve and have(curve[0]):
+            out.append(_fig(curve[1],
+                            'Efficiency against measured output torque, %s. '
+                            'Bands span the repeat legs at each point.' % lc,
+                            'eff_curve_' + label))
+        if loss and have(loss[0]) and cfg.get('report_loss_plot', True):
+            out.append(_fig(loss[1],
+                            'Power loss, %s: measured input shaft power minus '
+                            'measured output shaft power.' % lc,
+                            'eff_loss_' + label))
+
+    sub('Forward driving, power from input to output', 'ff',
+        'The input shaft was commanded and the held output torque opposed the '
+        'motion: the input shaft supplied the power and the output shaft '
+        'absorbed it.',
+        'efficiency_map_forward', 'efficiency_map_forward.png',
+        curve=('efficiency_vs_torque_forward', 'efficiency_forward.png'),
+        loss=('loss_vs_torque_forward', 'loss_forward.png'))
+    sub('Forward driving, power from output to input', 'fb',
+        'The input shaft was commanded and the held output torque assisted the '
+        'motion, so power flowed from the output shaft to the input shaft. The '
+        'input shaft was still the shaft commanded at the constant speed, so '
+        'this is a different arrangement from the back-driving test.',
+        'efficiency_map_backdriven_in_forward_test',
+        'efficiency_map_backdriven_forward_test.png',
+        curve=('efficiency_vs_torque_backdriven_in_forward_test',
+               'efficiency_curve_backdriven_forward_test.png'))
+    sub('Back-driving, power from output to input', 'bb',
+        'The output shaft was commanded and the held input torque opposed the '
+        'motion: the output shaft supplied the power and the input shaft '
+        'absorbed it.',
+        'efficiency_map_backdrive', 'efficiency_map_backdrive.png',
+        curve=('efficiency_vs_torque_backdrive', 'efficiency_backdrive.png'))
+    sub('Back-driving, power from input to output', 'bf',
+        'The output shaft was commanded and the held input torque assisted the '
+        'motion, so power flowed from the input shaft to the output shaft. The '
+        'output shaft was still the shaft commanded at the constant speed, so '
+        'this is a different arrangement from the forward-driving test.',
+        'efficiency_map_forward_flow_in_backdrive_test',
+        'efficiency_map_forward_flow_backdrive_test.png',
+        curve=('efficiency_vs_torque_forward_flow_in_backdrive_test',
+               'efficiency_curve_forward_flow_backdrive_test.png'))
+
+    if _have(pack, 'efficiency__coverage.png'):
+        out.append(_fig('efficiency_coverage.png',
+                        'Operating points covered by the efficiency sweep.',
+                        'eff_cov'))
+    out.append(_creep(cfg, pack, speeds=speeds))
+    return '\n'.join(x for x in out if x)
+
+
 def _efficiency(results, cfg, pack):
     pts = [r for r in _read_csv(pack, 'efficiency__per_point.csv')
            if r.get('flow') and r['flow'] == r.get('span_direction')]
     if not pts:
         return ''
+    if cfg.get('efficiency_quadrants'):
+        return _efficiency_quadrants(cfg, pack)
     out = [r'\section{Efficiency}', '']
     speeds = sorted({_f(r, 'rpm') for r in pts if _f(r, 'rpm') is not None})
     step = cfg.get('torque_step_nm', 5.0)
     out.append(_para(
         'Efficiency was measured at input speeds of %s, in output torque steps '
         'of \\SI{%s}{\\newton\\meter}. At each operating point the input shaft '
-        'was commanded through a bipolar constant-speed traverse while the '
-        'output shaft held a constant torque.'
+        'was commanded through %s while the output shaft held a constant '
+        'torque.'
         % (_and_list([_rpm(s) for s in speeds]),
-           T.raw(int(step) if float(step).is_integer() else step, 2))))
+           T.raw(int(step) if float(step).is_integer() else step, 2),
+           'constant-speed throws to a turnaround angle on the output, '
+           'reversing direction between throws, ' if _throws(cfg) else
+           'a bipolar constant-speed traverse')))
     out.append(_para(
-        'Because the traverse reverses, the held output torque opposes the '
+        'Because the motion reverses, the held output torque opposes the '
         'motion on one half of each traverse and assists it on the other. '
         'Power therefore flows from input to output on one half and from '
         'output to input on the other. Each half-traverse was measured '
@@ -553,6 +710,15 @@ def _efficiency(results, cfg, pack):
         'efficiency. Each figure below is therefore a single, isolated '
         'direction of power flow measured under the drive arrangement the '
         'test was set up for.'))
+    if _throws(cfg):
+        # Same statement, in the vocabulary of a throw test.
+        for old_, new_ in (
+                ('on one half of each traverse and assists it on the other',
+                 'during the throws in one direction and assists it during the '
+                 'throws in the other'),
+                ('Each half-traverse was measured', 'Each throw was measured'),
+                ('only the half-traverses whose', 'only the throws whose')):
+            out[-1] = out[-1].replace(old_, new_)
     out.append(_para(
         'Efficiency is the ratio of the two measured shaft powers, output '
         'over input where the input was driving and input over output where '
@@ -576,6 +742,30 @@ def _efficiency(results, cfg, pack):
                         'not measured.' % DIRECTION_WORD[direction],
                         'eff_map_%s' % direction, width=0.78))
 
+    # `report_cross_term_map: true` adds the forward-driving test's own
+    # output-to-input legs as a map. They are kept out of the reported results
+    # above on purpose (see the paragraph before the figures), so the text says
+    # exactly what they are.
+    if (cfg.get('report_cross_term_map')
+            and _have(pack, 'efficiency__efficiency_map_backdriven_in_forward_test.png')):
+        out.append(_para(
+            'The forward-driving test also contains legs on which the held '
+            'output torque assisted the motion, so that power flowed from the '
+            'output shaft to the input shaft. Figure~\\ref{fig:eff_map_cross} '
+            'shows the efficiency over those legs, on the same grid and colour '
+            'scale. On these legs the input shaft was still the shaft '
+            'commanded at the constant speed, so this is a different '
+            'arrangement from the back-driving test, in which the output shaft '
+            'was commanded.'))
+        out.append(_fig('efficiency_map_backdriven_forward_test.png',
+                        'Efficiency (\\si{\\percent}) over the legs of the '
+                        'forward-driving test on which power flowed from the '
+                        'output shaft to the input shaft, over the measured '
+                        'grid of commanded input speed and commanded output '
+                        'torque. The colour scale is fixed at '
+                        '\\SIrange{0}{100}{\\percent}. Grey cells were not '
+                        'measured.', 'eff_map_cross', width=0.78))
+
     if _have(pack, 'efficiency__efficiency_vs_torque_forward.png'):
         out.append(_fig('efficiency_forward.png',
                         'Efficiency against measured output torque, forward '
@@ -587,7 +777,8 @@ def _efficiency(results, cfg, pack):
     # other and the collapse above ~40 Nm reads as noise. The back-driving map
     # carries the same numbers on the commanded grid. Add it back with a
     # _fig('efficiency_backdrive.png', ...) here if it is wanted.
-    if _have(pack, 'efficiency__loss_vs_torque_forward.png'):
+    if (cfg.get('report_loss_plot', True)
+            and _have(pack, 'efficiency__loss_vs_torque_forward.png')):
         out.append(_fig('loss_forward.png',
                         'Power loss, forward driving: measured input shaft '
                         'power minus measured output shaft power.', 'loss'))
@@ -626,8 +817,10 @@ def _creep(cfg, pack, speeds=()):
         'Creep ratio is reported as $1 - (r \\cdot \\omega_{\\mathrm{out}}) / '
         '\\omega_{\\mathrm{in}}$, where $r$ is the gear ratio measured from '
         'the no-load sweep. It is evaluated over the constant-speed legs of '
-        'each operating point. The test request specifies that creep ratio '
-        'should stay below \\SI{5}{\\percent}.'))
+        'each operating point.'
+        + (' The test request specifies that creep ratio should stay below '
+           '\\SI{%s}{\\percent}.' % T.raw(cfg.get('creep_limit_pct', 5.0), 2)
+           if cfg.get('creep_limit_line', True) else '')))
     by_speed = {}
     for r in rows:
         by_speed.setdefault(_f(r, 'rpm_cmd'), []).append(r)
@@ -650,14 +843,17 @@ def _creep(cfg, pack, speeds=()):
     # 3000 rpm points, none of which held the commanded speed long enough to
     # evaluate the ratio over, would otherwise have left the report.
     missing = [sp for sp in (speeds or ()) if sp not in by_speed]
-    out.append(_table(
-        'Creep ratio by input speed, across the output torque levels measured '
-        'at that speed.',
-        [r'Input speed (\si{\rpm})', 'Levels',
-         r'Min (\si{\percent})', r'Max (\si{\percent})',
-         r'At torque (\si{\newton\meter})',
-         r'Above \SI{5}{\percent}'],
-        body, label='tab:creep', spec='rrrrrr'))
+    # `report_creep_table: false` leaves the table out and the figure in; the
+    # numbers are still in efficiency__creep.csv.
+    if cfg.get('report_creep_table', True):
+        out.append(_table(
+            'Creep ratio by input speed, across the output torque levels '
+            'measured at that speed.',
+            [r'Input speed (\si{\rpm})', 'Levels',
+             r'Min (\si{\percent})', r'Max (\si{\percent})',
+             r'At torque (\si{\newton\meter})',
+             r'Above \SI{5}{\percent}'],
+            body, label='tab:creep', spec='rrrrrr'))
     if missing:
         out.append(_para(
             'Creep ratio is not reported at %s. The creep ratio is evaluated '
@@ -670,9 +866,85 @@ def _creep(cfg, pack, speeds=()):
     if _have(pack, 'efficiency__creep_vs_torque.png'):
         out.append(_fig('creep.png',
                         'Creep ratio against commanded output torque, by '
-                        'input speed. The dashed line marks the '
-                        '\\SI{5}{\\percent} value given in the test request.',
+                        'input speed.'
+                        + (' The dashed line marks \\SI{%s}{\\percent}.'
+                           % T.raw(cfg.get('creep_limit_pct', 5.0), 2)
+                           if cfg.get('creep_limit_line', True) else ''),
                         'creep'))
+    return '\n'.join(out)
+
+
+def _slip_short(results, cfg, pack):
+    """A short static-slip section: how many ramps, how high, and which slipped.
+
+    Written from slip__ramp_summary.csv, which reads every ramp out of the raw
+    record (see analyzers.slip._ramp_summary). No breakaway, no per-ramp tables.
+    Switched by `slip_summary: short` in the unit file.
+    """
+    rows = _read_csv(pack, 'slip__ramp_summary.csv')
+    if not rows:
+        return ''
+    ratio = results.get('ratio') or 1.0
+    out = [r'\section{Static slip torque}', '']
+    out.append(_para(
+        'Torque was ramped on one shaft while the other was held under '
+        'position control, which grounds the drive train on the held side. '
+        'Successive ramps alternated between positive and negative torque. '
+        'A ramp is recorded as slip where the two shafts stopped turning at '
+        'the gear ratio and the angle between them, referred to the output, '
+        'began to change.'))
+    table, text = [], []
+    nominal = cfg.get('ratio_nameplate') or ratio
+    for direction in ('forward', 'backdrive'):
+        sel = [r for r in rows if r['direction'] == direction]
+        if not sel:
+            continue
+        slips = [r for r in sel if r['outcome'] == 'slip']
+        held = len(sel) - len(slips)
+        peak = max(_f(r, 'cmd_peak_nm') for r in sel)
+        # The ramps are commanded to a target, and the target is what is
+        # reported: 3.5 N.m at the input is the 150 N.m asked for at the
+        # output (through the nameplate ratio), whatever the cell then read.
+        target = peak * nominal if direction == 'forward' else peak
+        target = 5 * round(target / 5)
+        table.append([
+            T.escape(DIRECTION_WORD[direction].capitalize()),
+            T.escape('input' if direction == 'forward' else 'output'),
+            T.escape('output' if direction == 'forward' else 'input'),
+            str(len(sel)), str(len(slips)), T.num(target, 3)])
+        if direction == 'forward':
+            how = ('The input shaft torque was ramped to \\SI{%s}{\\newton\\meter} '
+                   'commanded, which is \\SI{%s}{\\newton\\meter} at the output, with '
+                   'the output shaft held.' % (T.raw(peak, 3), T.raw(target, 3)))
+        else:
+            how = ('The output shaft torque was ramped to \\SI{%s}{\\newton\\meter} '
+                   'commanded, with the input shaft held.' % T.raw(target, 3))
+        if not slips:
+            result = 'All %d ramps reached the commanded torque without slip.' % len(sel)
+        else:
+            parts = []
+            for r in slips:
+                at_cell = _f(r, 'slip_out_nm')
+                cmd_out = _f(r, 'cmd_peak_nm') * (nominal if direction == 'forward' else 1)
+                parts.append(
+                    'slip occurred at \\SI{%s}{\\newton\\meter} commanded '
+                    '(\\SI{%s}{\\newton\\meter} measured at the output torque cell)'
+                    % (T.raw(cmd_out, 3), T.raw(abs(at_cell), 3)) if at_cell is not None
+                    else 'slip occurred')
+            result = ('%d of the %d ramps reached the commanded torque without slip. '
+                      'On the remaining %s, %s.'
+                      % (held, len(sel),
+                         'ramp' if len(slips) == 1 else '%d ramps' % len(slips),
+                         ' and '.join(parts)))
+        text.append(_para('%s: %s %s' % (DIRECTION_WORD[direction].capitalize(),
+                                          how, result)))
+    out.append(_table(
+        'Static slip ramps. The torque is the commanded output torque the '
+        'ramps were run to.',
+        ['Test', 'Ramped shaft', 'Held shaft', 'Ramps', 'Slipped',
+         r'Commanded torque (\si{\newton\meter})'],
+        table, label='tab:slip', spec='lllrrr'))
+    out.extend(text)
     return '\n'.join(out)
 
 
@@ -863,6 +1135,9 @@ def _slip(results, cfg, pack):
     return '\n'.join(out)
 
 
+_DIRECTION_WORDS = {'forward': 'Forward driving', 'backdrive': 'Back-driving'}
+
+
 def _stiffness(results, cfg, pack):
     """Torsional stiffness. NOT WIRED INTO THE REPORT -- see `build`.
 
@@ -874,23 +1149,61 @@ def _stiffness(results, cfg, pack):
     if not rows:
         return ''
     out = [r'\section{Torsional stiffness}', '']
+    # `report_stiffness_detail: false` drops the lost-motion and shaft-tracking
+    # columns, the tracking paragraph and the shaft-angle figure. All of it is
+    # still in the pack (stiffness__fits.csv, stiffness__tracking.png).
+    detail = cfg.get('report_stiffness_detail', True)
     out.append(_para(
         'Torque was ramped to a target, held, and reversed. Wind-up is '
         'reported at the output shaft as the difference between the output '
         'shaft angle and the input shaft angle divided by the measured no-load '
         'gear ratio. Stiffness is the slope of output torque against that '
         'wind-up, fitted over the middle of the torque range and excluding the '
-        'reversal. Lost motion is the width of the loop at zero torque.'))
-    out.append(_para(
-        'During these tests the output shaft was held by the absorber motor '
-        'under position control rather than by a fixed mechanical ground. The '
-        'values below are measured across the drive and its holding servo in '
-        'series.'))
+        'reversal.' + (' Lost motion is the width of the loop at zero torque.'
+                       if detail else '')))
+    both = len({r.get('direction') for r in rows}) > 1
+    if both:
+        out.append(_para(
+            'The ramps were run in both directions. Forward driving, torque '
+            'was applied by the input (high-speed) shaft motor and the output '
+            '(low-speed) shaft was held by the absorber motor under position '
+            'control. Back-driving, torque was applied by the output motor and '
+            'the input shaft was held by its motor under position control. In '
+            'neither case was the held shaft fixed to a mechanical ground, so '
+            'the values below are measured across the drive and its holding '
+            'servo in series.'))
+    else:
+        out.append(_para(
+            'During these tests the output shaft was held by the absorber '
+            'motor under position control rather than by a fixed mechanical '
+            'ground. The values below are measured across the drive and its '
+            'holding servo in series.'))
+
+    # Compliance of the test chain outside the drive. Each motor's encoder sits
+    # behind its coupler, torque cell and second coupler, all of which are in
+    # series with the drive in every K below. The output-side chain was measured
+    # against a mechanical lockout; the input-side one is still to be measured.
+    chain_k = cfg.get('chain_k_output_nm_per_rad')
+    if chain_k:
+        out.append(_para(
+            'The measured wind-up also includes the compliance of the test '
+            'chain between each motor encoder and the gearbox shaft it drives: '
+            'coupler, torque cell and second coupler. The output-side chain '
+            '(output motor, coupler, torque cell, coupler, blocked against a '
+            'mechanical lockout plate) was measured separately at '
+            '\\SI{%s}{\\newton\\meter\\per\\radian}, from lockout runs to '
+            '\\SI{100}{\\newton\\meter}.' % T.raw(chain_k, 3)
+            + (' The input-side chain (lockout plate, input coupler, input '
+               'torque cell, input coupler, input motor) has not yet been '
+               'measured, so the values below are not corrected for either '
+               'chain.' if cfg.get('chain_input_pending') else '')))
 
     body = []
     for r in rows:
         k = _f(r, 'k_nm_per_rad')
-        body.append([
+        body.append(([T.escape(_DIRECTION_WORDS.get(r.get('direction'),
+                                                   r.get('direction') or ''))]
+                     if both else []) + [
             T.tt(r['segment']),
             T.num(_f(r, 'target_pct'), 2),
             T.num(_f(r, 'torque_peak_nm'), 3),
@@ -900,25 +1213,25 @@ def _stiffness(results, cfg, pack):
             # one, and four significant figures pushes it into exponent form.
             T.num(round(k) if k is not None else None),
             T.num(_f(r, 'k_r2'), 3),
-            T.num(_f(r, 'hysteresis_rad') * 1e3
-                  if _f(r, 'hysteresis_rad') is not None else None, 3),
-            T.num(_f(r, 'ratio_tracking_r'), 5),
-        ])
+        ] + ([T.num(_f(r, 'hysteresis_rad') * 1e3
+                    if _f(r, 'hysteresis_rad') is not None else None, 3),
+              T.num(_f(r, 'ratio_tracking_r'), 5)] if detail else []))
     out.append(_table(
         'Stiffness ramps. The nominal target is the fraction of static slip '
         'torque the ramp was configured for, using the slip value available '
         'when the test was generated; the peak torque column gives what was '
-        'recorded. Shaft tracking is the correlation between the two shaft '
-        'angles over the ramp.',
-        ['Segment', r'Target (\si{\percent})',
+        'recorded.' + (' Shaft tracking is the correlation between the two '
+                       'shaft angles over the ramp.' if detail else ''),
+        (['Direction'] if both else []) + ['Segment', r'Target (\si{\percent})',
          r'Peak torque (\si{\newton\meter})',
          r'Wind-up (\si{\milli\radian})',
-         r'$K$ (\si{\newton\meter\per\radian})', '$R^2$',
-         r'Lost motion (\si{\milli\radian})', 'Tracking'],
-        body, label='tab:stiff', spec='lrrrrrrr'))
+         r'$K$ (\si{\newton\meter\per\radian})', '$R^2$']
+        + ([r'Lost motion (\si{\milli\radian})', 'Tracking'] if detail else []),
+        body, label='tab:stiff',
+        spec=('l' if both else '') + ('lrrrrrrr' if detail else 'lrrrrr')))
 
     loose = [r for r in rows if (_f(r, 'ratio_tracking_r') or 1.0) < 0.99]
-    if loose:
+    if loose and detail:
         out.append(_para(
             'In %s the two shaft angles tracked the gear ratio with a '
             'correlation below 0.99 over the ramp, meaning the shafts did not '
@@ -932,13 +1245,14 @@ def _stiffness(results, cfg, pack):
         out.append(_fig('stiffness_hysteresis.png',
                         'Output torque against wind-up. The dashed line is '
                         'the fitted slope.', 'stiff_hyst', width=1.0))
-    if _have(pack, 'stiffness__tracking.png'):
+    if detail and _have(pack, 'stiffness__tracking.png'):
         out.append(_fig('stiffness_tracking.png',
                         'Shaft angles during each ramp, with the input '
                         'referred to the output through the measured ratio. '
                         'Wind-up is the difference between them, shown on the '
                         'right-hand axis.', 'stiff_track', width=1.0))
-    if _have(pack, 'stiffness__stiffness_vs_torque.png'):
+    if (cfg.get('report_stiffness_vs_torque', True)
+            and _have(pack, 'stiffness__stiffness_vs_torque.png')):
         out.append(_fig('stiffness_vs_torque.png',
                         'Local slope of the wind-up curve, in torque bins.',
                         'stiff_vs_t'))
@@ -962,10 +1276,15 @@ def _methods(results, cfg, pack):
          'referred to the output are divided by the measured no-load gear '
          'ratio, and are identified as such wherever they appear.'),
         ('Constant-speed selection',
-         'Measurements taken during a traverse use only the samples at the '
-         'commanded constant speed. The commanded speed is used as the '
-         'reference rather than a value derived from the data, because the '
-         'traverse overshoots at each reversal.'),
+         ('Measurements taken during a throw use only the constant-speed part '
+          'of the throw, which was logged separately from its ramp-up and '
+          'stop. Within it, samples are taken at the commanded constant '
+          'speed, which is used as the reference rather than a value derived '
+          'from the data.' if _throws(cfg) else
+          'Measurements taken during a traverse use only the samples at the '
+          'commanded constant speed. The commanded speed is used as the '
+          'reference rather than a value derived from the data, because the '
+          'traverse overshoots at each reversal.')),
         ('Averaging',
          'Where a point was measured over more than one leg, the reported '
          'value is the median across legs and the quoted range is the span '
@@ -1098,7 +1417,8 @@ def build(pack_dir, cfg, results=None, out_dir=None):
         ('efficiency', _efficiency),
     ]
     if cfg.get('report_slip'):
-        builders.append(('slip', _slip))
+        builders.append(('slip', _slip_short if cfg.get('slip_summary') == 'short'
+                         else _slip))
     if cfg.get('report_stiffness'):
         builders.append(('stiffness', _stiffness))
     builders.append(('measurement_notes', _methods))

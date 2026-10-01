@@ -48,8 +48,8 @@ turns (breakaway) -- they want different detectors, and only the slip hunt ends
 in an event that needs an operator watching. Bundled together, the safe one could
 not be run without arming the dangerous one.
 
-plus `archimedes_fwd_megabatch`, the same five concatenated into one plan, in run
-order, so the whole batch is a single selection in the GUI.
+There is no combined "run everything" plan: each test is its own selection (the
+megabatch was removed 2026-09-29).
 
 Everything that is still unmeasured sits in the PENDING block below. Rig limits,
 the window and `stop_decel_rad_s2` are read from the config, so after the STO
@@ -75,7 +75,6 @@ Run from repo root:
                        gearbox: the lockout rerun and the input spin bands.
   --include-backdrive  also write the five output-driven plans.
   --backdrive-only     write ONLY those.
-  --no-megabatch       skip the combined plan.
 
 Every value worth changing between units or between days on the bench is also a
 flag -- `--help` lists them with their current defaults. They rebind the module
@@ -104,7 +103,10 @@ from dyno.src import test_builder, test_preview
 MODE = 'inhouse_archimedes'
 
 # --- PENDING: update from gearbox day-1 and lockout results ------------------
-UNIT = '1.2.0'                      # '1.2.0' | '1.2.1' | '1.2.2'
+# 1.2.2 is the Syno gearbox now on the bench (2026-09-29): the client starts it
+# at 80 Nm output (its 140 Nm rating is not run yet), and NOTHING has been
+# measured on it -- see T_SLIP_OUT_NM below.
+UNIT = '1.2.2'                      # '1.2.0' | '1.2.1' | '1.2.2'
 # Output-referred forward static slip torque, from archimedes_fwd_slip. Until it
 # is measured, stiffness is drafted against 1.2.2's 140 Nm efficiency rating:
 # a unit that meets spec cannot slip below that, so 45% / 90% of it is safe.
@@ -113,8 +115,14 @@ UNIT = '1.2.0'                      # '1.2.0' | '1.2.1' | '1.2.2'
 # past 59 Nm output-referred -- the traction-limit signature -- and the -ve ramp
 # agrees at ~53-55 Nm. Roughly HALF the unit's 100 Nm rating: this unit does not
 # meet spec, which is consistent with the sticky points and its history.
-T_SLIP_OUT_NM = 53.0
-T_SLIP_PROVISIONAL_NM = 140.0
+# That figure is 1.2.0's. The 1.2.2 has no slip measurement, so it starts
+# at None: the efficiency sweep is bounded by EFF_MAX_OUT_NM (80) alone, and the
+# slip-hunt and stiffness sizing fall back to their provisional figures. Pass
+# `--slip-torque 53 --unit 1.2.0` to regenerate the old unit's plans.
+T_SLIP_OUT_NM = None
+# Provisional stiffness sizing while slip is unmeasured: 1.2.2's 80 Nm
+# starting torque, so the 45 / 90 % dwells are 36 / 72 Nm rather than 63 / 126.
+T_SLIP_PROVISIONAL_NM = 80.0
 # Where measurable micro-slip (creep) starts, same run: the ratio residual leaves
 # its 0.3 mrad noise band at ~20 Nm on the output cell and grows from there. The
 # customer's 5 % creep limit is the thing this threatens, well below gross slip.
@@ -141,8 +149,6 @@ GRAVITY_AMPLITUDE_NM = None
 # `ratio_slip` records 2.1-2.7 rad/s for it. The lower figure is used, so the
 # check below only complains when the limit is clearly past the whole band.
 FREE_SPIN_OUT_RAD_S = 2.1
-# Where the measured slip on the same day settled, in output rad of ratio error.
-MEASURED_SLIP_TRAVEL_OUT_RAD = 0.356
 
 # Customer-imposed hard limit on output shaft torque (IMSystems, 2026-09-17).
 # EVERY output-referred ceiling below is clipped to this, so relaxing it is one
@@ -188,10 +194,70 @@ EFF_RPM = [20, 300, 1500, 3000]
 # Set a speed to 0 to drop it entirely; remove it from the map to run it whole.
 BWD_EFF_TOP_LEVELS = {20: 2}
 EFF_STEP_OUT_NM = 5.0
-EFF_MAX_OUT_NM = {'1.2.0': 100.0, '1.2.1': 100.0, '1.2.2': 140.0}
+EFF_MAX_OUT_NM = {'1.2.0': 100.0, '1.2.1': 100.0, '1.2.2': 80.0}
 
-# Nominal throw: where a traverse ends when nothing forces it inward.
-OUTPUT_END_RAD = 1.35
+# Commanded throw half-window: where a traverse ends when nothing forces it
+# inward. 1.3 as of 2026-09-29, against the config's 1.6 rad abort window -- the
+# 0.3 rad between them is what the shaft's overshoot and the abort brake live in.
+# Shuttles command this as their amplitude; throws use it as `target_rad`.
+OUTPUT_END_RAD = 1.3
+# --- THROW MODE ----------------------------------------------------------------
+# The constant-speed tests (efficiency, velocity ramp, gravity map) run as `throw`
+# segments (docs/archimedes_throw_mode_design.md) wherever a throw can hold speed
+# long enough to measure: the drive runs in VELOCITY mode at the test speed, the
+# turnaround is fired on the live OUTPUT angle, and the other shaft holds its
+# torque at one constant sign for the whole segment -- so a segment covers both
+# rotation senses under the same torque, and the +/- level pairs cover all four
+# quadrants. A position shuttle instead spends its corners tracking a trapezoid.
+#
+# Not throws: slip, breakaway, stiffness and stiction are torque ramps at ~zero
+# velocity, and the bench plans run with the output locked (a throw needs the
+# output encoder to move).
+USE_THROW = True
+# Back-driving throws are driven by the OUTPUT (absorber). The design doc measured
+# that velocity loop as underdamped -- overshoot 60-120 % at 0.5-1 rad/s, ripple
+# 13-33 % of command at low speed -- and recommends input-driven throws instead.
+# Back-driving cannot be input-driven, so this is a switch: False keeps the
+# position shuttles for the output-driven plans.
+USE_THROW_OUTPUT_DRIVE = True
+# Speed-up accel, output frame. The input drive achieved 33-47 rad/s^2 against 60
+# commanded (design doc section 4), so asking for more only misleads the preview.
+THROW_RAMP_OUT_RAD_S2 = 40.0
+# The builder's window_margin_rad default; the sizing below mirrors its check.
+THROW_MARGIN_RAD = 0.05
+# Output drive only: the stop is a ~lag, not a constant decel -- travel measured
+# at 28-82 ms x v (worst 82). The config's constant decel underestimates it at
+# speed, so the turnaround is pulled in until the WORST stop still clears the
+# abort window by THROW_ABORT_MARGIN_RAD.
+THROW_OUTPUT_STOP_LAG_S = 0.082
+THROW_ABORT_MARGIN_RAD = 0.05
+# A throw is not worth running if less than this much of a full leg is at
+# constant speed; the plan falls back to a position shuttle (or skips).
+THROW_MIN_PLATEAU_RAD = 0.3
+# The hold torque meets ZERO between throw segments: ramp the level to 0, sit at 0
+# for THROW_ZERO_HOLD_S, then ramp to the next level, all inside the throw
+# behavior. Stepping +T -> -T with the shaft resting at an edge snapped the
+# output through its lost motion at up to 6.2 rad/s, growing with the level, and
+# tripped the window's look-ahead at +/-75 Nm (gbx_1p2p2 forward_driving/
+# efficiency_test, 2026-09-29). Output-referred Nm/s; the back-drive plans scale
+# it by 1/ratio because the input holds there. 50 Nm/s = 1.6 s to reach 80 Nm
+# (operator's call; 100 and 10 Nm/s were tried first).
+THROW_HOLD_RAMP_OUT_NM_S = 50.0
+THROW_ZERO_HOLD_S = 0.5
+# Output drive only: hold the output ANGLE through those torque ramps instead of
+# sitting at velocity 0. A velocity loop at zero lets the shaft walk by dT / Ki_eff
+# however slowly the torque moves -- 0.0115 rad/Nm measured on the LOAD AKD
+# (vl.kp 1 / vl.ki 2), linear from 10 to 45 Nm at 4.5 to 14 Nm/s (gbx_1p2p2
+# backdriving efficiency_03..05, 2026-09-30). A +T -> -T flip at 25 Nm is 0.57 rad,
+# at 80 Nm 1.8 rad: it walked the output off the turnaround and into the window
+# every time, and a slower ramp did not change the distance. The behavior now
+# commands kp * (x_hold - x) in velocity mode through the ramps (1/s; 0 = off).
+# Steady-state error under a ramp is R * 0.0115 / kp, so 4 /s is ~0.06 rad at
+# 20 Nm/s; UNTESTED on the rig -- watch the first flip for oscillation, and
+# back off if the output hunts. The input drive has no measured figure: off.
+THROW_HOLD_KP_OUT = 4.0
+# Most throws in one segment. 1 + 2 * MAX_CYCLES.
+THROW_MAX_N = 25
 # --- commanded-vs-actual overshoot -------------------------------------------
 # The shaft does not stop where it is told. It overshoots the turnaround by an
 # amount PROPORTIONAL TO SPEED -- a pure time lag -- and which shaft is being
@@ -333,11 +399,6 @@ RECENTRE_PARAMS = {
     'timeout_s': 20.0,
     'settle_s': 0.5,
 }
-# Which efficiency variant the megabatch carries. Both are always written; the
-# batch takes exactly one, because running both would measure efficiency twice.
-# 'alt' -- the full four quadrants -- is the one that answers the customer's
-# request; 'pos' is the faster half, for when the batch is a shakedown.
-MEGABATCH_EFFICIENCY = 'alt'
 # Which way the OUTPUT moves for a POSITIVE input position command, in the output
 # frame. +1 as of 2026-09-17: touch-off stamped `input_ratio: +43.82` on every
 # run in gbx_1p2p0/fwd_passes, and the efficiency logs agree (positive output
@@ -359,24 +420,7 @@ INPUT_SIGN = +1
 # it. There is no reason to be able to command 100 Nm at a contact that lets go
 # at 53, and a lower ceiling bounds a runaway.
 SLIP_CEILING_MARGIN = 1.4
-# Plans the megabatch leaves out, by tag.
-#   FSLIP  ends in a deliberate slip that no safety on this rig stops
-#          (2026-09-17). It needs an operator watching, so it does not belong in
-#          a 50-minute unattended batch. Leave this one out.
-#   FBRK   is the stiction half, split out of the slip plan on 2026-09-18. It is
-#          safe unattended -- low ceiling, detector fired on 12 of 12 ramps, both
-#          velocity safeties backstop it -- so it is excluded only out of
-#          caution over its first run with the output free. Drop it from this
-#          tuple once that has been watched once.
-MEGABATCH_EXCLUDE = ('FSLIP', 'FBRK')
-# Why each excluded tag is out, printed next to the plan it left behind.
-MEGABATCH_EXCLUDE_REASON = {
-    'FSLIP': 'it ends in a deliberate slip that no safety on this rig stops',
-    'FBRK': 'its ramps run with the output free, and that has not been watched once yet',
-}
-# Tag prefix marking a back-drive plan. The megabatch filters on THIS, not on a
-# bare 'B' -- which silently swallowed the 'BRK' (breakaway) plan when it was
-# first written.
+# Tag prefix marking a back-drive plan.
 BACKDRIVE_TAG = 'BWD_'
 # --- BACK-DRIVE knobs --------------------------------------------------------
 # All five output-driven plans are off unless --include-backdrive is passed.
@@ -429,10 +473,6 @@ STICTION_CEILING_IN_NM = 0.8
 # this only has to be gentle enough that the corners add no torque of their own;
 # at 0.15 rad/s it eats 0.02 rad of a 1.33 rad throw.
 GRAVITY_ACCEL_OUT = 0.5
-# Cap for the megabatch's load-only expansion check (it is only there to prove
-# TestManager accepts the plan; the window and duration come from the parts).
-MEGABATCH_CHECK_CYCLES = 200_000
-
 RPM = 2 * math.pi / 60
 
 
@@ -449,10 +489,12 @@ def load_config():
         'limits': test_preview.limits_from_config(MODE),
         'output_torque_safety': float(cfg['safeties']['output_torque']['limit']),
         'input_torque_safety': float(cfg['safeties']['input_torque']['limit']),
-        # The ratio-break (slip) safeties, added after the 2026-09-17 free-spin.
-        # Read rather than assumed: the notes below tell an operator whether to
-        # stand over the rig, and that answer changes with these numbers.
-        'ratio_break': _safety_limit(cfg, 'ratio_break'),
+        # The slip safeties, added after the 2026-09-17 free-spin. Read rather
+        # than assumed: the notes below tell an operator whether to stand over
+        # the rig, and that answer changes with these numbers.
+        'creep_over': _safety_limit(cfg, 'creep_over'),
+        'creep_under': _safety_limit(cfg, 'creep_under'),
+        'creep_watch': cfg.get('creep_watch') or {},
         'ratio_slip': _safety_limit(cfg, 'ratio_slip'),
     }
 
@@ -462,36 +504,51 @@ def _safety_limit(cfg, name):
     return None if not entry else float(entry['limit'])
 
 
-def ratio_break_notes(cfg):
-    """What the ratio-break safeties will actually do about a slip, from the
-    configured limits rather than from memory.
+def slip_safety_notes(cfg):
+    """What the slip safeties will actually do about a slip, from the configured
+    limits rather than from memory.
 
     This used to be a flat "nothing on this rig stops a slip", which was true
-    when it was written and stopped being true when `safeties.ratio_break` and
-    `ratio_slip` were added. It can go stale the same way again, so it is
-    derived: the numbers below come out of the config every run.
+    when it was written and stopped being true when the ratio safeties were
+    added. It can go stale the same way again, so it is derived: the numbers
+    below come out of the config every run.
+
+    `creep_over` / `creep_under` (which replaced `ratio_break` on 2026-09-29)
+    trip on the per-leg creep ratio -- see Controller._update_creep. Against a
+    locked output there is no leg to divide by, so they act as an absolute limit
+    of lost_motion_rad + limit * min_travel_rad of slip, which is what stands
+    between an input runaway and the E-stop.
     """
-    brk, slip = cfg.get('ratio_break'), cfg.get('ratio_slip')
-    if brk is None and slip is None:
-        return ['  NO RATIO-BREAK SAFETY IS CONFIGURED. Nothing on this rig can see a '
+    over, under, slip = cfg.get('creep_over'), cfg.get('creep_under'), cfg.get('ratio_slip')
+    if over is None and under is None and slip is None:
+        return ['  NO SLIP SAFETY IS CONFIGURED. Nothing on this rig can see a '
                 'slip. Watch it, and keep a hand on the E-stop']
-    out = [f'  ratio-break safeties are armed: '
-           + ', '.join(filter(None, [
-               f'ratio_break {brk:g} output rad' if brk is not None else None,
-               f'ratio_slip {slip:g} output rad/s' if slip is not None else None]))]
-    # The free-spin these were written for ran at 2.1-2.7 rad/s at the output
-    # and settled 0.356 rad out of ratio. A limit above that cannot catch it.
+    out = []
+    if over is not None or under is not None:
+        w = cfg.get('creep_watch') or {}
+        allow = float(w.get('lost_motion_rad', 0.05))
+        floor = float(w.get('min_travel_rad', 0.25))
+        parts = [f'creep_over {over:.1%}' if over is not None else None,
+                 f'creep_under {under:.1%}' if under is not None else None]
+        out.append('  creep safeties are armed: ' + ', '.join(filter(None, parts))
+                   + ' of the rolling distance, per leg (input over-travel / '
+                   'under-travel against the motion)')
+        loosest = max(x for x in (over, under) if x is not None)
+        trip_out = allow + loosest * floor
+        out.append(f'  against a locked output they trip at {trip_out:.3f} rad of slip '
+                   f'({trip_out * cfg["ratio"]:.1f} rad of input): {allow:g} lost-motion '
+                   f'allowance + {loosest:g} x the {floor:g} rad rolling floor. Trips '
+                   'are resumable')
+    else:
+        out.append('  NO CREEP SAFETY is configured (creep_over / creep_under)')
+    # The free-spin these were written for ran at 2.1-2.7 rad/s at the output.
+    # A rate limit above that cannot catch it.
     if slip is not None and slip > FREE_SPIN_OUT_RAD_S:
-        out.append(f'  BUT ratio_slip {slip:g} rad/s is ABOVE the '
-                   f'{FREE_SPIN_OUT_RAD_S:g} rad/s the 2026-09-17 free-spin actually ran '
-                   'at, so it would not have caught that event. The comment beside it in '
-                   'the config reasons about 1.0 rad/s. Treat this test as unprotected '
-                   'until that is resolved -- watch it, hand on the E-stop')
-    if brk is not None and brk > MEASURED_SLIP_TRAVEL_OUT_RAD * 2:
-        out.append(f'  ratio_break {brk:g} rad is well above the '
-                   f'{MEASURED_SLIP_TRAVEL_OUT_RAD:g} rad a measured slip settled at on '
-                   '2026-09-17, so it will not fire on a slip that stops on its own -- '
-                   'which is the intent, but it also means it is not the fast backstop')
+        out.append(f'  ratio_slip {slip:g} rad/s is above the {FREE_SPIN_OUT_RAD_S:g} rad/s '
+                   'the 2026-09-17 free-spin ran at, so the rate safety would not have '
+                   'caught that event; the creep safeties are the ones covering it')
+    elif slip is not None:
+        out.append(f'  ratio_slip {slip:g} output rad/s also armed')
     return out
 
 
@@ -723,6 +780,150 @@ def plan_shuttle(seg_id, motor, rpm_in, allowance, cfg, notes, cycles_cap,
                            cycles, **segment_kw)
 
 
+# --- throw sizing --------------------------------------------------------------
+
+def throw_geometry(motor, w_out, cfg, ramp_out=None):
+    """Turnaround and profile for a throw at output speed `w_out`, or None when
+    the rig config has no stop decel (or stop lag) for `motor`.
+
+    The turnaround is the largest angle (rounded DOWN to 0.01) that satisfies
+    both the builder's load-time rule -- target + margin + v^2/(2*window_decel)
+    under the abort window -- and, for the output drive, that its worst measured
+    stop still ends inside it. Returns a dict: target, ramp (rad of ramp-up),
+    stop (rad of predicted stop), plateau (rad at constant speed on a full
+    2 x target leg), extra (output-drive overshoot beyond the prediction).
+    """
+    rig = cfg['limits']['throw_rig']
+    decel = (rig.get('stop_decel') or {}).get(motor)
+    # A configured lag is what the behavior predicts the stop with (it replaces
+    # the constant decel), so the stop the plan is sized against is lag x v.
+    lag = (rig.get('stop_lag') or {}).get(motor)
+    if not decel and not lag:
+        return None
+    half = cfg['half_window']
+    wd = cfg['stop_decel']
+    ramp_out = ramp_out or THROW_RAMP_OUT_RAD_S2
+    w = abs(w_out)
+    cap = half - THROW_MARGIN_RAD - (w * w / (2 * wd) if wd > 0 else 0.0)
+    stop = lag * w if lag else w * w / (2 * decel)
+    extra = 0.0
+    if motor == 'output' and not lag:
+        extra = max(0.0, THROW_OUTPUT_STOP_LAG_S * w - stop)
+        cap = min(cap, half - THROW_ABORT_MARGIN_RAD - extra)
+    target = math.floor((min(OUTPUT_END_RAD, cap) - 1e-3) * 100) / 100
+    ramp = w * w / (2 * ramp_out)
+    stop_real = stop + extra
+    return {'target': target, 'ramp': ramp, 'stop': stop, 'extra': extra,
+            'plateau': 2 * target - ramp - stop_real,
+            'plateau_first': target - ramp - stop_real,
+            'decel': decel or (w / (2 * lag) if lag and w else None), 'window_reach': target + THROW_MARGIN_RAD
+                                            + (w * w / (2 * wd) if wd > 0 else 0.0)}
+
+
+def throw_count(geo, w_out, seconds=None, minimum=2):
+    """Throws needed for `seconds` (TARGET_CONST_S) of constant speed in EACH
+    direction. The first throw starts at centre and covers only `target`, so its
+    plateau is shorter; the rest are full 2 x target legs, alternating."""
+    seconds = TARGET_CONST_S if seconds is None else seconds
+    per = {1: 0.0, -1: 0.0}
+    direction, n = 1, 0
+    while n < THROW_MAX_N:
+        rolled = geo['plateau_first'] if n == 0 else geo['plateau']
+        per[direction] += max(rolled, 0.0) / abs(w_out)
+        direction, n = -direction, n + 1
+        if n >= minimum and min(per.values()) >= seconds:
+            break
+    return n, per
+
+
+def throw_segment(seg_id, motor, w_out, target, ramp_out, n_throws, hold_level,
+                  level_rate, settle_s, ratio, hold_ramp=0.0, zero_hold_s=0.0,
+                  hold_kp=0.0):
+    """One `throw` segment. `w_out` and `ramp_out` are OUTPUT-frame numbers; the
+    drive's own frame is the gear ratio for the input. `hold_level` is already in
+    the holding motor's Nm. Torque keeps ONE sign for the whole segment."""
+    k = ratio if motor == 'input' else 1.0
+    seg = test_builder.default_segment(seg_id)
+    seg['repeats'] = 1
+    seg['lead_in_s'] = test_builder.START_HOLD_S
+    seg['pattern'] = 'throw'
+    seg['params'] = {key: spec[1] for key, spec in test_builder.PATTERNS['throw'].items()}
+    seg['params'].update(speed_rad_s=round(w_out * k, 4), target_rad=round(target, 3),
+                         ramp_accel=round(ramp_out * k, 3), n_throws=int(n_throws),
+                         start_dir=1, hold_follows_dir=False,
+                         hold_ramp_nm_s=round(hold_ramp, 4),
+                         zero_hold_s=zero_hold_s if hold_ramp else 0.0,
+                         hold_position_kp=hold_kp if hold_ramp else 0.0)
+    seg['primary'] = {'motor': motor, 'control_mode': 'velocity', 'accel': 1.0}
+    seg['secondary'] = {'control_mode': 'torque', 'levels': [float(hold_level)],
+                        'rate': level_rate, 'settle_s': settle_s}
+    return seg
+
+
+def plan_throw(seg_id, motor, rpm_in, cfg, notes, hold_level=0.0, level_rate=10.0,
+               settle_s=1.0, ramp_out=None, n_throws=None, seconds=None,
+               hold_ramp=0.0):
+    """A throw at input speed `rpm_in`, driven by `motor`. None (with a note)
+    when throws are off, or cannot hold the speed long enough to be worth it --
+    the caller then falls back to a shuttle."""
+    if not USE_THROW or (motor == 'output' and not USE_THROW_OUTPUT_DRIVE):
+        return None
+    r = cfg['ratio']
+    w_out = rpm_in * RPM / r
+    geo = throw_geometry(motor, w_out, cfg, ramp_out)
+    if geo is None:
+        note = (f'no throw.stop_decel_rad_s2 or stop_lag_s for the {motor} in the rig config: '
+                f'{motor}-driven plans fall back to shuttles')
+        if note not in notes:
+            notes.append(note)
+        return None
+    if geo['plateau'] < THROW_MIN_PLATEAU_RAD:
+        notes.append(f'{seg_id}: {rpm_in} rpm cannot be thrown -- a full leg has only '
+                     f'{geo["plateau"]:+.2f} rad at constant speed (ramp {geo["ramp"]:.2f}, '
+                     f'stop {geo["stop"] + geo["extra"]:.2f} of 2 x {geo["target"]:.2f}); '
+                     'shuttled instead')
+        return None
+    if n_throws is None:
+        n_throws, per = throw_count(geo, w_out, seconds)
+    seg = throw_segment(seg_id, motor, w_out, geo['target'],
+                        ramp_out or THROW_RAMP_OUT_RAD_S2, n_throws, hold_level,
+                        level_rate, settle_s, r, hold_ramp, THROW_ZERO_HOLD_S,
+                        THROW_HOLD_KP_OUT if motor == 'output' else 0.0)
+    seg['_geo'] = geo
+    return seg
+
+
+
+def plan_constant_speed(seg_id, motor, rpm_in, allowance, cfg, notes, cycles_cap,
+                        tally=None, **throw_kw):
+    """A no-load constant-speed traverse: a throw where one can hold the speed,
+    else the position shuttle it used to be. `tally` (a dict) counts which."""
+    seg = plan_throw(seg_id, motor, rpm_in, cfg, notes, **throw_kw)
+    kind = 'throw'
+    if seg is not None:
+        seg.pop('_geo', None)
+    else:
+        kind = 'shuttle'
+        seg = plan_shuttle(seg_id, motor, rpm_in, allowance, cfg, notes, cycles_cap)
+    if seg and tally is not None:
+        tally.setdefault(kind, []).append(rpm_in)
+    return seg
+
+
+def tally_note(tally, cfg, motor):
+    """One line saying which speeds were thrown and which shuttled, and why."""
+    thrown, shuttled = tally.get('throw', []), tally.get('shuttle', [])
+    if not (thrown or shuttled):
+        return None
+    line = (f'{len(thrown)} speed(s) as THROWS (velocity-mode {motor} drive, turnaround '
+            f'fired on the live output angle)' if thrown else 'no speed could be thrown')
+    if shuttled:
+        line += (f'; {", ".join(str(x) for x in shuttled)} rpm stay position shuttles '
+                 '(too little constant-speed travel to throw)' if USE_THROW else
+                 '; throws are off (USE_THROW), all position shuttles')
+    return line
+
+
 def alternating(step, top):
     """+step, -step, +2step, -2step ... Alternating the load sign between
     cycles cancels creep drift (plan §4)."""
@@ -881,7 +1082,20 @@ def build_efficiency(cfg, shakedown, alternate, rpm_cap, cycles_cap, torque_scal
         # per cycle, so every segment carries exactly one cycle of drift and the
         # throw solve below is the same at every speed.
         per_cycle = rpm >= EFF_RECENTRE_PER_CYCLE_RPM and not bwd
-        if bwd:
+        geo = (throw_geometry(motor, rpm * RPM / r, cfg)
+               if USE_THROW and (USE_THROW_OUTPUT_DRIVE or not bwd) else None)
+        thrown = bool(geo) and geo['plateau'] >= THROW_MIN_PLATEAU_RAD
+        amp = None
+        if thrown:
+            # A throw turns on the live OUTPUT angle, so creep cannot walk it
+            # toward the window and the amplitude is not spent on a creep budget.
+            n_thr, per = throw_count(geo, rpm * RPM / r)
+            notes.append(f'E{rpm:04d}: THROW +/-{geo["target"]:.2f} rad, {n_thr} throws, '
+                         f'{min(per.values()):.1f} s at constant speed each way '
+                         f'(ramp {geo["ramp"]:.2f} rad, stop {geo["stop"] + geo["extra"]:.2f} '
+                         f'rad, window reach {geo["window_reach"]:.2f} of '
+                         f'{cfg["half_window"]:g})')
+        elif bwd:
             # The commanded shaft IS the one the window watches, so the throw
             # is not spent on a creep budget. See the docstring.
             amp, drift = None, 0.0
@@ -889,7 +1103,7 @@ def build_efficiency(cfg, shakedown, alternate, rpm_cap, cycles_cap, torque_scal
             lo_cap, lo_over = overshoot_capped_amplitude('output', w_out, 0.0)
             top = max(abs(float(v)) for v in levels) if levels else 0.0
             hi_cap, hi_over = overshoot_capped_amplitude('output', w_out, top)
-            notes.append(f'E{rpm:04d}: throw +/-{min(OUTPUT_END_RAD, hi_cap):.3f} rad at '
+            notes.append(f'E{rpm:04d}: shuttle +/-{min(OUTPUT_END_RAD, hi_cap):.3f} rad at '
                          f'{top:g} Nm to +/-{min(OUTPUT_END_RAD, lo_cap):.3f} at 0 Nm '
                          f'(overshoot {hi_over:.3f} / {lo_over:.3f}) -- back-driving, '
                          'creep lands on the input and cannot walk the window; what '
@@ -899,7 +1113,7 @@ def build_efficiency(cfg, shakedown, alternate, rpm_cap, cycles_cap, torque_scal
             amp, drift = efficiency_amplitude(levels, cfg, allowance,
                                               recentre=EFF_RECENTRE_BETWEEN_LEVELS,
                                               cycles=1)
-            notes.append(f'E{rpm:04d}: throw +/-{amp:.2f} rad output'
+            notes.append(f'E{rpm:04d}: shuttle +/-{amp:.2f} rad output'
                          + ('' if amp >= OUTPUT_END_RAD - 1e-9 else
                             f' (cut from {OUTPUT_END_RAD:g} to leave room for '
                             f'{drift:.2f} rad of creep in one cycle)'))
@@ -934,6 +1148,21 @@ def build_efficiency(cfg, shakedown, alternate, rpm_cap, cycles_cap, torque_scal
             # Aiming the first leg down-drift only buys anything where creep
             # eats the window, which is the forward case only.
             amp_sign = 1 if bwd else (1 if level >= 0 else -1) * INPUT_SIGN
+            if thrown:
+                seg = plan_throw(sid, motor, rpm, cfg, notes,
+                                 hold_level=level * level_scale,
+                                 level_rate=round(50.0 * level_scale, 4),
+                                 settle_s=1.0,
+                                 n_throws=2 if shakedown else None,
+                                 hold_ramp=THROW_HOLD_RAMP_OUT_NM_S * level_scale)
+                if seg is not None:
+                    seg.pop('_geo', None)
+                    # No recentre: a throw turns on the live output angle, so
+                    # nothing drifts, and the next one starts from wherever this
+                    # one ended (the behavior flips direction at an edge). The
+                    # slip reference is re-zeroed at the end of every throw.
+                    segs.append(seg)
+                    continue
             seg = plan_shuttle(sid, motor, rpm, allowance, cfg, notes,
                                cycles_cap, amp_cap=amp, amp_sign=amp_sign,
                                torque_out=level,
@@ -978,19 +1207,41 @@ def build_efficiency(cfg, shakedown, alternate, rpm_cap, cycles_cap, torque_scal
         notes.append('  power flows output -> input on the resisting half of each '
                      'traverse; bin on those, exactly as forward does')
     else:
-        notes.append(f'each shuttle starts toward its own creep direction (INPUT_SIGN '
-                     f'{INPUT_SIGN:+d}), so the peak that eats the window is reached at a '
-                     'quarter of the level instead of three quarters -- worth half a '
-                     "level's drift. CHECK THE SIGN at the bench")
+        if any(sg['pattern'] == 'sawtooth' for sg in segs):
+            notes.append(f'each shuttle starts toward its own creep direction (INPUT_SIGN '
+                         f'{INPUT_SIGN:+d}), so the peak that eats the window is reached at a '
+                         'quarter of the level instead of three quarters -- worth half a '
+                         "level's drift. CHECK THE SIGN at the bench")
     fast = [x for x in rpms if x >= EFF_RECENTRE_PER_CYCLE_RPM]
-    if fast and not bwd:
+    if fast and not bwd and any(sg['pattern'] == 'sawtooth' for sg in segs):
         notes.append(f'{EFF_RECENTRE_PER_CYCLE_RPM} rpm and above ({", ".join(str(x) for x in fast)}): '
-                     'one segment PER CYCLE, each with its own recentre. Creep per cycle '
-                     'does not fall with speed -- it is a ratio of rolling distance -- and '
-                     'those levels need 3 to 7 cycles each, so left whole they drift '
-                     'metres past the window')
-    if EFF_RECENTRE_BETWEEN_LEVELS:
-        notes.append(f'a recentre after every level: input drives the output back to '
+                     'shuttled speeds are one segment PER CYCLE, each with its own recentre. '
+                     'Creep per cycle does not fall with speed -- it is a ratio of rolling '
+                     'distance -- and those levels need 3 to 7 cycles each, so left whole '
+                     'they drift metres past the window')
+    if any(sg['pattern'] == 'throw' for sg in segs):
+        notes.append('THROWS: velocity-mode drive at the test speed, turnaround fired on the live '
+                     f'OUTPUT angle at +/-{OUTPUT_END_RAD:g} rad (abort window '
+                     f'+/-{cfg["half_window"]:g}); the holding shaft keeps ONE torque sign for '
+                     'the whole segment, so each level sees both rotation senses and the +/- '
+                     'level pairs cover all four quadrants. Only the constant-speed part of '
+                     'each throw is flagged in the log. Hold torque ramps '
+                     f'{THROW_HOLD_RAMP_OUT_NM_S:g} Nm/s (output-referred) to 0 after every '
+                     f'segment, holds 0 Nm {THROW_ZERO_HOLD_S:g} s, then ramps to the next '
+                     'level: levels never step through a resting edge'
+                     + (f'; the output angle is held by an outer loop (kp {THROW_HOLD_KP_OUT:g} /s) '
+                        'through those ramps' if THROW_HOLD_KP_OUT else '')
+                     + '. NO recentres between throw '
+                     'segments; the slip reference (and so the creep leg) is re-zeroed '
+                     'at the end of every throw')
+        if bwd:
+            notes.append('  BACK-DRIVE throws are driven by the OUTPUT (absorber) velocity loop, '
+                         'which the design doc measured as underdamped (overshoot 60-120 % at '
+                         '0.5-1 rad/s, ripple 13-33 % of command at low speed); the turnaround '
+                         'is sized against its measured stop lag, not the config decel. Judge '
+                         'the low-speed plateaus by their ripple before trusting them')
+    if EFF_RECENTRE_BETWEEN_LEVELS and any(sg['pattern'] == 'recentre' for sg in segs):
+        notes.append(f'a recentre after every shuttled level: input drives the output back to '
                      f'centre within {RECENTRE_PARAMS["tolerance_rad"]:g} rad, '
                      f'{RECENTRE_PARAMS["velocity_rad_s"]:g} rad/s input, '
                      f'{RECENTRE_PARAMS["timeout_s"]:g} s timeout. Where the output is '
@@ -1025,11 +1276,25 @@ def build_plans(cfg, shakedown, include_backdrive=False):
     notes = []
     segs = []
     for seg_id, w_out in (('SLOW', 0.05), ('FAST', 0.15)):
-        segs.append(shuttle_segment(seg_id, 'input', w_out * r, OUTPUT_END_RAD * r,
-                                    GRAVITY_ACCEL_OUT * r, 1 if shakedown else 2))
-    notes.append(f'input shuttle +/-{OUTPUT_END_RAD * r:.1f} rad '
-                 f'(= +/-{OUTPUT_END_RAD} rad output) at {0.05 * r:.2f} and '
-                 f'{0.15 * r:.2f} rad/s input, output 0 Nm')
+        # Throws: constant speed the whole way, with the output at 0 Nm. Four
+        # throws = the range walked twice each way (the first only covers half).
+        thr = plan_throw(seg_id, 'input', w_out * r / RPM, cfg, notes,
+                         ramp_out=GRAVITY_ACCEL_OUT, n_throws=3 if shakedown else 4)
+        if thr is not None:
+            thr.pop('_geo', None)
+            segs.append(thr)
+        else:
+            segs.append(shuttle_segment(seg_id, 'input', w_out * r, OUTPUT_END_RAD * r,
+                                        GRAVITY_ACCEL_OUT * r, 1 if shakedown else 2))
+    if all(sg['pattern'] == 'throw' for sg in segs):
+        notes.append(f'input THROWS at {0.05 * r:.2f} and {0.15 * r:.2f} rad/s input '
+                     f'({0.05:g} / {0.15:g} rad/s output), output 0 Nm, ramp '
+                     f'{GRAVITY_ACCEL_OUT:g} rad/s^2, turnaround +/-'
+                     f'{segs[0]["params"]["target_rad"]:g} rad from the live output angle')
+    else:
+        notes.append(f'input shuttle +/-{OUTPUT_END_RAD * r:.1f} rad '
+                     f'(= +/-{OUTPUT_END_RAD} rad output) at {0.05 * r:.2f} and '
+                     f'{0.15 * r:.2f} rad/s input, output 0 Nm')
     notes.append('input-driven rescript of the plan §1 gravity map: reads gravity '
                  '+ forward drag, not gravity + back-drive drag')
     plans.append(('GRAV', {'name': 'archimedes_fwd_gravity_map', 'segments': segs},
@@ -1116,13 +1381,11 @@ def build_plans(cfg, shakedown, include_backdrive=False):
     # already-slipping contact to a free-spin at 155 rad/s of input, and nothing
     # on the rig stopped it -- the operator E-stopped it.
     #
-    # A ratio-break safety DOES now exist (`safeties.ratio_break` /
-    # `ratio_slip`, both resumable), so that specific hole is closed in
-    # principle. This is still one ramp, because whether it is closed in
-    # PRACTICE depends on the limits those two entries are set to, and they are
-    # currently far wider than the comments next to them argue for -- see the
-    # note this plan prints. Give it more ramps (the back-drive plans take
-    # --bwd-ramps) once a slip has been watched to trip them.
+    # The creep safeties (`safeties.creep_over` / `creep_under`, resumable) now
+    # close that specific hole in principle: an input runaway on a locked output
+    # trips them at a few rad of input -- see the note this plan prints. This is
+    # still one ramp until a slip has been watched to trip them. Give it more
+    # ramps (the back-drive plans take --bwd-ramps) after that.
     segs = [
         breakaway_segment('SLIP', 'input', ceiling_in, round(rate_in, 4),
                           release_s=0.05, rest_s=3.0, bipolar=False,
@@ -1148,8 +1411,8 @@ def build_plans(cfg, shakedown, include_backdrive=False):
                      f'up to {OUTPUT_TORQUE_CAP_NM:g} Nm output", which is a result')
     notes.append('  the window, both velocity safeties and both torque safeties all stay '
                  'happy through a forward slip: the output stays put and the input spins. '
-                 'The ratio-break safeties are the only ones that can see it')
-    notes += ratio_break_notes(cfg)
+                 'The creep safeties are the only ones that can see it')
+    notes += slip_safety_notes(cfg)
     if T_SLIP_OUT_NM:
         notes.append(f'ceiling is {SLIP_CEILING_MARGIN:g} x the measured slip '
                      f'({ceiling_out:.0f} Nm output), not the '
@@ -1218,16 +1481,20 @@ def build_plans(cfg, shakedown, include_backdrive=False):
     # caps those at 600 rpm).
     notes, segs = [], []
     rpms = [30, 150, 300] if shakedown else [x for x in VEL_RAMP_RPM if x <= rpm_cap]
+    tally = {}
     for rpm in rpms:
-        seg = plan_shuttle(f'V{rpm:04d}', 'input', rpm, TRIP_ALLOWANCE_RAD['no_load'],
-                           cfg, notes, cycles_cap)
+        seg = plan_constant_speed(f'V{rpm:04d}', 'input', rpm, TRIP_ALLOWANCE_RAD['no_load'],
+                                  cfg, notes, cycles_cap, tally, n_throws=2 if shakedown else None)
         if seg:
             segs.append(seg)
-            if VEL_RECENTRE_BETWEEN_SPEEDS:
+            if VEL_RECENTRE_BETWEEN_SPEEDS and seg['pattern'] != 'throw':
                 segs.append(recentre_segment(seg['id'] + '_RC'))
+    if tally_note(tally, cfg, 'input'):
+        notes.append(tally_note(tally, cfg, 'input'))
     notes.append('torque ripple is reported from the <=600 rpm points only (plan §6)')
-    if VEL_RECENTRE_BETWEEN_SPEEDS:
-        notes.append(f'a recentre after every speed ({len(rpms)} of them): the output goes '
+    n_rc = sum(1 for sg in segs if sg['pattern'] == 'recentre')
+    if VEL_RECENTRE_BETWEEN_SPEEDS and n_rc:
+        notes.append(f'a recentre after every shuttled speed ({n_rc} of them): the output goes '
                      f'back to centre within {RECENTRE_PARAMS["tolerance_rad"]:g} rad '
                      'before the next one starts, so tracking error does not accumulate '
                      'down the sweep and a trip resumes that speed from centre')
@@ -1298,27 +1565,33 @@ def build_backdrive_plans(cfg, shakedown):
     # numbers (30 rpm steps to 300, then 300 rpm steps to 3600) read at the input.
     notes, segs = [], []
     rpms = [30, 150, 300] if shakedown else [x for x in VEL_RAMP_RPM if x <= rpm_cap]
+    tally = {}
     for rpm in rpms:
-        seg = plan_shuttle(f'V{rpm:04d}', 'output', rpm, TRIP_ALLOWANCE_RAD['backdrive'],
-                           cfg, notes, cycles_cap)
+        seg = plan_constant_speed(f'V{rpm:04d}', 'output', rpm, TRIP_ALLOWANCE_RAD['backdrive'],
+                                  cfg, notes, cycles_cap, tally, n_throws=2 if shakedown else None)
         if seg:
             segs.append(seg)
-            if VEL_RECENTRE_BETWEEN_SPEEDS:
+            if VEL_RECENTRE_BETWEEN_SPEEDS and seg['pattern'] != 'throw':
                 segs.append(recentre_segment(seg['id'] + '_RC'))
+    if tally_note(tally, cfg, 'output'):
+        notes.append(tally_note(tally, cfg, 'output'))
     top = max(rpms) if rpms else 0
-    notes.append(f'output position-commanded, input at 0 Nm. Speeds are INPUT-referred: '
+    notes.append(f'output driven (throws where they fit), input at 0 Nm. Speeds are INPUT-referred: '
                  f'{min(rpms) if rpms else 0}-{top} rpm input = '
                  f'{min(rpms) * RPM / r if rpms else 0:.3f}-{top * RPM / r:.2f} rad/s at '
                  'the output')
     notes.append(f'  top speed puts {top * RPM:.0f} rad/s on the input (limit '
                  f'{cfg["limits"]["input"]["velocity"]:g}) and {top * RPM / r:.1f} rad/s on '
                  f'the output (limit {cfg["limits"]["output"]["velocity"]:g})')
-    notes.append('  the input is dragged at 43x the output corner acceleration, which is '
-                 'what caps the high-speed corners here -- see any drag note above')
+    if tally.get('shuttle'):
+        notes.append('  shuttled speeds: the input is dragged at 43x the output corner '
+                     'acceleration, which is what caps the high-speed corners here -- '
+                     'see any drag note above')
     notes.append('also the back-drive torque-ripple source; same <=600 rpm limit (plan '
                  'section 6)')
-    if VEL_RECENTRE_BETWEEN_SPEEDS:
-        notes.append(f'a recentre after every speed ({len(rpms)} of them). The recentre '
+    n_rc = sum(1 for sg in segs if sg['pattern'] == 'recentre')
+    if VEL_RECENTRE_BETWEEN_SPEEDS and n_rc:
+        notes.append(f'a recentre after every shuttled speed ({n_rc} of them). The recentre '
                      'drives the INPUT in velocity mode, so it also leaves the input out '
                      'of the torque mode this plan runs it in -- which is what makes the '
                      'next segment re-zero its own position frame cleanly')
@@ -1372,8 +1645,8 @@ def build_backdrive_plans(cfg, shakedown):
                      'ceiling, bring it down and re-run')
     notes.append('  back-driving it is the OUTPUT that runs away, so the position window '
                  'catches this one on its own -- unlike the forward slip, where the '
-                 'output stays put and only the ratio-break channels can see it')
-    notes += ratio_break_notes(cfg)
+                 'output stays put and only the creep safeties can see it')
+    notes += slip_safety_notes(cfg)
     plans.append((BACKDRIVE_TAG + 'SLIP',
                   {'name': 'archimedes_bwd_slip', 'segments': segs}, notes))
 
@@ -1430,23 +1703,6 @@ def build_backdrive_plans(cfg, shakedown):
     return plans
 
 
-def build_megabatch(plans, name):
-    """Every forward plan's segments concatenated, in run order, as one recipe.
-
-    Segment ids are prefixed with the plan's tag so the run log and the trace
-    filenames still say which test each segment came from. Nothing else about a
-    segment changes, so the megabatch runs exactly what the individual plans run
-    -- which is why the window margin below is taken from the parts rather than
-    re-derived over a two-hour expansion."""
-    segs = []
-    for tag, recipe, _ in plans:
-        if not recipe:
-            continue
-        for seg in recipe['segments']:
-            segs.append(dict(seg, id=f'{tag}_{seg["id"]}'))
-    return {'name': name, 'segments': segs}
-
-
 # --- checks ------------------------------------------------------------------------
 
 def window_margin(test_file, cfg, max_cycles=50_000_000):
@@ -1489,6 +1745,11 @@ def write_plan(recipe, notes, cfg, tests_dir):
           f'{len(recipe["segments"])} segment(s))')
     print(f'  window: worst |x| + stop distance {worst:.3f} rad '
           f'vs {cfg["half_window"]:g}  {flag}')
+    n_throw = sum(1 for sg in recipe['segments'] if sg.get('pattern') == 'throw')
+    if n_throw:
+        print(f'  ({n_throw} throw segment(s): the expansion has no output encoder, so this '
+              'figure covers the shuttles only.\n   A throw is held inside the window by its '
+              'own load-time reach check, which validate_segment / TestManager ran above)')
     for n in notes:
         print(f'  {n}')
     return test_file, worst, duration, flag == 'OK'
@@ -1603,6 +1864,8 @@ OVERRIDES = {
     'eff_slip_margin': 'EFF_SLIP_MARGIN',
     'vel_rpm': 'VEL_RAMP_RPM',
     'throw': 'OUTPUT_END_RAD',
+    'hold_ramp': 'THROW_HOLD_RAMP_OUT_NM_S',
+    'hold_kp': 'THROW_HOLD_KP_OUT',
     'peak_target': 'PEAK_TARGET_RAD',
     'overshoot_margin': 'OVERSHOOT_MARGIN_RAD',
     'overshoot_lag': 'OVERSHOOT_LAG_S',
@@ -1626,6 +1889,11 @@ def apply_overrides(args):
         was = globals()[const]
         globals()[const] = value
         changed.append(f'{const}: {was!r} -> {value!r}')
+    # A per-unit table rather than a scalar, so it cannot go through OVERRIDES.
+    eff_max = getattr(args, 'eff_max', UNSET)
+    if not isinstance(eff_max, _Unset):
+        changed.append(f'EFF_MAX_OUT_NM[{UNIT!r}]: {EFF_MAX_OUT_NM[UNIT]!r} -> {eff_max!r}')
+        EFF_MAX_OUT_NM[UNIT] = eff_max
     return changed
 
 
@@ -1643,9 +1911,13 @@ def main():
                          'unit is not back-driving well enough to test that way)')
     ap.add_argument('--backdrive-only', action='store_true',
                     help='write ONLY the output-driven plans (implies '
-                         '--include-backdrive and --no-megabatch)')
-    ap.add_argument('--no-megabatch', action='store_true',
-                    help='skip the combined all-forward-tests plan')
+                         '--include-backdrive)')
+
+    ap.add_argument('--start-at', action='append', default=[], metavar='PLAN:SEGMENT',
+                    help='also write a copy of PLAN that begins at SEGMENT, to resume '
+                         'a long run without repeating what already ran, e.g. '
+                         '--start-at fwd_efficiency_alt:E1500_P75 writes '
+                         'archimedes_fwd_efficiency_alt_from_E1500_P75. Repeatable')
 
     g = ap.add_argument_group(
         'parameter overrides',
@@ -1655,13 +1927,16 @@ def main():
                    help=f'unit under test (default {UNIT})')
     g.add_argument('--slip-torque', default=UNSET, type=_opt_float, metavar='NM',
                    help='measured output-referred static slip torque, or "none" to '
-                        f'go back to the provisional figure (default {T_SLIP_OUT_NM:g})')
+                        f'go back to the provisional figure (default {T_SLIP_OUT_NM})')
     g.add_argument('--creep-onset', default=UNSET, type=_opt_float, metavar='NM',
                    help=f'output torque where measurable creep starts (default '
                         f'{T_CREEP_ONSET_OUT_NM:g})')
     g.add_argument('--output-cap', default=UNSET, type=float, metavar='NM',
                    help=f"customer's hard output torque limit (default "
                         f'{OUTPUT_TORQUE_CAP_NM:g})')
+    g.add_argument('--eff-max', default=UNSET, type=float, metavar='NM',
+                   help=f'top output torque of the efficiency sweep for --unit '
+                        f'(default {EFF_MAX_OUT_NM[UNIT]:g}); still clipped by --output-cap')
     g.add_argument('--eff-rpm', default=UNSET, type=_rpm_list, metavar='LIST',
                    help='efficiency input speeds, comma separated (default '
                         f'{",".join(str(x) for x in EFF_RPM)})')
@@ -1676,6 +1951,12 @@ def main():
     g.add_argument('--throw', default=UNSET, type=float, metavar='RAD',
                    help=f'output half-throw each traverse ends at (default '
                         f'{OUTPUT_END_RAD:g}; the window is read from the config)')
+    g.add_argument('--hold-ramp', default=UNSET, type=float, metavar='NM_S',
+                   help='throw hold-torque ramp, output-referred Nm/s, to and from zero '
+                        f'between segments (default {THROW_HOLD_RAMP_OUT_NM_S:g})')
+    g.add_argument('--hold-kp', default=UNSET, type=float, metavar='PER_S',
+                   help='output-drive throws: position-hold gain through the hold-torque '
+                        f'ramps, 1/s, 0 = velocity 0 (default {THROW_HOLD_KP_OUT:g})')
     g.add_argument('--input-sign', default=UNSET, type=int, choices=(1, -1),
                    help='which way the output moves for a positive input command '
                         f'(default {INPUT_SIGN:+d})')
@@ -1725,7 +2006,6 @@ def main():
     args = ap.parse_args()
     if args.backdrive_only:
         args.include_backdrive = True
-        args.no_megabatch = True
     changed = apply_overrides(args)
     if changed:
         print('OVERRIDES (this run only, the file is unchanged):')
@@ -1758,11 +2038,26 @@ def main():
     else:
         plans = build_plans(cfg, args.shakedown, args.include_backdrive)
 
+    for spec in args.start_at:
+        plan_name, _, seg_id = spec.partition(':')
+        want = 'archimedes_' + plan_name + ('_shakedown' if args.shakedown else '')
+        match = [(t_, r_) for t_, r_, _ in plans if r_ and r_['name'] == want]
+        if not match or not seg_id:
+            sys.exit(f'--start-at {spec!r}: want PLAN:SEGMENT with PLAN one of '
+                     + ', '.join(r_['name'][len("archimedes_"):] for _, r_, _ in plans if r_))
+        tag_, recipe_ = match[0]
+        ids = [sg['id'] for sg in recipe_['segments']]
+        if seg_id not in ids:
+            sys.exit(f'--start-at {spec!r}: {want} has no segment {seg_id!r}')
+        k = ids.index(seg_id)
+        plans.append((tag_ + '_FROM', {
+            'name': f'{want}_from_{seg_id}', 'segments': recipe_['segments'][k:]},
+            [f'RESUME COPY of {want}: skips the first {k} of {len(ids)} segments and '
+             f'begins at {seg_id}. Segments are independent (torque restarts at 0 in '
+             'every throw segment), so it runs exactly what the full plan would from here']))
+
     failed = False
     written = []
-    forward = []
-    total_s = 0.0
-    worst_all = 0.0
     for tag, recipe, notes in plans:
         if recipe is None:            # a speed the window could not fit
             for n in notes:
@@ -1775,59 +2070,6 @@ def main():
         test_file, worst, duration, ok = result
         failed |= not ok
         written.append(test_file)
-        dropped = MEGABATCH_EXCLUDE + (
-            'EFF_ALT' if MEGABATCH_EFFICIENCY == 'pos' else 'EFF_POS',)
-        if not tag.startswith(BACKDRIVE_TAG) and tag not in dropped:
-            forward.append((tag, recipe, notes))
-            total_s += duration
-            worst_all = max(worst_all, worst)
-
-    if not args.bench and not args.no_megabatch and forward:
-        name = 'archimedes_fwd_megabatch' + ('_shakedown' if args.shakedown else '')
-        mega = build_megabatch(forward, name)
-        issues = [f'{s["id"]}: {i}' for s in mega['segments']
-                  for i in test_builder.validate_segment(s, cfg['limits'])]
-        if issues:
-            failed = True
-            print(f'\n{name}: NOT WRITTEN')
-            for i in issues:
-                print(f'  {i}')
-        else:
-            test_file = test_builder.save_test(mega, tests_dir)
-            written.append(test_file)
-            # Load-only check: TestManager parses the plan and every behavior
-            # expands, capped so a two-hour timeline never has to be held in
-            # memory. Window and duration are the parts' -- the megabatch is
-            # their concatenation, segment for segment.
-            window_margin(test_file, cfg, max_cycles=MEGABATCH_CHECK_CYCLES)
-            flag = 'OK' if worst_all <= cfg['half_window'] else 'TRIPS'
-            failed |= flag != 'OK'
-            print(f'\n{test_file}  ({total_s / 60:.1f} min, '
-                  f'{len(mega["segments"])} segment(s))')
-            print(f'  window: worst |x| + stop distance {worst_all:.3f} rad '
-                  f'vs {cfg["half_window"]:g}  {flag}  (max over the parts)')
-            print('  ' + ' -> '.join(tag for tag, _, _ in forward))
-            print('  every forward test back to back, one selection; the individual '
-                  'plans above run the same segments if you need to split it')
-            for tag in MEGABATCH_EXCLUDE:
-                why = MEGABATCH_EXCLUDE_REASON.get(tag, 'excluded by MEGABATCH_EXCLUDE')
-                left = [r['name'] for t_, r, _ in plans if t_ == tag and r]
-                for name in left:
-                    print(f'  NOT in the batch: {name} -- {why}. Run it on its own, '
-                          'watching, afterwards')
-            other = 'EFF_ALT' if MEGABATCH_EFFICIENCY == 'pos' else 'EFF_POS'
-            why = ('all four quadrants' if MEGABATCH_EFFICIENCY == 'alt'
-                   else 'half the time, one rotation sense')
-            for name in [r['name'] for t_, r, _ in plans if t_ == other and r]:
-                print(f'  NOT in the batch: {name} -- the batch carries the '
-                      f'{MEGABATCH_EFFICIENCY!r} variant ({why}). Flip '
-                      'MEGABATCH_EFFICIENCY to swap them; running both would measure '
-                      'efficiency twice')
-            print('  duration is a LOWER bound wherever recentres are involved: the '
-                  'expansion has no\n  sensor, so every recentre takes its '
-                  f'"nothing to do" path and costs {RECENTRE_PARAMS["settle_s"]:g} s. On '
-                  f'the rig each one that has to move adds up to\n  '
-                  f'{RECENTRE_PARAMS["timeout_s"]:g} s more')
 
     if not args.bench:
         # A back-drive-only run has not written the forward plans and must not

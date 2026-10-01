@@ -114,6 +114,49 @@ check(abs(s['peak_rel']) > 1.0 + 0.02 and s['travel'] > s['predicted_travel'] + 
       'a fitted decel above the plant overshoots the target, and the record shows '
       f"travel {s['travel']:.3f} vs predicted {s['predicted_travel']:.3f}")
 
+print('--- stop lag (travel grows linearly with speed) ---')
+LAG_RIG = {'window_enabled': True, 'half_window': HALF_WINDOW, 'window_decel': 70.0,
+           'stop_decel': {'output': 70.0, 'input': 70.0}, 'stop_lag': {'output': 0.06}}
+for speed in (0.7, 2.0, 4.0):
+    p = Plant(true_lag=0.06)
+    beh = make(p, rig=LAG_RIG, speed_rad_s=speed, ramp_accel=40.0, target_rad=1.0)
+    run(beh, p)
+    check(len(beh.stops) == 4 and all(abs(abs(s['peak_rel']) - 1.0) < 0.03
+                                      for s in beh.stops),
+          f'{speed:g} rad/s: lag stop lands on target at every speed: '
+          + ', '.join('%+.3f' % s['peak_rel'] for s in beh.stops))
+# A constant decel fitted at the fast end (a_eff rises with speed under a PI
+# velocity loop) under-predicts the slow stops, so they turn late.
+q = Plant(true_lag=0.06)
+slow = make(q, speed_rad_s=0.7, ramp_accel=40.0, stop_decel_rad_s2=4.0 / (2 * 0.06))
+run(slow, q)
+check(all(abs(s['peak_rel']) > 1.02 for s in slow.stops),
+      'a constant decel fitted at speed turns a slow throw late (the lag does not): '
+      + ', '.join('%+.3f' % s['peak_rel'] for s in slow.stops))
+p = Plant(true_lag=0.06)
+beh = make(p, rig=LAG_RIG, speed_rad_s=3.0)
+run(beh, p)
+s = beh.stops[0]
+check(abs(s['travel'] - s['predicted_travel']) < 0.01,
+      f"the stop record predicts the lag travel ({s['travel']:.3f} vs {s['predicted_travel']:.3f})")
+check(refuses(rig={'window_enabled': False, 'stop_decel': {'output': None},
+                   'stop_lag': {'output': 0.06}}) is None,
+      'a lag alone is enough: no constant decel needed for the drive')
+check(refuses(rig={'window_enabled': False, 'stop_decel': {'output': None},
+                   'stop_lag': {}}) is not None,
+      'neither a decel nor a lag refuses the plan')
+p = Plant(true_decel=70.0)
+beh = make(p, rig=LAG_RIG, stop_decel_rad_s2=70.0)
+run(beh, p)
+check(beh.stop_lag is None and beh.stop_decel == 70.0,
+      'a stop_decel_rad_s2 setting (calibration) wins over the rig lag')
+beh = make(Plant(), rig=LAG_RIG)
+check(beh.stop_lag == 0.06 and beh.stop_decel is None,
+      'a rig lag replaces the constant decel for that drive')
+check(make(Plant(drive='input'), rig=LAG_RIG, drive_motor='input',
+           speed_rad_s=3.0 * RATIO).stop_lag is None,
+      'the lag is per drive: the input keeps its constant decel')
+
 print('--- ratio reset ---')
 p = Plant()
 beh = make(p)
@@ -181,6 +224,78 @@ for c in beh.commands():
     seen.append(beh.repeat)
 check(beh.repeats == 5 and max(seen) == 5 and seen == sorted(seen),
       f'repeats={beh.repeats}, repeat climbs 1..{max(seen)}')
+
+print('--- hold torque meets zero between segments ---')
+p = Plant()
+beh = make(p, n_throws=3, hold_level=4.0, hold_ramp_nm_s=20.0, zero_hold_s=0.1)
+cmds = run(beh, p)
+hold = [c['input_command'] for c in cmds]           # output drives, input holds
+speed = [c['output_command'] for c in cmds]
+first_move = next(i for i, v in enumerate(speed) if v != 0.0)
+last_move = max(i for i, v in enumerate(speed) if v != 0.0)
+check(hold[0] == 0.0 and abs(hold[first_move - 1] - 4.0) < 1e-9,
+      'torque starts at 0 and has reached the level before the first motion')
+check(abs(max(abs(b - a) for a, b in zip(hold, hold[1:])) - 20.0 * beh.dt) < 1e-6,
+      f'torque never changes faster than the ramp ({20.0 * beh.dt:.4f} Nm/cycle)')
+check(all(abs(h - 4.0) < 1e-9 for h in hold[first_move:last_move]),
+      'torque is constant through the throws')
+tail = hold[last_move + 1:]
+check(abs(tail[-1]) < 1e-9 and len(tail) >= int(0.1 / beh.dt) and tail[-int(0.1 / beh.dt):] == [0.0] * int(0.1 / beh.dt),
+      'ends ramped to 0 with the zero-torque hold')
+check(all(c['ratio_reset'] for c in cmds if c.get('ratio_reset')), 'ratio resets still happen at every stop')
+check(sum(1 for c in cmds if c.get('ratio_reset')) == 3, 'one ratio_reset per throw')
+
+print('--- position hold through the torque ramps ---')
+
+
+class Walker(Plant):
+    """Plant whose shaft walks OPPOSITE to any change in the hold torque, by
+    `walk` rad per Nm of the holding (input) motor. 0.0115 is the LOAD AKD's
+    measured rad per OUTPUT Nm; here it is applied per hold Nm, which only
+    sets the scale of the disturbance (0.23 rad/s at the 20 Nm/s ramp)."""
+
+    def __init__(self, walk, **kw):
+        super().__init__(**kw)
+        self.walk, self.last = walk, 0.0
+
+    def step(self, cmd):
+        super().step(cmd)
+        hold = cmd['input_command']
+        self.pos -= self.walk * (hold - self.last)
+        self.last = hold
+
+
+def ramp_walk(kp):
+    p = Walker(0.0115, drive='output')
+    beh = make(p, n_throws=2, hold_level=12.0, hold_ramp_nm_s=20.0, zero_hold_s=0.3,
+               hold_position_kp=kp)
+    worst = 0.0
+    for c in beh.commands():
+        p.step(c)
+        if c['input_command'] != 12.0 and beh.repeat == 2:
+            worst = max(worst, abs(p.pos - p.centre - beh.stops[-1]['rest_rel']))
+    return worst, beh
+
+
+w0, _ = ramp_walk(0.0)
+w4, beh4 = ramp_walk(4.0)
+check(w0 > 0.05, f'without the hold the shaft walks off the turnaround ({w0:.3f} rad)')
+check(w4 < 0.6 * w0, f'kp 4 /s cuts the walk to {w4:.3f} rad (vs {w0:.3f})')
+check(abs(beh4.stops[-1]['rest_rel']) > 0.9, 'turnaround still lands on the target with the hold on')
+
+p = Plant()
+cmds = run(make(p, n_throws=2, hold_level=4.0, hold_ramp_nm_s=20.0, zero_hold_s=0.1,
+                hold_position_kp=4.0), p)
+check(abs(max(abs(c['output_command']) for c in cmds[:150])) < 1e-9,
+      'undisturbed shaft: the hold commands no speed (nothing to correct)')
+cmds = run(make(reader=Plant().reader(centre=None), n_throws=2, hold_level=4.0,
+                hold_ramp_nm_s=20.0, hold_position_kp=4.0))
+check(all(c['output_command'] == 0.0 for c in cmds), 'no feedback: still never commands motion')
+
+print('--- default (no ramp) is the original step ---')
+p = Plant()
+cmds = run(make(p, n_throws=2, hold_level=4.0), p)
+check(cmds[0]['input_command'] == 4.0, 'hold_ramp_nm_s = 0 commands the level at once')
 
 print('--- offline preview (no sensor_reader) ---')
 beh = make()

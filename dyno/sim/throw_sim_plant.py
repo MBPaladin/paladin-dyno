@@ -17,11 +17,15 @@ class Plant:
     shaft overshoot its command the way velocity_mode_6 did (3.0 -> 4.2)."""
 
     def __init__(self, drive='output', input_sign=1, centre=2.0, start_rel=0.0,
-                 true_decel=70.0, true_accel=1000.0, gain=1.0, dt=0.001):
+                 true_decel=70.0, true_accel=1000.0, gain=1.0, dt=0.001,
+                 true_lag=None):
         self.drive, self.sign, self.centre = drive, input_sign, centre
         self.pos = centre + start_rel
         self.v, self.true_decel, self.true_accel = 0.0, true_decel, true_accel
         self.gain, self.dt = gain, dt
+        # First-order braking (travel to rest = true_lag * v0), the shape of the
+        # output drive under a PI velocity loop; overrides true_decel.
+        self.true_lag = true_lag
         self.peak = abs(start_rel)
         self.frozen = False
 
@@ -34,8 +38,11 @@ class Plant:
             target = cmd['input_command'] * self.sign / RATIO
         target *= self.gain
         braking = abs(target) < abs(self.v) or target * self.v < 0
-        rate = (self.true_decel if braking else self.true_accel) * self.dt
-        self.v += max(-rate, min(rate, target - self.v))
+        if braking and self.true_lag:
+            self.v += (target - self.v) * min(1.0, self.dt / self.true_lag)
+        else:
+            rate = (self.true_decel if braking else self.true_accel) * self.dt
+            self.v += max(-rate, min(rate, target - self.v))
         self.pos += self.v * self.dt
         self.peak = max(self.peak, abs(self.pos - self.centre))
 
@@ -54,7 +61,8 @@ def make(plant=None, reader=None, rig=None, **settings):
          'ramp_accel': 100.0, 'n_throws': 4, 'settle_s': 0.05}
     s.update(settings)
     rig = rig or {'window_enabled': True, 'half_window': HALF_WINDOW,
-                  'window_decel': 70.0, 'stop_decel': {'output': 70.0, 'input': 70.0}}
+                  'window_decel': 70.0, 'stop_decel': {'output': 70.0, 'input': 70.0},
+                  'stop_lag': {}}
 
     class T(Throw):
         def _load_rig(self):

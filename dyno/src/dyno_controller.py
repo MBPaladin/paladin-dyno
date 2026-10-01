@@ -226,6 +226,22 @@ class Controller(Master):
         self.ratio_error_rad = math.nan
         self.ratio_slip_rad_s = math.nan
 
+        # Creep watch: the same slip, as a ratio of the distance rolled instead
+        # of an absolute angle. See _update_creep. Tunables are the top-level
+        # `creep_watch:` block of the rig config; absent keys keep the class
+        # defaults below.
+        creep_cfg = self.dyno_params.get('creep_watch') or {}
+        self._creep_min_travel_rad = float(
+            creep_cfg.get('min_travel_rad', self._CREEP_MIN_TRAVEL_RAD))
+        self._creep_lost_motion_rad = float(
+            creep_cfg.get('lost_motion_rad', self._CREEP_LOST_MOTION_RAD))
+        self._creep_reversal_rad = float(
+            creep_cfg.get('reversal_hysteresis_rad', self._CREEP_REVERSAL_RAD))
+        self._creep_leg = None
+        self.creep_over = math.nan
+        self.creep_under = math.nan
+        self.creep_ratio = math.nan
+
         self._aux_funcs = []
         if self.mode == 'actuator_production':
             self._aux_funcs.append(self._aux_func_A3_Dyno)
@@ -894,6 +910,19 @@ class Controller(Master):
     # quantisation does not dominate, short enough that a runaway is caught in
     # a tenth of a second once trip_samples is added on top.
     _RATIO_RATE_WINDOW_S = 0.05
+
+    # Creep-watch defaults (overridden by the config's `creep_watch:` block).
+    # Also read by stub controllers in the sim tests, which skip __init__.
+    _CREEP_MIN_TRAVEL_RAD = 0.25
+    _CREEP_LOST_MOTION_RAD = 0.05
+    _CREEP_REVERSAL_RAD = 0.02
+    _creep_min_travel_rad = _CREEP_MIN_TRAVEL_RAD
+    _creep_lost_motion_rad = _CREEP_LOST_MOTION_RAD
+    _creep_reversal_rad = _CREEP_REVERSAL_RAD
+    _creep_leg = None
+    creep_over = math.nan
+    creep_under = math.nan
+    creep_ratio = math.nan
 
     _FAULT_CLEAR_SETTLE_S = 0.5
 
@@ -1765,6 +1794,85 @@ class Controller(Master):
         self._ratio_rate_mark = None
         self.ratio_error_rad = math.nan
         self.ratio_slip_rad_s = math.nan
+        self._creep_leg = None
+        self.creep_over = math.nan
+        self.creep_under = math.nan
+        self.creep_ratio = math.nan
+
+    def _update_creep(self, x, err):
+        """Creep ratio of the current leg of travel, from the output angle `x`
+        and ratio error `err` (both since the reference was latched).
+
+        Creep is the report's definition, 1 - r * w_out / w_in (the customer's
+        creep-ratio section, analyzers/efficiency.py `_creep`), applied to the
+        travel of one leg instead of to mean speeds: with d_out the output
+        travel and d_in the input travel, creep = |1 - r * d_out / d_in|. It
+        divides by the OBSERVED input, so the input moving 1.0526 rad for an
+        expected 1.0000 reads 5.00 %. The ratio is the touch-off-measured one
+        (the report uses the no-load sweep's). It is measured per LEG -- a run of output motion in
+        one direction, from one reversal to the next -- and signed against the
+        motion, because that is what separates the physical cases:
+
+          over   input travels MORE than the ratio says. The input is driving
+                 and the output lags: the output torque opposes the motion
+                 (antagonism), or the contact is letting go under drive.
+          under  input travels LESS. The output is driving and the input lags:
+                 the output torque assists the motion (back-driving), or the
+                 input is being dragged.
+
+        Measured in the fixed frame the two would cancel over a shuttle (creep
+        follows the sign of the TORQUE, so it is over on one leg and under on the
+        next) and a whole-run path length would read ~0. Per leg they do not.
+
+        With s the slip along the motion (+ = over), d the output rolled and
+        d + s the input travel referred to the output:
+
+            over = max(0, |s| - lost_motion) / max(d + s, min_travel)
+
+        * lost_motion_rad, output rad: reversal backlash and wind-up. They read
+          as slip at the start of every leg but are not creep -- the rig logs
+          show up to ~0.05 rad of it, output-driven -- so they are forgiven.
+        * min_travel_rad floors the denominator. Creep is meaningless over a
+          few mrad of travel (the report throws such samples out too), and this
+          is also what makes the watch a hard limit when the input is NOT
+          travelling or the output is NOT rolling: an input runaway against a
+          locked output trips at lost_motion + limit * min_travel of slip,
+          instead of dividing by ~0.
+
+        Legs are cut where the output reverses by more than the hysteresis, and
+        restart wherever the reference is latched (each throw, each test).
+        NaN until there is a reference and both positions read, like
+        ratio_error_rad.
+        """
+        leg = self._creep_leg
+        if leg is None:
+            leg = self._creep_leg = {'dir': 0, 'x0': x, 'e0': err, 'ext': x, 'e_ext': err}
+        hyst = self._creep_reversal_rad
+        if leg['dir'] == 0:
+            # Output has not moved yet: any input motion is input over-travel.
+            if abs(x - leg['x0']) > hyst:
+                leg['dir'] = 1 if x > leg['x0'] else -1
+                leg['ext'], leg['e_ext'] = x, err
+        elif leg['dir'] * (x - leg['ext']) > 0:
+            leg['ext'], leg['e_ext'] = x, err
+        elif leg['dir'] * (leg['ext'] - x) > hyst:
+            # Reversal: the new leg starts from the extreme of the old one.
+            leg['x0'], leg['e0'] = leg['ext'], leg['e_ext']
+            leg['dir'] = -leg['dir']
+            leg['ext'], leg['e_ext'] = x, err
+
+        if leg['dir'] == 0:
+            slip = abs(err - leg['e0'])
+            rolled = 0.0
+        else:
+            slip = -leg['dir'] * (err - leg['e0'])
+            rolled = leg['dir'] * (x - leg['x0'])
+        # Input travel referred to the output: what the report divides by.
+        den = max(rolled + slip, self._creep_min_travel_rad)
+        beyond = max(abs(slip) - self._creep_lost_motion_rad, 0.0) / den
+        self.creep_over = beyond if slip > 0 else 0.0
+        self.creep_under = beyond if slip < 0 else 0.0
+        self.creep_ratio = self.creep_over - self.creep_under
 
     def _update_ratio_error(self):
         """Refresh the two ratio channels. Runs every cycle, before the safety
@@ -1779,10 +1887,12 @@ class Controller(Master):
         if pos is None:
             self.ratio_error_rad = math.nan
             self.ratio_slip_rad_s = math.nan
+            self.creep_over = self.creep_under = self.creep_ratio = math.nan
             return
         err = ((pos[1] - ref['output'])
                - (pos[0] - ref['input']) / ref['ratio'])
         self.ratio_error_rad = err
+        self._update_creep(pos[1] - ref['output'], err)
         now = time.perf_counter()
         mark = self._ratio_rate_mark
         if mark is None:

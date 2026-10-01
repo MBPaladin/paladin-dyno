@@ -39,8 +39,10 @@ FORWARD = 'forward'
 BACKDRIVE = 'backdrive'
 
 # Spans shorter than this carry no usable plateau at any test speed; they are
-# aborted starts, not measurements.
-MIN_SAMPLES = 200
+# aborted starts, not measurements. 100 ms at the 1 kHz log rate: the throw
+# plateaus at 1500-3000 rpm input are 0.15-0.3 s, and a 200-sample floor
+# dropped most of them.
+MIN_SAMPLES = 100
 
 
 # A command channel this flat is a HOLD, not a traverse. Both thresholds sit
@@ -49,6 +51,10 @@ MIN_SAMPLES = 200
 POS_SWEEP_RAD = 0.05
 TORQUE_SWEEP_NM = 0.01
 VEL_SWEEP_RAD_S = 0.05
+# A HELD speed is judged lower than a swept one: 20 rpm at the input is 0.0485
+# rad/s at the output, just under the sweep floor, and a back-drive throw at
+# that speed commands exactly that. Still far above an unused channel's zero.
+VEL_HELD_RAD_S = 0.02
 
 
 def _sweep(seg, channel):
@@ -65,6 +71,21 @@ def _sweep(seg, channel):
     v = seg[channel]
     v = v[np.isfinite(v)]
     return float(np.ptp(v)) if v.size else None
+
+
+def _held_speed(seg, channel):
+    """Median |velocity command| of a channel, or None if it is inactive.
+
+    The other shape a velocity-mode test takes: a throw plateau holds ONE
+    constant speed, so there is nothing to sweep and _sweep reads zero -- but
+    the driving shaft is the one whose velocity command is on and non-zero,
+    while the far shaft holds torque (its velocity command is NaN).
+    """
+    if not seg.is_active(channel):
+        return None
+    v = np.abs(seg[channel])
+    v = v[np.isfinite(v)]
+    return float(np.median(v)) if v.size else None
 
 
 def direction_of(seg):
@@ -102,6 +123,15 @@ def direction_of(seg):
                 spans[role] = span
         if spans:
             return max(spans, key=spans.get)
+    # Nothing sweeps: a throw plateau holds one speed. The driver is the shaft
+    # commanded in velocity mode at a non-zero speed; if both are, it is not
+    # the shape this knows, so say nothing rather than guess.
+    held = {role: _held_speed(seg, ch)
+            for role, ch in ((FORWARD, 'dut_velocity_command'),
+                             (BACKDRIVE, 'load_velocity_command'))}
+    held = {r: v for r, v in held.items() if v is not None and v > VEL_HELD_RAD_S}
+    if len(held) == 1:
+        return next(iter(held))
     return None
 
 
@@ -138,7 +168,10 @@ class Span:
         collapsed to two and four measured slips went missing from the
         customer's table.
         """
-        if self.kind in (naming.SLIP, naming.BREAKAWAY):
+        if self.kind in (naming.SLIP, naming.BREAKAWAY) or 'SETPOINT' in self.point.raw:
+            # A throw plateau is one leg of a throw; every launch numbers its
+            # setpoints from 1, so the IDs collide across runs by construction
+            # and each copy is an independent leg, not a restart of one.
             return (self.direction, self.point.raw, self.source)
         return (self.direction, self.point.raw)
 
@@ -199,6 +232,15 @@ class Dataset:
             m = np.isfinite(wi) & np.isfinite(wo) & (np.abs(wo) > 0.02)
             if m.sum() < 200:
                 continue
+            if 'SETPOINT' in s.point.raw:
+                # A throw plateau is one constant speed plus the catch-up at
+                # its start, where the output has not moved yet; a line through
+                # the whole segment reads 17 for a 43:1 box. The ratio of the
+                # samples actually at speed is the ratio.
+                ref = np.percentile(np.abs(wo[m]), 90)
+                k = m & (np.abs(wo) > 0.5 * ref)
+                votes.append(float(np.median(np.abs(wi[k] / wo[k]))))
+                continue
             votes.append(abs(np.polyfit(wo[m], wi[m], 1)[0]))
         return float(np.median(votes)) if votes else None
 
@@ -214,19 +256,24 @@ class Dataset:
         return False
 
 
-def _find_logs(root, exclude):
-    """Every .hdf5 under root, minus the excluded subtrees."""
+def _find_logs(root, exclude, include=None):
+    """Every .hdf5 under root, minus the excluded subtrees. With `include`, only
+    logs with one of those path components (the opposite cut)."""
     hits = []
     for path in sorted(glob.glob(os.path.join(root, '**', '*.hdf5'),
                                  recursive=True)):
         rel = os.path.relpath(path, root)
-        if any(part in exclude for part in rel.split(os.sep)):
+        parts = rel.split(os.sep)
+        if any(part in exclude for part in parts):
+            continue
+        if include and not any(part in include for part in parts):
             continue
         hits.append(path)
     return hits
 
 
-def load(root, exclude=(), keep_kinds=None, duplicates='longest'):
+def load(root, exclude=(), keep_kinds=None, duplicates='longest', drop=None,
+         include=None):
     """Open every log under `root` and build one campaign-wide Dataset.
 
     `exclude` is a set of path components to skip -- 'initial_setup' and
@@ -246,6 +293,11 @@ def load(root, exclude=(), keep_kinds=None, duplicates='longest'):
                  back-drive ramp was run end to end three times on gbx_1p2p0.
 
     Either way the report lists what happened, so the choice is never silent.
+
+    `drop` is an optional predicate on a finished Span (see span_dropper): the
+    per-span cut for what a whole-folder `exclude` cannot say, such as 'only the
+    lowest speed below 70 Nm from the first pass'. Every span it removes is
+    listed in `skipped`.
     """
     if duplicates not in ('longest', 'all'):
         raise ValueError(f"duplicates must be 'longest' or 'all', "
@@ -258,7 +310,8 @@ def load(root, exclude=(), keep_kinds=None, duplicates='longest'):
     ds = Dataset(root=root)
     candidates = {}
 
-    for path in _find_logs(root, exclude):
+    include = set(include) if include else None
+    for path in _find_logs(root, exclude, include):
         rel = os.path.relpath(path, root)
         mtime = os.path.getmtime(path)
         try:
@@ -286,11 +339,62 @@ def load(root, exclude=(), keep_kinds=None, duplicates='longest'):
                 continue
             span = Span(point=point, seg=seg, direction=direction,
                         source=rel, n=len(seg), mtime=mtime)
+            if drop is not None and drop(span):
+                ds.skipped.append((f'{rel}:{seg.raw_id}', 'dropped by span_rules'))
+                continue
             candidates.setdefault(span.key(), []).append(span)
 
     ds.spans = _resolve(candidates, ds, duplicates)
     _check_filenames(ds)
     return ds
+
+
+def span_dropper(rules):
+    """A `drop` predicate from the unit file's `span_rules`, or None.
+
+    Each rule is a mapping of conditions, ALL of which must hold for it to drop
+    a span; a span is dropped when ANY rule matches:
+
+        source:         the log's path (relative to log_root) starts with this
+        kind:           the span's kind ('efficiency', 'velocity', ...)
+        rpm / rpm_not:  the input speed in its ID, a list
+        abs_torque_ge / abs_torque_lt:  |commanded level| in Nm, from its ID
+        direction:      'forward' or 'backdrive'
+
+    Kept deliberately to what a campaign's ID and path can say, so a rule reads
+    as the decision it is ('drop 300 rpm from 120 Nm: the drive slipped
+    through').
+    """
+    rules = [dict(r) for r in (rules or [])]
+    if not rules:
+        return None
+    known = {'source', 'kind', 'rpm', 'rpm_not', 'abs_torque_ge',
+             'abs_torque_lt', 'direction'}
+    for r in rules:
+        bad = set(r) - known
+        if bad:
+            raise ValueError(f'span_rules: unknown condition(s) {sorted(bad)}')
+
+    def matches(r, s):
+        if 'source' in r and not s.source.startswith(r['source']):
+            return False
+        if 'kind' in r and s.kind != r['kind']:
+            return False
+        if 'direction' in r and s.direction != r['direction']:
+            return False
+        rpm = s.point.rpm
+        if 'rpm' in r and rpm not in [float(x) for x in r['rpm']]:
+            return False
+        if 'rpm_not' in r and rpm in [float(x) for x in r['rpm_not']]:
+            return False
+        torque = s.point.torque_nm
+        if 'abs_torque_ge' in r and (torque is None or abs(torque) < r['abs_torque_ge']):
+            return False
+        if 'abs_torque_lt' in r and (torque is None or abs(torque) >= r['abs_torque_lt']):
+            return False
+        return True
+
+    return lambda span: any(matches(r, span) for r in rules)
 
 
 def _resolve(candidates, ds, mode='longest'):

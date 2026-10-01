@@ -1,0 +1,121 @@
+# Syno 1.2.2 -- the third unit, and the first run with THROW-mode plans
+# (velocity-mode throws, each steady-speed leg logged as a <id>-SETPOINT<k>
+# segment) and the retuned output velocity loop (vl.kp 1.0, vl.ki 2.0).
+#
+# Copied from gbx_1p2p1.yaml. What differs is WHICH logs count: this campaign
+# was run and re-run while the bench was being tuned, so most of the tree is
+# superseded and is excluded by folder name below.
+
+unit: "1.2.2"
+unit_label: "Syno 1.2.2"
+
+log_root: dyno/logs/archimedes/gbx_1p2p2
+
+exclude:
+  - initial_setup
+  - troubleshooting_initial
+  - troubleshooting
+  # Forward efficiency. The data used is efficiency_higher_range* (the big
+  # batch, to +/-150 Nm) plus the lowest speed below 70 Nm from
+  # efficiency_test (see span_rules). Everything else is superseded by it:
+  - efficiency_extended_85
+  - efficiency_extended_90
+  - efficiency_extended_95
+  - efficiency_extended_100
+  - efficiency_extended_110
+  - efficiency_extended_115
+  - efficiency_test_resumed   # the first pass's continuation, redone in the batch
+  - efficiency_test_2         # efficiency_test/efficiency_test_2, same
+  # Back-drive velocity ramp. Runs 2-6 were taken while the output AKD's
+  # velocity loop was being tuned (kp 0.2/ki 17.5 -> 0.6/0.5 -> 1.0/0.8) and
+  # several aborted on the position window; run 8 (kp 1.0, ki 2.0) is the full
+  # ramp on the final tune. Run 7 is the same tune but is superseded by it.
+  - backdriving_velocity_ramp
+  - velocity_ramp_2
+  - velocity_ramp_3
+  - velocity_ramp_4
+  - velocity_ramp_5
+  - velocity_ramp_6
+  - velocity_ramp_7
+  - 01_gentle_initial_backdriving   # bring-up (velocity mode shakedown)
+  # Thermal warm-up spins (a five-minute shuttle at 600 rpm): not part of the
+  # velocity ramp, and they put 141 legs into the 600 rpm point, ten of them with
+  # turnaround impacts that stretch its ripple band.
+  - warmup
+  - warmup_sep_30th
+  # Slip: the report uses forward_driving/slip_5x_150Nm_spec (forward) and
+  # backdriving/slip_initial_150Nm (back-driving); the earlier forward ramps are out.
+  - slip
+  - slip_5x
+
+# Per-span cuts a folder name cannot make; see dataset.span_dropper.
+span_rules:
+  # First pass: only the lowest speed, below 70 Nm. Above that the batch
+  # (efficiency_higher_range) starts and replaces it.
+  - {source: forward_driving/efficiency_test, rpm_not: [20]}
+  - {source: forward_driving/efficiency_test, abs_torque_ge: 70}
+  # 300 rpm at 120 Nm: the unit slipped through (1% efficient, ~90% creep).
+  # It is not a steady operating point.
+  - {kind: efficiency, rpm: [300], abs_torque_ge: 120}
+  # Back-drive efficiency at 3000 rpm: the customer does not want it in the data
+  # (they know it was run). Forward driving at 3000 rpm stays.
+  - {kind: efficiency, direction: backdrive, rpm: [3000]}
+
+# The report quotes torque_cap_nm as the output torque limit applied during
+# testing. The customer's limit for 1.2.2 is 140 Nm; the batch was run past it
+# (to 150 Nm at 20 rpm, at the customer's request) to find where the drive lets
+# go, so the limit actually applied was 150.
+torque_cap_nm: 150.0
+rated_torque_nm: 140.0
+
+# Tests were run as velocity-mode throws, not a position sawtooth: changes how
+# the report DESCRIBES them (see report._throws), nothing in the analysis.
+test_shape: throws
+
+# Output position window in force (raised to 1.60 on 2026-09-18).
+position_half_window_rad: 1.6
+
+ratio_nameplate: 43
+ratio: 43.88
+
+# The 1.2.2 Paladin Test Request marks slip torque and stiffness 'Yes' for this
+# unit.
+# A short slip section from forward_driving/slip_5x_150Nm_spec and
+# backdriving/slip_initial_150Nm: ramps run, peak torque reached, which slipped.
+report_slip: true
+slip_summary: short           # ramps run, peak torque, which slipped; no breakaway
+report_stiffness: true
+# Left out of the report (all still written to the pack):
+report_output_travel: false     # end-stop travel figure in the velocity ramp
+report_stiffness_detail: false  # lost-motion and tracking columns, the tracking
+                                # paragraph, the shaft-angle figure
+report_stiffness_vs_torque: false  # local-slope-against-torque figure
+report_loss_plot: false         # power-loss-against-torque figure in efficiency
+report_creep_table: false       # the creep table (the creep figure stays)
+report_torque_cap: false        # 'output torque limit applied' row in Table 1
+report_cross_term_map: true     # (unused when efficiency_quadrants is on)
+efficiency_quadrants: true      # efficiency section as 4 subsections: test x power-flow direction
+coverage_cap_line: false        # customer-limit line on the efficiency coverage plot
+
+# The ceiling drawn on the creep figure. The request says 5%; 10% was asked for
+# here.
+creep_limit_pct: 10.0
+creep_limit_line: false   # no limit line (or limit wording) on the creep figure
+
+# Stiffness of the output-side test chain (load motor -> coupler -> output torque
+# cell -> coupler), from logs/inhouse_absorbers/bigboi/blocked_rotor_{50,100}nm:
+# 36.0 and 35.3 kNm/rad, linear and closed-loop. The 200 Nm run (25-31 kNm/rad,
+# joint slipped at ~190 Nm) is not used. The input-side chain is still to be
+# tested; while chain_input_pending is true the report says K is uncorrected.
+chain_k_output_nm_per_rad: 36000
+chain_input_pending: true
+
+# The torque-cell zero is read from no-load traverses, and for this unit the only
+# bidirectional ones are the warm-up shuttles that `exclude` keeps out of every
+# result. From the throw data alone the zero comes out +1.66 Nm (33% of a 5 Nm
+# step), which is not believable. So the warm-ups are read for the zero only.
+# misc/warmup alone gives +0.028 Nm; both together +0.230 Nm (what the report
+# carried before the warm-ups were excluded).
+cell_zero_sources:
+  - warmup
+  - warmup_sep_30th

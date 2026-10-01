@@ -24,8 +24,8 @@ from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtWidgets import (QAbstractSpinBox, QCheckBox, QComboBox,
                                QDoubleSpinBox, QFileDialog, QFormLayout,
                                QGroupBox, QHBoxLayout, QLabel, QLineEdit,
-                               QListWidget, QPushButton, QSpinBox,
-                               QVBoxLayout, QWidget)
+                               QListWidget, QPushButton, QScrollArea,
+                               QSpinBox, QVBoxLayout, QWidget)
 
 from deployment import dyno_paths
 from dyno.src import test_builder, test_preview
@@ -240,6 +240,7 @@ class TestBuilderWindow(QWidget):
         self.mode = mode
         self.setWindowTitle('Test Builder')
         self.resize(1536, 960)
+        self.setMinimumHeight(480)
         try:
             self.limits = test_preview.limits_from_config(mode)
         except Exception:
@@ -471,21 +472,48 @@ class TestBuilderWindow(QWidget):
 
         editor.addStretch(1)
 
+        # Messages live in their own capped scroll area, below the editor: a long
+        # test can produce dozens of validation lines, and as plain widgets in the
+        # column they set the window's minimum height past the screen, pushing the
+        # segment buttons off the bottom.
+        messages = QVBoxLayout()
+        messages.setContentsMargins(0, 0, 0, 0)
         self.validation_label = QLabel('')
         self.validation_label.setWordWrap(True)
         self.validation_label.setStyleSheet('color: #d62728;')
-        editor.addWidget(self.validation_label)
+        messages.addWidget(self.validation_label)
 
         # Non-blocking warnings (e.g. a gridpoint's stored continuous-torque
         # rating differing from the current rig config's default).
         self.warn_label = QLabel('')
         self.warn_label.setWordWrap(True)
         self.warn_label.setStyleSheet('color: #e6a700;')
-        editor.addWidget(self.warn_label)
+        messages.addWidget(self.warn_label)
 
+        # The editor scrolls instead of growing the window (a throw segment's
+        # parameter form alone is taller than a laptop screen).
+        editor_inner = QWidget()
+        editor_inner.setLayout(editor)
+        editor_scroll = QScrollArea()
+        editor_scroll.setWidgetResizable(True)
+        editor_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        editor_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        editor_scroll.setWidget(editor_inner)
+        messages_inner = QWidget()
+        messages_inner.setLayout(messages)
+        messages_scroll = QScrollArea()
+        messages_scroll.setWidgetResizable(True)
+        messages_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        messages_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        messages_scroll.setMaximumHeight(110)
+        messages_scroll.setWidget(messages_inner)
+        editor_col = QVBoxLayout()
+        editor_col.setContentsMargins(0, 0, 0, 0)
+        editor_col.addWidget(editor_scroll, stretch=1)
+        editor_col.addWidget(messages_scroll)
         editor_wrap = QWidget()
-        editor_wrap.setLayout(editor)
-        editor_wrap.setFixedWidth(430)
+        editor_wrap.setLayout(editor_col)
+        editor_wrap.setFixedWidth(450)
         body.addWidget(editor_wrap)
 
         # Right: live preview ------------------------------------------------

@@ -15,7 +15,7 @@ align_load_position_to_dut: false
 
 # Cross-coupling torque feedforward. It assumes a fixed positive ratio; this
 # drive reverses and creeps, so it is off.
-feedforward_ratio: 0.0
+feedforward_ratio: 0.7
 
 # --- Output position window ---
 # Centre is declared by the operator each session (output vertical); with
@@ -104,8 +104,37 @@ position_window:
 # assisting secondary torque; see docs/archimedes_throw_mode_design.md.
 throw:
   stop_decel_rad_s2:
-    output: 70      
+    output: 70
     input: 40
+  # A stop whose travel grows linearly with speed is predicted as lag x v, and a
+  # lag here REPLACES that drive's constant decel above (which is then unused).
+  # Output drive, AKD velocity loop vl.kp 1.0 / vl.ki 2.0 (gbx_1p2p2
+  # backdriving/velocity_ramp_7, no hold torque): stop travel / v was 0.058-0.061
+  # s at 2-4.3 rad/s and 0.068-0.079 s at 0.7-1.4, so a_eff ran 5 -> 36 rad/s^2
+  # and no constant decel fits. 0.061 is the fast-stop figure (fit_stop_decel) (the ones that can
+  # reach the window); it under-predicts the slowest stops by ~0.015 rad. Refit
+  # with `python -m dyno.src.archimedes.fit_stop_decel <log dir>` after ANY change
+  # to the output drive's velocity-loop gains, and with a hold torque applied.
+  stop_lag_s:
+    output: 0.061
+
+# --- Creep watch (Controller._update_creep) ---
+# Feeds the creep_over / creep_under safeties. Creep is measured per LEG of output
+# travel (reversal to reversal), against the ratio touch-off measured.
+creep_watch:
+  # Floor on the rolled distance the ratio divides by, output rad. Under it the
+  # ratio is meaningless, so the safety becomes an absolute slip limit of
+  # lost_motion_rad + limit * min_travel_rad.
+  min_travel_rad: 0.25
+  # Slip forgiven at the start of every leg, output rad: reversal backlash and
+  # wind-up, which read as input over/under-travel but are not creep. Largest
+  # seen on the 2026-09-29 logs: 0.047 rad, output-driven (decel_test_output);
+  # 0.012 rad input-driven. Raise it if a clean run nuisance-trips just after a
+  # turnaround; lower it once the unit's lost motion is measured.
+  lost_motion_rad: 0.05
+  # Output must back off this far from a leg's extreme before it counts as a
+  # reversal (encoder noise is 0.3 mrad).
+  reversal_hysteresis_rad: 0.02
 
 # --- 0. PORTS ---
 ports:
@@ -265,20 +294,39 @@ safeties:
   # the input stays well inside its own 500 rad/s limit and neither torque cell
   # goes near its ceiling. Slip is the one failure every other entry here sleeps
   # through, because it is the only one that moves no single channel out of
-  # range -- it moves the RELATION between two. Both entries below watch that
-  # relation, zeroed at Declare Centre and again at the start of every test.
+  # range -- it moves the RELATION between two. The entries below watch that
+  # relation, zeroed at Declare Centre, at the start of every test, and (throws)
+  # at every turnaround.
   #
   # `resumable: true` is why a trip offers recentre-and-resume rather than just
   # ending the run: IMSystems say the drive is designed to slip, so a slip
   # displaces the shafts instead of damaging them, and the cure is the position
   # window's cure -- put the output back on centre and restart the segment.
   #
-  # ratio_break is the accumulated one, in OUTPUT rad. 0.40 sits above what
-  # creep can legitimately reach (plan section 4: ~0.175 rad per shuttle cycle at
-  # the customer's 5% creep limit, and the alternating level sign cancels it
-  # between cycles) and above where a measured slip settles (0.356 rad on
-  # 2026-09-17), so the slip test still completes its own measurement.
-  ratio_break: { source: ratio_error_rad, limit: 10.0, trip_samples: 50, resumable: true } # output rad
+  # creep_over / creep_under replace `ratio_break` (2026-09-29). They are the
+  # customer's creep figure as a safety: how far the input shaft's motion is off
+  # from what a no-slip train needs, using the customer report's definition
+  # (efficiency analyzer `_creep`): creep = |1 - r * d_out / d_in|, here per leg
+  # of travel. limit 0.05 = 5.00 % of the observed input travel, i.e. 1.0526 rad
+  # of input for an expected 1.0000 (over) or 0.95 for 1.00 (under). See the
+  # `creep_watch:` block below for how it is measured and why it is per leg.
+  #   creep_over   input moves MORE than expected: the input is driving and the
+  #                output lags (output torque opposing the motion), or the
+  #                contact lets go under drive.
+  #   creep_under  input moves LESS: the output is driving and the input lags
+  #                (output torque assisting the motion, i.e. back-driving).
+  # Two entries so each direction can carry its own limit; both are read against
+  # the motion, so they hold for either rotation sense and either torque sign.
+  # Every leg from rest is protected too: with the output not rolling, an input
+  # runaway trips at lost_motion_rad + limit * min_travel_rad of slip (~0.06 rad
+  # of output, ~2.7 rad of input) -- the 2026-09-17 free-spin ran to 96 rad.
+  # Legit legs sit far below: 0.1-2 % on the 2026-09-29 throw logs. The loaded
+  # efficiency levels are the ones to watch: creep measured on this unit at
+  # 40 Nm is ~4-5 %, right at this limit (dyno/logs/.../analysis_pack).
+
+  #creep_over:  { source: creep_over,  limit: 0.2, trip_samples: 50, resumable: true } # fraction of rolling
+  #creep_under: { source: creep_under, limit: 0.2, trip_samples: 50, resumable: true } # fraction of rolling
+  
   # ratio_slip is the rate, output rad/s, averaged over 50 ms. This is the one
   # that catches a runaway fast: the 2026-09-17 free-spin ran at 2.1-2.7 rad/s
   # and would have been stopped inside ~150 ms, at roughly 20 rad of input
@@ -287,9 +335,9 @@ safeties:
   # the slip test's own detected slip peaked at 0.44 rad/s, so neither trips it.
   # Raise it if high-speed efficiency ever nuisance-trips; 1.0 rad/s is ~14%
   # creep at 3000 rpm, already well past what the customer's spec allows.
-  ratio_slip: { source: ratio_slip_rad_s, limit: 10.0, trip_samples: 50, resumable: true } # output rad/s
+  ratio_slip: { source: ratio_slip_rad_s, limit: 5.0, trip_samples: 50, resumable: true } # output rad/s
   #
-  # Neither carries nan_trips. Both read NaN whenever a position is unreadable
+  # None of these carries nan_trips. They read NaN whenever a position is unreadable
   # or no reference is latched, and the position window already trips on a NaN
   # output position with a message that says which channel died -- a second
   # entry tripping on the same cause would only bury it.
@@ -361,7 +409,7 @@ post_test:
     # the brake commands zero speed / hold position and the drive's own loop
     # does it (no mode switch -- an AKD de-enables to change mode, which
     # would drop all torque for the duration).
-    torque_nm: 0.5
+    torque_nm: 1.0
     # Braked to rest in the OUTPUT frame, because the output is what the window
     # and the bumpers are about.
     velocity_source: devices.LOAD.velocity
@@ -434,3 +482,6 @@ log_keys:
   # and a run that does NOT trip still shows how close it came.
   - [ratio_error, ratio_error_rad]
   - [ratio_slip, ratio_slip_rad_s]
+  # Signed creep of the current leg (+ input over-travel, - under). What the
+  # creep_over / creep_under safeties read; logged so a run shows its margin.
+  - [creep_ratio, creep_ratio]
