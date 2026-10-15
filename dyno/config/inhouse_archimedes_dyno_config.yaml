@@ -3,7 +3,7 @@
 #
 # See dyno/docs/archimedes_gearbox_implementation_plan.md and the companion
 # archimedes_gearbox_implementation_log.md. Launch with
-# ./launch/inhouse_archimedes.sh. Kept separate from inhouse_dyno_config.yaml so
+# ./launch/archimedes.sh. Kept separate from inhouse_dyno_config.yaml so
 # day-to-day edits there cannot disturb this setup.
 
 load_only: false
