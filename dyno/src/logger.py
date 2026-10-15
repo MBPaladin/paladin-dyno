@@ -16,18 +16,12 @@ from dyno.src.config_utils import augment_log_keys
 
 
 def log_dir_name(sim=None):
-    """Log folder naming convention: (sim_)yyyy_mm_dd_hh_mm_ss, stamped in
-    Pacific time regardless of the machine's timezone. Shared by the Logger
-    (folder creation) and the GUI (experiment-notes path)."""
+    """Log folder naming convention: (sim_)yyyy-mm-dd_hhmmss, stamped in the
+    machine's local timezone. Shared by the Logger (folder creation) and the
+    GUI (experiment-notes path)."""
     if sim is None:
         sim = bool(os.environ.get('DYNO_SIM'))
-    try:
-        from zoneinfo import ZoneInfo
-        from datetime import datetime
-        stamp = datetime.now(ZoneInfo('America/Los_Angeles')).strftime('%Y-%m-%d_%H%M%S')
-    except Exception:  # tz database unavailable: fall back to machine-local
-        stamp = time.strftime('%Y_%m_%d_%H_%M_%S')
-    return ('sim_' if sim else '') + stamp
+    return ('sim_' if sim else '') + time.strftime('%Y-%m-%d_%H%M%S')
 
 
 class Logger:
@@ -70,6 +64,8 @@ class Logger:
         # bias cannot change mid-file and one scalar per sensor describes the
         # whole log.
         self.live_tare = None
+        # Declared centre and last touch-off, for rigs with a position window.
+        self.live_window = None
         # How the run being closed ended, set by stop_logging for _report_meta.
         self.stop_reason = None
         # Naming metadata pushed by the GUI through the logging queue (dict
@@ -110,6 +106,7 @@ class Logger:
                     if isinstance(sample[-1], dict):
                         self.live_session_id = sample[-1].get('session_id')
                         self.live_tare = sample[-1].get('tare')
+                        self.live_window = sample[-1].get('window')
 
                     # starts logging
                     if sample[-2]['log'] == True and self.save == False:
@@ -207,6 +204,13 @@ class Logger:
         # applied, which is what every log written before this feature means.
         if self.live_tare:
             self.file.attrs['tare'] = json.dumps(self.live_tare, default=str)
+
+        # Centre and touch-off can't change while a test runs (the controller
+        # refuses both), so the values at file open describe the whole log.
+        if self.live_window and self.live_window.get('centre') is not None:
+            self.file.attrs['position_window'] = json.dumps(
+                {k: self.live_window.get(k) for k in
+                 ('source', 'centre', 'half_window', 'touch_off')}, default=str)
 
         # makes the HDF5 file and the datasets within it that are needed
         self.dsets = {}

@@ -31,6 +31,15 @@ class Master:
         self._actual_wkc = 0
         self.wkc_error = 0 # per-cycle missing working counter (expected - actual); 0 when healthy
         self.cycle_dt_us = 0.0 # measured interval between PDO sends, logged per-sample
+        # Splits the "unaccounted" part of a late cycle -- the 1.5 ms median that
+        # is outside both step_us and telemetry_us -- into the two places it can
+        # actually be. recv_us is time blocked in receive_processdata (a bus
+        # answer arriving late); send_delay_us is how late this cycle's send was
+        # against the deadline hybrid_sleep_until aimed at, which is where a GIL
+        # handoff from the telemetry feeder thread lands and nowhere else.
+        # Seeded NaN so pre-loop samples read as "not measured" not as 0.
+        self.recv_us = float('nan')
+        self.send_delay_us = float('nan')
         self._master = pysoem.Master()
         self._master.in_op = False
         self._master.do_check_state = False
@@ -72,7 +81,15 @@ class Master:
         wkc_error_count = 0
         max_wkc_errors_before_warning = 10 # Only print warning after 10 consecutive errors
 
-        target_dc_modulo = 500000
+        # Where in the 1 ms DC cycle the frame should pass the reference clock.
+        # Configurable because the AKD runs its loop on a 250 us grid: a frame
+        # landing ON a tick boundary (0/250/500/750) lets jitter move a setpoint
+        # to the neighbouring tick, which the 2026-09-16 Archimedes spin runs
+        # showed as exact +/-0.25-cycle position slips and ~20 A kicks. The phase
+        # also has to stay clear of the 0/1000 wrap, which the integrator below
+        # reads as a full-scale error reversal. 625 satisfies both; see the
+        # comment on dc_send_phase_us in master_config.yaml.
+        target_dc_modulo = int(self.master_params.get('dc_send_phase_us', 625)) * 1000
         master_time_offset = None
         jitter_arr = np.zeros(1000)
         monotonic_ns = time.clock_gettime_ns # same clock as hybrid_sleep_until
@@ -82,8 +99,14 @@ class Master:
             while not self._pd_thread_stop_event.is_set():
 
                 pdo_send_time = monotonic_ns(time.CLOCK_MONOTONIC)
+                # Lateness of this send against the schedule. Everything between
+                # hybrid_sleep_until returning and this line is in here, and the
+                # only thing there is reacquiring the GIL.
+                self.send_delay_us = (pdo_send_time - cycle_start_time) / 1000.0
                 self._master.send_processdata()
+                recv_start = monotonic_ns(time.CLOCK_MONOTONIC)
                 self._actual_wkc = self._master.receive_processdata(timeout=int(cycle_time_sec * 1_000_000 * 0.9)) # Timeout in microseconds, 90% of cycle
+                self.recv_us = (monotonic_ns(time.CLOCK_MONOTONIC) - recv_start) / 1000.0
                 # Deficit form so the log reads 0 when healthy and rises on dropped/late frames.
                 self.wkc_error = self._master.expected_wkc - self._actual_wkc
 
@@ -228,6 +251,10 @@ class Master:
         resolved = {'mode': getattr(self, 'mode', None),
                     'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
                     'session_id': self.session_id,
+                    # The bench's ports block rides along so analysis can map
+                    # device names to log prefixes / roles / attached labels
+                    # without re-opening the bench config (see Segment.ports).
+                    'ports': self.dyno_params.get('ports'),
                     'devices': {}}
         for device_name, device in vars(self.devices).items():
             entry = {'class': type(device).__name__}
@@ -259,6 +286,7 @@ class Master:
         if self._master.state_check(pysoem.OP_STATE, timeout=5_000_000) == pysoem.OP_STATE:
             print('SUCCESS: Systems OPERATIONAL.')
             self.in_op = True
+            self._print_sync_diagnostics('at OP')
             
             check_thread = threading.Thread(target=self._check_thread)
             check_thread.start()
@@ -276,6 +304,8 @@ class Master:
         # each AKD holding the last controlword it ever saw, which overrides a
         # service-channel enable and is what makes Workbench refuse to enable
         # the axis after a run.
+        if self.in_op:
+            self._print_sync_diagnostics('at shutdown')
         self._release_drives()
 
         self.in_op = False
@@ -293,6 +323,43 @@ class Master:
                   'which can block Workbench from enabling the axis. Run '
                   './dyno/utilities/release_drives.sh to clear it.')
         self._master.close()
+
+    # SM2 (outputs) synchronisation parameters, ETG.1020. Read-only; a slave
+    # that does not implement a subindex is skipped. Error counters are only
+    # meaningful compared between the 'at OP' and 'at shutdown' prints.
+    _SYNC_SUBINDEXES = (
+        (0x01, 2, 'sync type (0 free run, 1 SM, 2 DC SYNC0, 3 DC SYNC1)'),
+        (0x02, 4, 'cycle time ns'),
+        (0x0A, 4, 'SYNC0 cycle ns'),
+        (0x0B, 2, 'SM event missed count'),
+        (0x0C, 2, 'cycle time too small count'),
+        (0x20, 1, 'sync error'),
+    )
+
+    def _print_sync_diagnostics(self, label):
+        '''Print each DC-synced slave's 0x1C32 sync mode and error counters.'''
+        for i, slave in enumerate(self._master.slaves):
+            model = self._expected_slave_layout[i]['model']
+            if not DEVICE_CLASSES[model].get('has_dc', False):
+                continue
+            name = self._expected_slave_layout[i].get('name', model)
+            parts = []
+            for sub, size, label_ in self._SYNC_SUBINDEXES:
+                try:
+                    raw = slave.sdo_read(0x1C32, sub, size=size)
+                    parts.append(f'{label_}={int.from_bytes(raw[:size], "little")}')
+                except Exception:
+                    parts.append(f'{label_}=n/a')
+            # ESC registers: 0x0981 DC activation (bit0 cyclic unit, bit1
+            # SYNC0 output), 0x09A0 SYNC0 cycle. These show whether SYNC0 is
+            # actually running on the slave, whatever 0x1C32:01 reports.
+            try:
+                act = int.from_bytes(bytes(slave._fprd(0x0981, 1))[:1], 'little')
+                cyc = int.from_bytes(bytes(slave._fprd(0x09A0, 4))[:4], 'little')
+                parts.append(f'ESC 0x0981 activation={act:#04x}, ESC SYNC0 cycle ns={cyc}')
+            except Exception:
+                parts.append('ESC DC registers=n/a')
+            print(f'Sync {label}: {name} ({model}) 0x1C32: ' + ', '.join(parts))
 
     def _release_drives(self, timeout_s=2.0):
         '''Walk every DS402 drive to Switch on Disabled before PDOs stop.

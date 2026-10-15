@@ -53,6 +53,9 @@ Thumbs.db
 __pycache__/
 .venv
 *.png
+# ...except assets the tools ship. report.sh copies this logo into a new
+# report's pics/, so it has to survive the blanket *.png rule above.
+!dyno/utilities/assets/*.png
 dyno/logs/resolved_config.json
 dyno/tests/traces/ui_generated/*
 dyno/tests/ui_generated_tests/*

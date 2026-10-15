@@ -21,11 +21,30 @@
 # DUT.torque x DUT.gear_ratio = 25 Nm until the DUT derate below is raised.
 load_only: true
 
+# --- 0. PORTS ---
+# The rig's mechanical ports. `role` is what commands / the UI / analysis
+# target; `prefix` is what this bench's log channels are called (they differ on
+# the gearbox bench, which is why both fields exist); `device` is the EtherCAT
+# slave behind the port; `attached` is a free-text label for reports and figure
+# titles -- NO code branches on it; `cell` names the torque sensor on that
+# shaft. This block is carried into every log's resolved_config.json.
+ports:
+  - role: input
+    prefix: dut
+    device: DUT
+    attached: none
+    cell: input_torque
+  - role: output
+    prefix: load
+    device: LOAD
+    attached: none
+    cell: load_torque
+
 # --- 1. SENSOR CONFIGURATION ---
 sensors:
   # Output torque cell
   load_torque:
-    port: RESERVED_ADC
+    port: RESERVED_ADC_1
     fs_v: 5
     fs_pos: 500
     offset: 0
@@ -33,11 +52,32 @@ sensors:
 
   # Input torque cell
   input_torque:
-    port: ADC1
+    port: RESERVED_ADC_2
     fs_v: 10
     fs_pos: 20
     offset: 0
     supply: NA
+
+  # No clamp fitted on this bench: ADC1/ch3 carries nothing, and the 2026-09-03
+  # logs have no current_clamp dataset. Re-enable when one goes back on.
+  # current_clamp:
+  #   port: ADC1
+  #   fs_v: 5
+  #   fs_pos: 50
+  #   offset: 0
+  #   supply: NA
+
+  # The two RTDs actually fitted to the absorber. These are the only working
+  # temperature readings on this bench -- load_stator_temp below is on the
+  # unfitted RESERVED_RTD (ch8) and reads NaN, which means its safety entry can
+  # never fire. Do not rely on it alone.
+  pt100_rtd_top:
+    port: RTD1
+    sensor_type: PT100
+
+  pt100_rtd_bottom:
+    port: RTD2
+    sensor_type: PT100
 
   load_stator_temp:
     port: RESERVED_RTD
@@ -49,16 +89,16 @@ sensors:
 # no matching power_<supply> key, so omitting them is the supported way to say
 # "unpowered".
 panel_ports:
-  RESERVED_ADC:
+  RESERVED_ADC_1:
     signal_module: adc_1
     signal_channel: ch1
-  ADC1:
+  RESERVED_ADC_2:
     signal_module: adc_1
     signal_channel: ch2
-  ADC2:
+  ADC1:
     signal_module: adc_1
     signal_channel: ch3
-  ADC3:
+  ADC2:
     signal_module: adc_1
     signal_channel: ch4
   RTD1:
@@ -96,43 +136,37 @@ expected_slave_layout:
   - model: AKD
     name: DUT
     params:
-      flip_torque_sign: False
-      gear_ratio: 1 # Output should always be set to 1
+      absorber_library: false
+      flip_torque_sign: True
+      gear_ratio: 1
       motor_params:
-        # TODO: verify against the motor actually fitted. Carried over from the
-        # RA400 entry - wrong kt means commanded torque != delivered torque.
-        kt: 25.5
-        k_tanh: 0.018
+        kt: 0.983
+        k_tanh: 0.0001
       motor_limits:
-        # TODO: deliberately derated for first spin. RA400 ratings are
-        # torque 450 / velocity 13; raise these only once the machine is
-        # identified and the mounting is trusted.
-        torque: 25
-        continuous_torque: 10
-        velocity: 50
-        acceleration: 20 # Rad/s^2
-        rotatum: 100 # Nm/s
+        torque: 20
+        continuous_torque: 20
+        velocity: 600
+        acceleration: 1000 #Rad/s^2
+        rotatum: 20 #Nm/s, 4 x peak torque value
       drive_params:
-        i_cont: 8
+        i_cont: 7
   - model: AKD
     name: LOAD
     params:
-      # Not commanded while load_only is set, but the params are still
-      # validated at bring-up (devices.py:610 requires all nine), and sim
-      # resolves entirely from here. TODO on commissioning.
+      absorber_library: false
       flip_torque_sign: True
-      gear_ratio: 1
+      gear_ratio: 1 # Output should always be set to 1
       motor_params:
         kt: 7.79
         k_tanh: 0.0164
       motor_limits:
-        torque: 220
+        torque: 500
         continuous_torque: 100
         velocity: 50
-        acceleration: 20 # Rad/s^2
-        rotatum: 400 # Nm/s
+        acceleration: 20 #Rad/s^2
+        rotatum: 1000 #Nm/s, 4 x peak torque value
       drive_params:
-        i_cont: 15
+        i_cont: 15           
 
 # Measured values over these limits stop the test.
 #
@@ -146,9 +180,9 @@ expected_slave_layout:
 # never > limit - so a failed/disconnected RTD reads NaN and silently disables
 # this check rather than tripping it.
 safeties:
-  output_torque: { source: devices.adc_1.load_torque, limit: 220 } # Nm, derated for bringup
-  output_velocity: { source: devices.LOAD.velocity, limit: 60 } # rad/s, derated for bringup
-  input_velocity: { source: devices.DUT.velocity, limit: 100 } # rad/s, catches a back-driven DUT
+  output_torque: { source: devices.adc_1.load_torque, limit: 500 } # Nm
+  output_velocity: { source: devices.LOAD.velocity, limit: 200 } # rad/s, derated for bringup
+  input_velocity: { source: devices.DUT.velocity, limit: 300 } # rad/s, catches a back-driven DUT
   load_stator_temp: { source: devices.rtd_module.load_stator_temp, limit: 100 } # C
 
 # Torque cell tare: the GUI's Tare button averages each listed cell at rest and
@@ -196,3 +230,9 @@ log_keys:
   - [dut_statusword, devices.DUT.statusword]
   - [cycle_time_us, cycle_dt_us] # measured PDO loop interval
   - [wkc_error, wkc_error] # expected - actual working counter; 0 = healthy
+  # Multisine preamble sample index (NaN outside a preamble). Analysis splits
+  # the excitation into exact periods on this, not on timestamps.
+  - [preamble_sample, preamble_sample]
+  # ramp_break breakaway marker: the commanded torque the online detector
+  # fired at, on that one sample only (NaN on every other sample).
+  - [breakaway_torque, breakaway_torque]

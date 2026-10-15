@@ -1,5 +1,22 @@
 # GEARBOX DYNO CONFIG
 
+# --- 0. PORTS ---
+# See inhouse_dyno_config.yaml for the field definitions. This bench is the
+# one whose log prefixes (`input_*`/`output_*`) differ from its device names
+# (`DUT`/`LOAD`) -- without this block, analysis lowercases the device name
+# and silently finds no channels.
+ports:
+  - role: input
+    prefix: input
+    device: DUT
+    attached: gearbox_input
+    cell: input_torque
+  - role: output
+    prefix: output
+    device: LOAD
+    attached: gearbox_output
+    cell: output_torque
+
 # --- 1. SENSOR CONFIGURATION ---
 # All logical sensors go here. Port mapping handles the hardware routing.
 sensors:
@@ -98,3 +115,6 @@ log_keys: #This needs to match with how the ethercat loop and gui are creating d
   - [output_current, devices.LOAD.current]
   - [cycle_time_us, cycle_dt_us] # measured PDO loop interval
   - [wkc_error, wkc_error] # expected - actual working counter; 0 = healthy, >0 = dropped/late frame
+  # ramp_break breakaway marker: the commanded torque the online detector
+  # fired at, on that one sample only (NaN on every other sample).
+  - [breakaway_torque, breakaway_torque]

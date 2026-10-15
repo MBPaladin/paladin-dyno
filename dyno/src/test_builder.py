@@ -30,12 +30,126 @@ time strictly increases, and torque/velocity channels end at 0.
 import hashlib
 import math
 import os
+import random
 import re
 
 import yaml
 
 MOTORS = ('input', 'output')
 MODES = ('torque', 'velocity', 'position')
+
+# --- optional test preamble --------------------------------------------------
+# A recipe-level (once per test, not per segment) measurement phase that runs
+# before the first segment: a silent hold for an ambient noise floor, or that
+# hold followed by a periodic multisine torque excitation at standstill for
+# FRF / resonance analysis. Absent key = 'none', so existing recipes are
+# untouched. `role` targets a port role the loaded bench declares (or 'all');
+# per-segment `lead_in_s` is unrelated and stays exactly as it is.
+PREAMBLE_MODES = ('none', 'hold', 'multisine')
+PREAMBLE_LEVELS = ('gentle', 'normal', 'hard')
+# One user-facing amplitude control, defined as target SNR of each excited
+# line over the measured per-bin noise floor -- never as a fraction of a motor
+# rating, which would be two orders of magnitude wrong across the two ports.
+PREAMBLE_SNR_DB = {'gentle': 20.0, 'normal': 30.0, 'hard': 40.0}
+
+# Fixed multisine design parameters. Deliberately not user knobs: the whole
+# scheme rests on exact periodicity at the logging rate, and every derived
+# quantity below is stored into the generated yaml so analysis and operators
+# can see it without re-deriving.
+MULTISINE_PERIOD_S = 2.0          # -> 2000 samples/period at 1 kHz, df = 0.5 Hz
+MULTISINE_PERIODS = 12            # first 2 are ramp-in + settling, discarded
+MULTISINE_DISCARD_PERIODS = 2
+MULTISINE_BAND_HZ = (5.0, 200.0)  # low: free-shaft rigid body; high: no AA filter
+MULTISINE_LINES_PER_DECADE = 24
+MULTISINE_DETECTION_FRACTION = 0.25  # odd lines silenced to measure odd distortion
+
+
+def default_preamble():
+    return {'mode': 'none', 'quiet_s': 3.0, 'role': 'output',
+            'level': 'normal', 'seed': 1234}
+
+
+def design_multisine(seed, cycle_time_s=0.001):
+    """Derive the multisine line set. Deterministic given `seed`.
+
+    Log-spaced candidates across the band are snapped to the nearest ODD FFT
+    bin (odd-only excitation leaves every even bin empty as a clean measure of
+    even-order distortion), deduplicated, and a seeded ~25% are silenced as
+    *detection lines* measuring odd-order distortion -- the dominant kind for
+    friction and backlash. Excited lines get Schroeder phases (low crest
+    factor without windowing, which would destroy the periodicity everything
+    here depends on).
+    """
+    n_samples = int(round(MULTISINE_PERIOD_S / cycle_time_s))
+    df = 1.0 / MULTISINE_PERIOD_S
+    f_lo, f_hi = MULTISINE_BAND_HZ
+    n_candidates = int(round(MULTISINE_LINES_PER_DECADE
+                             * math.log10(f_hi / f_lo))) + 1
+    bins = []
+    for i in range(n_candidates):
+        f = f_lo * (f_hi / f_lo) ** (i / (n_candidates - 1))
+        k = int(round(f / df))
+        k = k if k % 2 else (k + 1 if (f / df) >= k else k - 1)  # nearest odd
+        if f_lo / df <= k <= f_hi / df and k not in bins:
+            bins.append(k)
+    bins.sort()
+
+    rng = random.Random(int(seed))
+    n_detect = max(1, int(round(MULTISINE_DETECTION_FRACTION * len(bins))))
+    detection = set(rng.sample(bins, n_detect))
+    excited = [k for k in bins if k not in detection]
+
+    lines = []
+    for j, k in enumerate(bins):
+        if k in detection:
+            lines.append({'bin': k, 'freq_hz': k * df, 'detection': True})
+        else:
+            # Schroeder phase over the excited lines only, indexed in order.
+            m = excited.index(k)
+            phase = -math.pi * m * (m + 1) / len(excited)
+            lines.append({'bin': k, 'freq_hz': k * df, 'detection': False,
+                          'phase': round(phase % (2 * math.pi), 6)})
+    return {
+        'period_s': MULTISINE_PERIOD_S,
+        'samples_per_period': n_samples,
+        'periods': MULTISINE_PERIODS,
+        'discard_periods': MULTISINE_DISCARD_PERIODS,
+        'df_hz': df,
+        'band_hz': list(MULTISINE_BAND_HZ),
+        'seed': int(seed),
+        'n_excited': len(excited),
+        'lines': lines,
+    }
+
+
+def validate_preamble(preamble, roles=None):
+    """Human-readable issues with a recipe's preamble block (empty = clean)."""
+    if not preamble or preamble.get('mode', 'none') == 'none':
+        return []
+    issues = []
+    mode = preamble.get('mode')
+    if mode not in PREAMBLE_MODES:
+        issues.append(f'preamble mode must be one of {PREAMBLE_MODES}, got {mode!r}')
+        return issues
+    quiet_s = float(preamble.get('quiet_s', 0.0))
+    if quiet_s < 1.0:
+        # The quiet hold is what anchors the excitation amplitude (and the
+        # ambient floor); under a second there is nothing to average.
+        issues.append(f'preamble quiet_s must be >= 1.0 s, got {quiet_s:g}')
+    if mode == 'multisine':
+        level = preamble.get('level', 'normal')
+        if level not in PREAMBLE_LEVELS:
+            issues.append(f'preamble level must be one of {PREAMBLE_LEVELS}, '
+                          f'got {level!r}')
+        try:
+            int(preamble.get('seed', 1234))
+        except (TypeError, ValueError):
+            issues.append('preamble seed must be an integer')
+        role = preamble.get('role', 'output')
+        if roles is not None and role != 'all' and role not in roles:
+            issues.append(f'preamble role {role!r} is not declared by this '
+                          f'bench (declared: {", ".join(roles)}, or "all")')
+    return issues
 
 # --- position command shaping ----------------------------------------------
 # A piecewise-linear position trace has a velocity discontinuity at every
@@ -61,6 +175,24 @@ START_HOLD_S = 1.0              # [s] default lead-in hold at zero
 GENERATED_TEST_DIR = 'ui_generated_tests'   # under the tests directory
 GENERATED_TRACE_DIR = 'ui_generated'        # under tests/traces/
 
+# Integer params whose spinbox may go negative, key -> (min, max, step).
+# Every other int param is a count (cycles, debounce) and keeps the 1.. range.
+# `direction` is the one signed integer on any form, and a spinbox that cannot
+# reach -1 does not just display the wrong thing: the form commits whatever the
+# widget clamped to, so opening a -1 segment and touching anything rewrote it
+# to +1. Step 2 so the arrows walk -1 <-> +1 without stopping at 0.
+SIGNED_INT_PARAMS = {
+    'direction': (-1, 1, 2),
+    'start_dir': (-1, 1, 2),
+}
+DEFAULT_INT_RANGE = (1, 100000, 1)
+
+
+def int_param_range(key):
+    """(min, max, step) for an integer param's spinbox."""
+    return SIGNED_INT_PARAMS.get(key, DEFAULT_INT_RANGE)
+
+
 # Pattern parameter metadata: key -> (label, default, type). The UI builds its
 # forms from this, and compile falls back to these defaults for missing keys.
 PATTERNS = {
@@ -69,7 +201,16 @@ PATTERNS = {
         'rate':         ('Ramp rate [units/s]', 1.0, float),
         'peak_dwell_s': ('Dwell at peak [s]', 1.0, float),
         'bipolar':      ('Bipolar (sweep to -amplitude too)', True, bool),
+        # Cycle peak to peak (+A <-> -A) instead of through zero
+        # (0 -> +A -> -A -> 0). Ignored when not bipolar. See _pattern_keys.
+        'start_at_peak': ('Cycle peak-to-peak (ramp to +amplitude first)',
+                          False, bool),
         'cycles':       ('Cycles', 1, int),
+        # Hold at 0 after each cycle finishes, separating one sawtooth from
+        # the next (and the last one from the secondary's next level).
+        # Defaults to 0 so existing recipes (which have no such key) compile
+        # byte-identically.
+        'end_dwell_s':  ('Dwell after done [s]', 0.0, float),
     },
     'step': {
         'levels':  ('Levels (comma separated)', [5.0, 10.0], list),
@@ -91,6 +232,80 @@ PATTERNS = {
     # gets its own log flag with ramps/settles untagged, so post-processing can
     # group by flag. Axes: pattern-motor levels x other-motor levels, with the
     # pattern/other control modes required to be the velocity/torque pair.
+    # Compiles to a real `ramp_break` behavior (not a trace): the release point
+    # is chosen at run time from live velocity, which nothing precomputed can
+    # express. See test_manager.RampBreak. The pattern motor ramps torque; the
+    # other motor holds each of its levels in turn, exactly as it does for a
+    # trace segment.
+    'breakaway': {
+        'amplitude':          ('Ramp ceiling [Nm]', 5.0, float),
+        'rate':               ('Ramp rate [Nm/s]', 0.1, float),
+        'release_s':          ('Release back to 0 [s]', 1.0, float),
+        'rest_s':             ('Rest after release [s]', 2.0, float),
+        # Which way a NON-bipolar ramp pushes. Ignored when `bipolar` is set,
+        # which alternates +/- regardless. Exists so a single ramp can be aimed
+        # one way -- a slip or breakaway hunt that has to recentre between
+        # attempts cannot use `bipolar`, because the recentre has to happen
+        # BETWEEN the two directions and a bipolar segment has no gap there.
+        'direction':          ('Ramp direction (+1 / -1)', 1, int),
+        'bipolar':            ('Alternate direction each ramp', True, bool),
+        'cycles':             ('Ramps per direction', 3, int),
+        'velocity_threshold': ('Breakaway speed [rad/s]', 0.5, float),
+        'stuck_s':            ('Require stuck for [s]', 0.25, float),
+        'debounce_cycles':    ('Debounce [control cycles]', 5, int),
+        'arm_fraction':       ('Arm above (fraction of ceiling)', 0.05, float),
+    },
+    # Compiles to a real `recentre` behavior (not a trace): it drives the INPUT
+    # in velocity mode until the OUTPUT is back at the declared centre, which
+    # needs live feedback and so cannot be precomputed. See test_manager.Recentre
+    # -- in particular why velocity mode is the only mode that makes the move
+    # stick across a segment boundary.
+    'recentre': {
+        'tolerance_rad':             ('Centred within [rad]', 0.02, float),
+        'slow_within_rad':           ('Slow down within [rad]', 0.10, float),
+        'velocity_rad_s':            ('Input speed [rad/s]', 4.0, float),
+        'approach_velocity_rad_s':   ('Input approach speed [rad/s]', 1.0, float),
+        'acceleration_rad_s2':       ('Input acceleration [rad/s^2]', 20.0, float),
+        'timeout_s':                 ('Give up after [s]', 30.0, float),
+        'settle_s':                  ('Settle after arriving [s]', 0.5, float),
+    },
+    # Compiles to a real `throw` behavior (not a trace): the PRIMARY motor runs
+    # in velocity mode and stops on a turnaround angle predicted from live
+    # OUTPUT-encoder position and velocity, then reverses; the SECONDARY holds a
+    # torque (its first level). See test_manager.Throw and
+    # docs/archimedes_throw_mode_design.md. The abort angle is the rig config's
+    # position_window.half_window_rad, and the stop decel is the measured
+    # `throw.stop_decel_rad_s2` for the primary motor -- neither is a param here.
+    'throw': {
+        'speed_rad_s':       ('Drive speed [rad/s, driven shaft]', 3.0, float),
+        'target_rad':        ('Turnaround angle [rad, output, from centre]', 1.0, float),
+        'ramp_accel':        ('Speed-up accel [rad/s^2, driven shaft]', 20.0, float),
+        'n_throws':          ('Throws', 4, int),
+        'start_dir':         ('First throw direction (+1 / -1)', 1, int),
+        'hold_follows_dir':  ('Hold torque sign follows throw direction', False, bool),
+        'settle_s':          ('Rest confirmation [s]', 0.2, float),
+        # 0 = the hold torque is a step at the start and just stops at the end.
+        # > 0 ramps it 0 -> hold before the first throw and hold -> 0 after the
+        # last, then holds 0 Nm for zero_hold_s, so consecutive segments meet at
+        # zero torque instead of stepping +T -> -T at a resting edge.
+        'hold_ramp_nm_s':    ('Hold torque ramp at the ends [Nm/s, hold motor; 0 = step]', 0.0, float),
+        'zero_hold_s':       ('Zero-torque hold after the ramp down [s]', 0.0, float),
+        # 0 = the drive sits at velocity 0 through those ramps, which lets the
+        # shaft walk ~ dT / Ki_eff (0.0115 rad/Nm on the LOAD AKD) whatever the
+        # ramp rate. > 0 holds the output angle instead: the drive is commanded
+        # kp * (x_hold - x) in velocity mode. Start near 4.
+        'hold_position_kp':  ('Position hold gain during hold-torque ramps [1/s; 0 = velocity 0]', 0.0, float),
+        'window_margin_rad': ('Margin to the window boundary [rad]', 0.05, float),
+        # 0 = use the measured value in the rig config. Set it for calibration
+        # runs (deliberately low, so the throw fires early and safely) and for a
+        # drive that has no measured value yet.
+        'stop_decel_rad_s2': ('Stop decel override [rad/s^2, output; 0 = rig config]',
+                              0.0, float),
+        # A stop whose travel grows linearly with speed (the output drive) is
+        # predicted as lag x v instead of v^2 / (2a). 0 = the rig config's
+        # `throw.stop_lag_s` for the drive, if it has one.
+        'stop_lag_s':        ('Stop lag override [s, output; 0 = rig config]', 0.0, float),
+    },
     'gridpoint': {
         'levels':               ('Pattern-motor levels (comma separated)',
                                  [15.0, 30.0, 60.0, 100.0], list),
@@ -129,17 +344,69 @@ def _round_levels(values):
     return [0.0 if r == 0 else r for r in rounded]  # normalize -0.0
 
 
+# The two symmetric modes REINTERPRET the start/stop inputs as magnitudes and
+# `n` as points per side (see generate_levels). They are separate spacing modes
+# rather than a modifier flag precisely because that reinterpretation is not
+# something a checkbox should do silently to two boxes labelled start and stop.
+SYMMETRIC_SPACINGS = ('log_sym', 'log_sym_pairs')
+SPACINGS = ('linear', 'log') + SYMMETRIC_SPACINGS
+
+
+def _log_magnitudes(lo, hi, n):
+    """`n` magnitudes log-spaced from `lo` to `hi`, both > 0."""
+    if n == 1:
+        return [float(lo)]
+    a, b = math.log(lo), math.log(hi)
+    return [math.exp(a + (b - a) * i / (n - 1)) for i in range(n)]
+
+
 def generate_levels(start, stop, n, spacing='linear', mirror=False):
     """`n` levels from `start` to `stop`, rounded to LEVEL_DECIMALS.
 
-    `spacing` is 'linear' or 'log' (log needs both endpoints non-zero and of
-    the same sign). `mirror` appends the descending sweep back to `start`
-    without repeating the turnaround point, so hysteresis shows up in one run.
+    `spacing`:
+      'linear'         `n` points evenly spaced from start to stop.
+      'log'            `n` points log-spaced; needs both endpoints non-zero and
+                       of the same sign.
+      'log_sym'        Signed log sweep. start/stop are MAGNITUDES (their order
+                       is ignored) and `n` is points PER SIDE, so the result has
+                       2n of them: -max ... -min, +min ... +max, monotonically
+                       increasing. Zero is never sampled -- a log sweep cannot
+                       reach it, and for anything measured as a ratio (gearbox
+                       efficiency, friction) a zero-load point carries no signal
+                       to take a ratio of.
+      'log_sym_pairs'  The same 2n magnitudes ordered as +/- pairs of ascending
+                       magnitude (-min, +min, -max, +max, ...). Visiting both
+                       directions back to back at each magnitude means thermal
+                       drift and cell zero-drift move both members of a pair
+                       together and cancel out of the direction asymmetry --
+                       which is the measurement in an efficiency or friction
+                       sweep. It costs a full command reversal between every
+                       pair, so 'log_sym' is the gentler sweep on the hardware.
+
+    `mirror` appends the descending sweep back to the first level without
+    repeating the turnaround point, so hysteresis shows up in one run.
     """
     n = int(n)
     if n < 1:
         raise ValueError('Number of levels must be at least 1')
-    if n == 1:
+    if spacing in SYMMETRIC_SPACINGS:
+        # start/stop are magnitudes here, so a sign on either is meaningless
+        # rather than wrong -- take abs and sort instead of rejecting.
+        if start == 0 or stop == 0:
+            raise ValueError('Symmetric log spacing needs both magnitudes '
+                             'non-zero (these boxes are the smallest and '
+                             'largest |level|, not the sweep endpoints)')
+        lo, hi = sorted((abs(float(start)), abs(float(stop))))
+        if n > 1 and lo == hi:
+            raise ValueError('Symmetric log spacing needs two different '
+                             'magnitudes to sweep between')
+        mags = _log_magnitudes(lo, hi, n)
+        if spacing == 'log_sym':
+            values = [-m for m in reversed(mags)] + list(mags)
+        else:
+            values = [v for m in mags for v in (-m, m)]
+        levels = _round_levels(values)
+    elif n == 1:
         levels = _round_levels([float(start)])
     elif spacing == 'linear':
         levels = _round_levels([start + (stop - start) * i / (n - 1)
@@ -159,8 +426,191 @@ def generate_levels(start, stop, n, spacing='linear', mirror=False):
     return levels
 
 
+# Patterns that compile to a generative behavior instead of a trace csv. Their
+# command stream only exists at run time -- a grid search walks its own
+# setpoints, a breakaway ramp ends on an event nobody can precompute -- so
+# there is no csv to write, compare against, or plot exactly.
+GENERATIVE_PATTERNS = ('gridpoint', 'breakaway', 'recentre', 'throw')
+
+
+def is_generative(segment):
+    return segment.get('pattern') in GENERATIVE_PATTERNS
+
+
 def is_gridpoint(segment):
     return segment.get('pattern') == 'gridpoint'
+
+
+def is_breakaway(segment):
+    return segment.get('pattern') == 'breakaway'
+
+
+def breakaway_settings(segment):
+    """The `ramp_break` behavior settings a breakaway segment compiles to.
+
+    The pattern motor is the one that ramps (torque mode, enforced by
+    validation). The other motor keeps the meaning it has in every other
+    segment: it holds each of its levels in turn while the ramp cycles run
+    against it, which is how a stiction sweep against preload -- or against
+    output angle -- gets expressed.
+    """
+    primary = segment['primary']
+    secondary = segment['secondary']
+    params = segment.get('params', {})
+    p = lambda key: _param(params, 'breakaway', key)
+    return {
+        'ramp_motor': primary['motor'],
+        'hold_mode': secondary['control_mode'],
+        'hold_levels': [float(v) for v in secondary.get('levels', [0.0])] or [0.0],
+        'hold_rate': abs(float(secondary.get('rate', 1.0))) or 1.0,
+        'hold_settle_s': float(secondary.get('settle_s', 0.0)),
+        'lead_in_s': max(float(segment.get('lead_in_s', START_HOLD_S)), 0.0),
+        'amplitude': abs(float(p('amplitude'))),
+        'rate': abs(float(p('rate'))),
+        'release_s': float(p('release_s')),
+        'rest_s': float(p('rest_s')),
+        'direction': 1 if float(p('direction')) >= 0 else -1,
+        'bipolar': bool(p('bipolar')),
+        'cycles': int(p('cycles')),
+        'detect': {
+            'velocity_threshold': abs(float(p('velocity_threshold'))),
+            'stuck_s': float(p('stuck_s')),
+            'debounce_cycles': int(p('debounce_cycles')),
+            'arm_fraction': float(p('arm_fraction')),
+        },
+    }
+
+
+def breakaway_preview_rows(segment):
+    """Approximate keyframes for the live plot, in compile_segment's
+    (cols, rows) form.
+
+    Drawn as the NO-BREAKAWAY case: every ramp runs to the ceiling. That is
+    what the rig does when nothing lets go, it is exactly what the post-save
+    expansion produces (preview has no sensor to detect with), and it is the
+    longest and largest command stream the plan can ask for -- so the preview
+    is an upper bound rather than a guess at where the shaft will let go. A
+    real run is shorter, and its peaks are wherever the friction happened to
+    be."""
+    s = breakaway_settings(segment)
+    primary = segment['primary']
+    sec_motor = 'output' if primary['motor'] == 'input' else 'input'
+    sec_mode = segment['secondary']['control_mode']
+
+    rows = [(0.0, 0.0, 0.0)]
+    t = 0.0
+    sec = 0.0
+    hold_rate = max(s['hold_rate'], 1e-12)
+
+    def emit(primary_value):
+        rows.append((t, primary_value, sec))
+
+    if s['lead_in_s'] > 0:
+        t += s['lead_in_s']
+        emit(0.0)
+    directions = (1.0, -1.0) if s['bipolar'] else (float(s['direction']),)
+    for level in s['hold_levels']:
+        if level != sec:
+            t += abs(level - sec) / hold_rate
+            sec = level
+            emit(0.0)
+        if s['hold_settle_s'] > 0:
+            t += s['hold_settle_s']
+            emit(0.0)
+        for _ in range(max(1, s['cycles'])):
+            for sign in directions:
+                t += s['amplitude'] / max(s['rate'], 1e-12)
+                emit(sign * s['amplitude'])
+                t += max(s['release_s'], 1e-3)
+                emit(0.0)
+                if s['rest_s'] > 0:
+                    t += s['rest_s']
+                    emit(0.0)
+    if sec != 0.0:
+        t += abs(sec) / hold_rate
+        sec = 0.0
+        emit(0.0)
+
+    cols = ['time', f"{primary['motor']}_motor_torque",
+            f'{sec_motor}_motor_{sec_mode}']
+    return cols, rows
+
+
+def is_recentre(segment):
+    return segment.get('pattern') == 'recentre'
+
+
+def recentre_settings(segment):
+    """The `recentre` behavior settings a recentre segment compiles to.
+
+    The primary motor is ignored -- a recentre always drives the input and always
+    in velocity mode, because that is the only arrangement that both needs live
+    feedback and survives the next segment's position-mode re-zero. The secondary
+    carries what the OUTPUT holds while it happens, which for an efficiency sweep
+    is 0 Nm.
+    """
+    params = segment.get('params', {})
+    secondary = segment.get('secondary', {})
+    p = lambda key: _param(params, 'recentre', key)
+    levels = [float(v) for v in secondary.get('levels', [0.0])] or [0.0]
+    return {
+        'hold_mode': secondary.get('control_mode', 'torque'),
+        'hold_level': levels[0],
+        'tolerance_rad': abs(float(p('tolerance_rad'))),
+        'slow_within_rad': abs(float(p('slow_within_rad'))),
+        'velocity_rad_s': abs(float(p('velocity_rad_s'))),
+        'approach_velocity_rad_s': abs(float(p('approach_velocity_rad_s'))),
+        'acceleration_rad_s2': abs(float(p('acceleration_rad_s2'))),
+        'timeout_s': abs(float(p('timeout_s'))),
+        'settle_s': abs(float(p('settle_s'))),
+    }
+
+
+def recentre_preview_rows(segment):
+    """Preview keyframes: a still shaft. The real move depends on where creep
+    has left the output, which nothing precomputed can know -- so the preview
+    shows the one thing that is certain, that this segment commands no torque
+    and ends at rest. Its DURATION in the preview is the timeout, the worst case,
+    for the same reason ramp_break previews every ramp running to its ceiling."""
+    s = recentre_settings(segment)
+    cols = ['time', 'input_motor_velocity', 'output_motor_' + s['hold_mode']]
+    return cols, [[0.0, 0.0, s['hold_level']],
+                  [s['timeout_s'] + s['settle_s'], 0.0, s['hold_level']]]
+
+
+def _validate_recentre(segment, limits=None):
+    """Mirrors the Recentre asserts so problems surface while editing."""
+    issues = []
+    s = recentre_settings(segment)
+    if s['hold_mode'] not in ('torque', 'velocity'):
+        issues.append('recentre holds the output in torque or velocity, not '
+                      f"{s['hold_mode']}: it is the shaft being moved")
+    if s['tolerance_rad'] <= 0:
+        issues.append('Centred-within must be > 0')
+    if s['velocity_rad_s'] <= 0 or s['approach_velocity_rad_s'] <= 0:
+        issues.append('Input speeds must be > 0')
+    if s['acceleration_rad_s2'] <= 0:
+        issues.append('Input acceleration must be > 0')
+    if s['timeout_s'] <= 0:
+        issues.append('Timeout must be > 0')
+    if limits:
+        lim = limits['input']
+        if s['velocity_rad_s'] > lim['velocity']:
+            issues.append(f"input speed {s['velocity_rad_s']:g} rad/s exceeds the "
+                          f"input motor velocity limit {lim['velocity']:g}")
+        if s['acceleration_rad_s2'] > lim['acceleration']:
+            issues.append(f"input acceleration {s['acceleration_rad_s2']:g} rad/s^2 "
+                          f"exceeds the input motor acceleration limit "
+                          f"{lim['acceleration']:g}")
+        if s['hold_mode'] == 'torque':
+            peak = abs(s['hold_level'])
+            if peak > limits['output']['torque']:
+                issues.append(f"hold level {peak:g} Nm exceeds the output motor "
+                              f"torque limit {limits['output']['torque']:g}")
+            reaction = reaction_torque_issue(peak, limits)
+            if reaction:
+                issues.append(f'hold level: {reaction}')
+    return issues
 
 
 def gridpoint_torque_motor(segment):
@@ -304,13 +754,43 @@ def _pattern_keys(pattern, params):
             keys.append((t, keys[-1][1]))
 
     if pattern == 'sawtooth':
-        for _ in range(max(1, int(p('cycles')))):
+        cycles = max(1, int(p('cycles')))
+        if p('bipolar') and p('start_at_peak'):
+            # Peak-anchored: engage one flank fully, then run every cycle
+            # peak to peak, so no traversal ever turns around near zero.
+            # A plain sawtooth's cycles already fuse into this in the middle
+            # (its return to zero and the next cycle's ramp up are collinear,
+            # unless end_dwell_s breaks them apart); anchoring is about the
+            # ENDS, which is where hysteresis analysis is most sensitive. It
+            # also reaches a given number of peak-to-peak traversals in
+            # 2*cycles + 2 ramps instead of 3*(cycles + 1).
+            #
+            # The lead-in 0 -> +A is the only partial pass, and it is the one
+            # that engages from an unknown backlash state -- which is exactly
+            # the leg backlash analysis drops. The trailing return to zero is
+            # not optional: a trace's torque channel must end at 0, and the
+            # zero-torque rest between levels is what separates one level's
+            # sweep from the next for post-processing.
             move(p('amplitude'), p('rate'))
             hold(p('peak_dwell_s'))
-            if p('bipolar'):
+            for _ in range(cycles):
                 move(-p('amplitude'), p('rate'))
                 hold(p('peak_dwell_s'))
+                move(p('amplitude'), p('rate'))
+                hold(p('peak_dwell_s'))
             move(0.0, p('rate'))
+            # Only one end dwell here: this shape's cycles run peak to peak by
+            # design, so there is no return to zero between them to rest at.
+            hold(p('end_dwell_s'))
+        else:
+            for _ in range(cycles):
+                move(p('amplitude'), p('rate'))
+                hold(p('peak_dwell_s'))
+                if p('bipolar'):
+                    move(-p('amplitude'), p('rate'))
+                    hold(p('peak_dwell_s'))
+                move(0.0, p('rate'))
+                hold(p('end_dwell_s'))
     elif pattern == 'step':
         for level in p('levels'):
             move(float(level), p('rate'))
@@ -341,9 +821,9 @@ def compile_segment(segment):
     stepping through its levels: ramp to level -> settle -> run pattern ->
     next level, ending with a ramp back to 0.
     """
-    if is_gridpoint(segment):
-        raise ValueError('gridpoint segments compile to a grid_search '
-                         'behavior, not a trace')
+    if is_generative(segment):
+        raise ValueError(f"{segment['pattern']} segments compile to a "
+                         'generative behavior, not a trace')
     pattern = segment['pattern']
     params = segment.get('params', {})
     primary = segment['primary']
@@ -491,11 +971,249 @@ def reaction_torque_issue(output_torque_peak, limits):
             f'(limit {dut:g}) through gear_ratio {ratio:g}')
 
 
+# --- throw -------------------------------------------------------------------
+
+def is_throw(segment):
+    return segment.get('pattern') == 'throw'
+
+
+def throw_rig_from_config(cfg):
+    """The rig-config values a throw depends on, from a parsed rig config dict:
+    the window it must stay inside and the measured stop decel per drive motor.
+    Shared by the behavior (which reads the file) and the builder (which
+    validates against the same numbers while editing)."""
+    window = cfg.get('position_window') or {}
+    return {
+        'window_enabled': bool(window.get('enabled', False)),
+        'half_window': window.get('half_window_rad'),
+        'window_decel': float(window.get('stop_decel_rad_s2') or 0.0),
+        'stop_decel': (cfg.get('throw') or {}).get('stop_decel_rad_s2') or {},
+        'stop_lag': (cfg.get('throw') or {}).get('stop_lag_s') or {},
+    }
+
+
+def throw_window_reach(target, margin, v_out, window_decel):
+    """How far out a nominal throw reaches as the WINDOW sees it: the target,
+    the margin, and the window's own predicted stop distance at this speed. It
+    has to stay under half_window_rad, or the abort fires on a nominal throw."""
+    reach = target + margin
+    if window_decel > 0:
+        reach += v_out ** 2 / (2.0 * window_decel)
+    return reach
+
+
+def throw_settings(segment):
+    """The `throw` behavior settings a throw segment compiles to. The primary
+    motor drives (and brakes); the secondary's first level is the hold torque."""
+    params = segment.get('params', {})
+    primary = segment['primary']
+    secondary = segment.get('secondary', {})
+    p = lambda key: _param(params, 'throw', key)
+    levels = [float(v) for v in secondary.get('levels', [0.0])] or [0.0]
+    settings = {
+        'drive_motor': primary['motor'],
+        'speed_rad_s': abs(float(p('speed_rad_s'))),
+        'target_rad': abs(float(p('target_rad'))),
+        'ramp_accel': abs(float(p('ramp_accel'))),
+        'n_throws': int(p('n_throws')),
+        'start_dir': 1 if float(p('start_dir')) >= 0 else -1,
+        'hold_level': levels[0],
+        'hold_follows_dir': bool(p('hold_follows_dir')),
+        'settle_s': abs(float(p('settle_s'))),
+        'window_margin_rad': abs(float(p('window_margin_rad'))),
+        'hold_ramp_nm_s': abs(float(p('hold_ramp_nm_s'))),
+        'zero_hold_s': abs(float(p('zero_hold_s'))),
+        'hold_position_kp': abs(float(p('hold_position_kp'))),
+    }
+    if abs(float(p('stop_decel_rad_s2'))) > 0:
+        settings['stop_decel_rad_s2'] = abs(float(p('stop_decel_rad_s2')))
+    if abs(float(p('stop_lag_s'))) > 0:
+        settings['stop_lag_s'] = abs(float(p('stop_lag_s')))
+    return settings
+
+
+def _throw_frame(s, limits):
+    """(k, decel_out, accel_out, v_out) for the throw's numbers: `k` converts
+    driven-shaft units to output units (the gear ratio for an input drive), and
+    decel_out is the measured stop decel (None if not measured)."""
+    k = 1.0
+    if s['drive_motor'] == 'input':
+        k = abs(((limits or {}).get('input') or {}).get('gear_ratio') or 0) or None
+    rig = (limits or {}).get('throw_rig') or {}
+    decel = s.get('stop_decel_rad_s2') or (rig.get('stop_decel') or {}).get(
+        s['drive_motor'])
+    if k is None:
+        return None, decel, None, None
+    return k, decel, s['ramp_accel'] / k, s['speed_rad_s'] / k
+
+
+def _throw_stop(s, limits):
+    """(lag_s, decel) the throw's stop is predicted with, at most one set: a
+    lag replaces the constant decel, as in test_manager.Throw. A decel in the
+    settings (a calibration override) wins over the rig's lag."""
+    rig = (limits or {}).get('throw_rig') or {}
+    drive = s['drive_motor']
+    decel, lag = s.get('stop_decel_rad_s2') or None, s.get('stop_lag_s') or None
+    if decel is None and lag is None:
+        lag = (rig.get('stop_lag') or {}).get(drive) or None
+    if decel is None and lag is None:
+        decel = (rig.get('stop_decel') or {}).get(drive) or None
+    return lag, (None if lag else decel)
+
+
+def throw_info(segment, limits):
+    """One line for the editor: where the throw turns round, and how close that
+    sits to the window. None when the numbers it needs are not known."""
+    s = throw_settings(segment)
+    k, _decel, accel_out, v_out = _throw_frame(s, limits)
+    lag, decel = _throw_stop(s, limits)
+    rig = (limits or {}).get('throw_rig') or {}
+    if k is None or not (decel or lag) or not rig.get('half_window'):
+        return None
+    reach = throw_window_reach(s['target_rad'], s['window_margin_rad'], v_out,
+                               rig.get('window_decel') or 0.0)
+    return (f"throw: turns at +/-{s['target_rad']:g} rad, predicted stop "
+            f"{lag * v_out if lag else v_out ** 2 / (2 * decel):.3f} rad at "
+            f"{v_out:g} rad/s (output), "
+            f"window reach {reach:.3f} of {float(rig['half_window']):g} rad")
+
+
+def throw_preview_rows(segment, limits=None):
+    """Nominal keyframes: the driven channel's speed and the hold torque.
+
+    Each throw is a ramp up, a constant-speed run, and the stop, with the stop
+    decel from the rig config (the ramp accel stands in when it is unmeasured).
+    The first throw starts at centre so covers `target`; the rest cover the full
+    2 x target. Where a throw is too short to reach speed the profile is a
+    triangle. Live position moves the real turnaround points, so this is the
+    nominal shape, and the post-save expansion shows the exact stream."""
+    s = throw_settings(segment)
+    drive = s['drive_motor']
+    hold = 'output' if drive == 'input' else 'input'
+    k, decel, accel_out, v_out = _throw_frame(s, limits)
+    k = k or 1.0
+    accel_out = accel_out or s['ramp_accel']
+    v_out = v_out or s['speed_rad_s']
+    lag, decel = _throw_stop(s, limits)
+    # A lag stop covers lag x v, which is what a constant decel of v / (2 lag)
+    # covers from this speed, so the triangle/trapezoid below stays the same.
+    decel = (v_out / (2.0 * lag)) if lag else (decel or accel_out)
+    eps = 1e-3
+
+    rows = [(0.0, 0.0, 0.0)]
+    t, direction = 0.0, s['start_dir']
+    ramp = s['hold_ramp_nm_s']
+    if ramp > 0 and s['hold_level']:
+        hold0 = s['hold_level'] * (direction if s['hold_follows_dir'] else 1.0)
+        t += abs(hold0) / ramp
+        rows.append((t, 0.0, hold0))
+    for i in range(s['n_throws']):
+        travel = s['target_rad'] if i == 0 else 2.0 * s['target_rad']
+        hold_now = s['hold_level'] * (direction if s['hold_follows_dir'] else 1.0)
+        peak = v_out
+        if peak ** 2 / (2 * accel_out) + peak ** 2 / (2 * decel) > travel:
+            peak = math.sqrt(2.0 * travel / (1.0 / accel_out + 1.0 / decel))
+        t_up, t_down = peak / accel_out, peak / decel
+        run = (travel - peak ** 2 / (2 * accel_out) - peak ** 2 / (2 * decel)) / peak
+        rows.append((t + eps, 0.0, hold_now))
+        t += eps
+        rows.append((t + t_up, direction * peak * k, hold_now))
+        t += t_up
+        if run > 0:
+            t += run
+            rows.append((t, direction * peak * k, hold_now))
+        t += t_down
+        rows.append((t, 0.0, hold_now))
+        t += s['settle_s']
+        rows.append((t, 0.0, hold_now))
+        direction = -direction
+    if ramp > 0 and s['hold_level']:
+        last = rows[-1][2]
+        t += abs(last) / ramp
+        rows.append((t, 0.0, 0.0))
+        if s['zero_hold_s'] > 0:
+            t += s['zero_hold_s']
+            rows.append((t, 0.0, 0.0))
+    cols = ['time', f'{drive}_motor_velocity', f'{hold}_motor_torque']
+    return cols, rows
+
+
+def _validate_throw(segment, limits=None):
+    """Mirrors the Throw asserts so problems surface while editing."""
+    issues = []
+    primary, secondary = segment['primary'], segment['secondary']
+    s = throw_settings(segment)
+    if primary['control_mode'] != 'velocity':
+        issues.append('throw drives in velocity mode: put the primary motor in '
+                      'velocity mode')
+    if secondary['control_mode'] != 'torque':
+        issues.append('throw holds the other motor in torque mode: put the '
+                      'secondary motor in torque mode')
+    if s['speed_rad_s'] <= 0:
+        issues.append('Drive speed must be > 0')
+    if s['target_rad'] <= 0:
+        issues.append('Turnaround angle must be > 0')
+    if s['ramp_accel'] <= 0:
+        issues.append('Speed-up accel must be > 0')
+    if s['n_throws'] < 1:
+        issues.append('Throws must be >= 1')
+    if not limits:
+        return issues
+    lim = limits[s['drive_motor']]
+    hold = 'output' if s['drive_motor'] == 'input' else 'input'
+    if s['speed_rad_s'] > lim['velocity']:
+        issues.append(f"drive speed {s['speed_rad_s']:g} rad/s exceeds the "
+                      f"{s['drive_motor']} motor velocity limit {lim['velocity']:g}")
+    if s['ramp_accel'] > lim['acceleration']:
+        issues.append(f"speed-up accel {s['ramp_accel']:g} rad/s^2 exceeds the "
+                      f"{s['drive_motor']} motor acceleration limit "
+                      f"{lim['acceleration']:g}")
+    if s['hold_ramp_nm_s'] > (limits[hold].get('rotatum') or float('inf')):
+        issues.append(f"hold ramp {s['hold_ramp_nm_s']:g} Nm/s exceeds the {hold} motor "
+                      f"rotatum limit {limits[hold]['rotatum']:g}")
+    peak = abs(s['hold_level'])
+    if peak > limits[hold]['torque']:
+        issues.append(f"hold level {peak:g} Nm exceeds the {hold} motor torque "
+                      f"limit {limits[hold]['torque']:g}")
+    if hold == 'output':
+        reaction = reaction_torque_issue(peak, limits)
+        if reaction:
+            issues.append(f'hold level: {reaction}')
+
+    k, _decel, accel_out, v_out = _throw_frame(s, limits)
+    lag, decel = _throw_stop(s, limits)
+    if k is None:
+        issues.append('throw with the input driving needs the input gear_ratio')
+        return issues
+    rig = limits.get('throw_rig')
+    if rig is None:
+        return issues
+    if not lag and (not decel or decel <= 0):
+        issues.append(f"no measured stop decel or lag for the {s['drive_motor']} motor "
+                      '(throw.stop_decel_rad_s2 / throw.stop_lag_s in the rig config): '
+                      'measure it before running this drive')
+    if rig.get('window_enabled') and rig.get('half_window'):
+        reach = throw_window_reach(s['target_rad'], s['window_margin_rad'], v_out,
+                                   rig.get('window_decel') or 0.0)
+        if reach >= float(rig['half_window']):
+            issues.append(f"throw reaches {reach:.3f} rad as the window sees it "
+                          f"(target + margin + look-ahead at {v_out:g} rad/s), at or "
+                          f"past half_window_rad {float(rig['half_window']):g}: "
+                          'lower the target or the speed')
+    return issues
+
+
 def validate_segment(segment, limits=None):
     """Return a list of human-readable issues (empty = clean). Mirrors the
     TestTrace asserts so problems surface while editing, not at load time."""
     if is_gridpoint(segment):
         return _validate_gridpoint(segment, limits)
+    if is_breakaway(segment):
+        return _validate_breakaway(segment, limits)
+    if is_recentre(segment):
+        return _validate_recentre(segment, limits)
+    if is_throw(segment):
+        return _validate_throw(segment, limits)
     issues = []
     primary = segment['primary']
     secondary = segment['secondary']
@@ -597,16 +1315,75 @@ def _validate_gridpoint(segment, limits=None):
     return issues
 
 
-def validate_recipe(recipe, limits=None):
+def _validate_breakaway(segment, limits=None):
+    """Mirrors the RampBreak asserts so problems surface while editing."""
+    primary = segment['primary']
     issues = []
-    if not recipe.get('segments'):
-        issues.append('Recipe has no segments')
-    seen = set()
-    for seg in recipe.get('segments', []):
-        if seg['id'] in seen:
-            issues.append(f"Duplicate segment id: {seg['id']}")
-        seen.add(seg['id'])
-        issues.extend(f"[{seg['id']}] {msg}" for msg in validate_segment(seg, limits))
+    if primary['control_mode'] != 'torque':
+        issues.append('breakaway ramps torque: put the pattern motor in '
+                      'torque mode')
+    s = breakaway_settings(segment)
+    detect = s['detect']
+    if s['amplitude'] <= 0:
+        issues.append('Ramp ceiling must be > 0')
+    if s['rate'] <= 0:
+        issues.append('Ramp rate must be > 0')
+    if s['release_s'] <= 0:
+        issues.append('Release time must be > 0')
+    if s['rest_s'] < 0:
+        issues.append('Rest time must be >= 0')
+    if detect['velocity_threshold'] <= 0:
+        issues.append('Breakaway speed must be > 0')
+    if detect['stuck_s'] < 0:
+        issues.append('Stuck time must be >= 0')
+    if detect['debounce_cycles'] < 1:
+        issues.append('Debounce must be at least 1 cycle')
+    if not 0.0 <= detect['arm_fraction'] <= 1.0:
+        issues.append('Arm fraction must be in [0, 1]')
+    if not s['hold_levels']:
+        issues.append('Hold motor has no levels')
+    if s['direction'] not in (1, -1):
+        issues.append('Ramp direction must be +1 or -1')
+
+    if limits:
+        ramp = limits[primary['motor']]
+        sec_motor = 'output' if primary['motor'] == 'input' else 'input'
+        if s['amplitude'] > ramp['torque']:
+            issues.append(f"ramp ceiling {s['amplitude']:g} Nm exceeds the "
+                          f"{primary['motor']} motor torque limit "
+                          f"{ramp['torque']:g}")
+        if s['rate'] > ramp['rotatum']:
+            issues.append(f"ramp rate {s['rate']:g} Nm/s exceeds the "
+                          f"{primary['motor']} motor rotatum limit "
+                          f"{ramp['rotatum']:g}")
+        if s['release_s'] > 0 and s['amplitude'] / s['release_s'] > ramp['rotatum']:
+            issues.append(
+                f"release slew {s['amplitude'] / s['release_s']:g} Nm/s exceeds "
+                f"the {primary['motor']} motor rotatum limit "
+                f"{ramp['rotatum']:g}; lengthen the release time")
+        # The detector has to fire while the shaft is still slower than
+        # anything the rig will trip on -- a threshold at or above the motor's
+        # own velocity ceiling can only ever be reached by a lurch that has
+        # already aborted the run.
+        if detect['velocity_threshold'] >= ramp['velocity']:
+            issues.append(
+                f"breakaway speed {detect['velocity_threshold']:g} rad/s is at "
+                f"or above the {primary['motor']} motor velocity limit "
+                f"{ramp['velocity']:g}; it cannot fire before the rig's own "
+                'limits do')
+        if primary['motor'] == 'output':
+            reaction = reaction_torque_issue(s['amplitude'], limits)
+            if reaction:
+                issues.append(f'ramp ceiling: {reaction}')
+        hold_peak = max((abs(v) for v in s['hold_levels']), default=0.0)
+        hold_limit = limits[sec_motor].get(s['hold_mode'])
+        if hold_limit is not None and hold_peak > hold_limit:
+            issues.append(f"hold level {hold_peak:g} exceeds the {sec_motor} "
+                          f"motor {s['hold_mode']} limit {hold_limit:g}")
+        if s['hold_mode'] == 'torque' and sec_motor == 'output':
+            reaction = reaction_torque_issue(hold_peak, limits)
+            if reaction:
+                issues.append(f'hold level: {reaction}')
     return issues
 
 
@@ -633,12 +1410,64 @@ def build_yaml_dict(recipe):
     """Assemble the runner-facing yaml dict (behaviors + embedded recipe)."""
     name = sanitize_name(recipe['name'])
     behaviors = []
+    preamble = recipe.get('preamble')
+    if preamble and preamble.get('mode', 'none') != 'none':
+        settings = {'mode': preamble['mode'],
+                    'quiet_s': float(preamble.get('quiet_s', 3.0))}
+        if preamble['mode'] == 'multisine':
+            seed = int(preamble.get('seed', 1234))
+            settings.update({
+                'role': preamble.get('role', 'output'),
+                'level': preamble.get('level', 'normal'),
+                'seed': seed,
+                # The derived line taxonomy is stored (not just the seed) so
+                # analysis and operators can read the excited/detection bins
+                # straight off the yaml without re-deriving them.
+                'design': design_multisine(seed),
+            })
+        behaviors.append({'id': 'PREAMBLE', 'type': 'preamble',
+                          'settings': settings})
     for seg in recipe['segments']:
         if is_gridpoint(seg):
             # Real grid_search behavior: per-setpoint log flags, no trace csv.
             # Repeats are ignored (the UI pins them to 1 for gridpoints).
             behaviors.append({'id': seg['id'], 'type': 'grid_search',
                               'settings': gridpoint_settings(seg)})
+            continue
+        if is_recentre(seg):
+            # Real recentre behavior: drives the input off live output position.
+            behavior = {'id': seg['id'], 'type': 'recentre',
+                        'settings': recentre_settings(seg)}
+            repeats = int(seg.get('repeats', 1))
+            if repeats > 1:
+                behavior = {'id': seg['id'] + '_LOOP', 'type': 'loop',
+                            'settings': {'loop_count': repeats},
+                            'behaviors': [behavior]}
+            behaviors.append(behavior)
+            continue
+        if is_throw(seg):
+            # Real throw behavior: velocity-mode drive, live turnaround.
+            behavior = {'id': seg['id'], 'type': 'throw',
+                        'settings': throw_settings(seg)}
+            repeats = int(seg.get('repeats', 1))
+            if repeats > 1:
+                behavior = {'id': seg['id'] + '_LOOP', 'type': 'loop',
+                            'settings': {'loop_count': repeats},
+                            'behaviors': [behavior]}
+            behaviors.append(behavior)
+            continue
+        if is_breakaway(seg):
+            # Real ramp_break behavior: releases on live velocity, no trace csv.
+            # Repeats still work -- the loop wrapper below applies to any
+            # behavior, generative or not.
+            behavior = {'id': seg['id'], 'type': 'ramp_break',
+                        'settings': breakaway_settings(seg)}
+            repeats = int(seg.get('repeats', 1))
+            if repeats > 1:
+                behavior = {'id': seg['id'] + '_LOOP', 'type': 'loop',
+                            'settings': {'loop_count': repeats},
+                            'behaviors': [behavior]}
+            behaviors.append(behavior)
             continue
         primary = seg['primary']
         secondary = seg['secondary']
@@ -708,8 +1537,8 @@ def save_test(recipe, tests_dir):
     os.makedirs(trace_dir, exist_ok=True)
 
     for seg in recipe['segments']:
-        if is_gridpoint(seg):
-            continue  # compiles to a grid_search behavior, no trace csv
+        if is_generative(seg):
+            continue  # compiles to a behavior, not a trace csv
         cols, rows = compile_segment(seg)
         csv_path = os.path.join(trace_dir, f"{name}__{seg['id']}.csv")
         with open(csv_path, 'w', newline='') as f:
@@ -745,7 +1574,7 @@ def load_recipe(yaml_path, tests_dir=None):
         name = sanitize_name(recipe.get('name', ''))
         trace_dir = os.path.join(tests_dir, 'traces', GENERATED_TRACE_DIR)
         for seg in recipe.get('segments', []):
-            if is_gridpoint(seg):
+            if is_generative(seg):
                 continue  # no trace csv to compare
             csv_path = os.path.join(trace_dir, f"{name}__{seg['id']}.csv")
             try:

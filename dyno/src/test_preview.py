@@ -31,7 +31,7 @@ import numpy as np
 import yaml
 
 from deployment import dyno_paths
-from dyno.src import test_manager
+from dyno.src import test_builder, test_manager
 
 MODES = ('torque', 'velocity', 'position')
 
@@ -44,8 +44,29 @@ MAX_CYCLES = 2_000_000
 _TRACE_HOLD_CYCLES = 250
 
 
-# Rig-config slave name for each motor of the command stream.
+# Rig-config slave name for each side of the command stream. This is the
+# controller's fixed wiring (DUT always receives input_command, LOAD always
+# receives output_command), NOT a statement of role -- on the actuator benches
+# the DUT device is the client actuator. Semantics live in the config's
+# `ports:` block; see commandable_roles() below.
 MOTOR_SLAVES = {'input': 'DUT', 'output': 'LOAD'}
+
+
+def ports_from_config(mode):
+    """The bench's `ports:` block (see inhouse_dyno_config.yaml), or []."""
+    with open(f"{dyno_paths.dyno_config_directory}/{mode}_dyno_config.yaml") as f:
+        return yaml.safe_load(f).get('ports') or []
+
+
+def commandable_roles(mode):
+    """Roles the loaded bench declares on ports whose device the command
+    stream can actually reach (DUT/LOAD). Roles come from what the config
+    declares, never from counting servo drives -- a drive count gives the
+    wrong answer on actuator_production, where DUT *is* the client actuator.
+    Falls back to the two stream sides for configs without a ports block."""
+    roles = [p['role'] for p in ports_from_config(mode)
+             if p.get('role') and p.get('device') in MOTOR_SLAVES.values()]
+    return roles or list(MOTOR_SLAVES)
 
 
 def limits_from_config(mode):
@@ -100,6 +121,10 @@ def limits_from_config(mode):
     # load_only means the DUT side has no motor or coupling fitted, so the load
     # motor's torque is not reacted anywhere. See reaction_torque_issue.
     limits['coupled'] = not cfg.get('load_only', False)
+    # Not a motor limit: the window and measured stop decel a throw segment is
+    # validated against (test_builder._validate_throw). Ignored by everything
+    # that only reads the per-motor entries.
+    limits['throw_rig'] = test_builder.throw_rig_from_config(cfg)
     return limits
 
 
@@ -189,13 +214,9 @@ def _expand_trace_body(instance, dt):
     im, om = instance.input_mode, instance.output_mode
     t_arr, in_arr, out_arr = instance._t_arr, instance._in_arr, instance._out_arr
 
-    # Body samples: the generator yields while (perf_counter - start) < max_time,
-    # interpolating at ~i*dt for i = 0, 1, 2, .... Its float clock lands the last
-    # sample a hair under max_time, so it emits floor(max_time/dt)+1 samples
-    # (the trailing one at ~max_time). We match that count exactly; the single
-    # boundary sample's value may differ from the rig by << 1 cycle, which is why
-    # cross_check tolerates one sample at the tail. See module docstring.
-    n_body = int(np.floor(instance._trace_max_time / dt + 1e-9)) + 1
+    # Body samples: the generator is sample-paced, interpolating at exactly i*dt
+    # for i < instance._n_body = floor(max_time/dt)+1 (the last at max_time).
+    n_body = instance._n_body
     args = np.arange(n_body) * dt
     body_in = np.interp(args, t_arr, in_arr)
     body_out = np.interp(args, t_arr, out_arr)
@@ -235,7 +256,8 @@ def expand_test(test_file, mode, limits=None, max_cycles=MAX_CYCLES):
     """Expand ``test_file`` into a command timeline.
 
     Returns a dict with ``t`` (seconds), ``input_<mode>`` / ``output_<mode>``
-    signal arrays (NaN where inactive), ``n_cycles`` and ``truncated``.
+    signal arrays (NaN where inactive), ``n_cycles``, ``truncated``, and
+    ``segments`` (one entry per behavior the rig will run, in run order).
 
     Loading/validation is delegated to ``TestManager``; if the plan violates a
     safety limit the underlying ``AssertionError`` propagates -- that is the same
@@ -256,6 +278,7 @@ def expand_test(test_file, mode, limits=None, max_cycles=MAX_CYCLES):
 
         body_cache = {}
         seg_in, seg_out, seg_im, seg_om = [], [], [], []
+        segments = []
         total = 0
         truncated = False
         for bdef in test_manager.behavior_iterator(tm.test_config):
@@ -272,6 +295,19 @@ def expand_test(test_file, mode, limits=None, max_cycles=MAX_CYCLES):
             seg_out.append(body[1])
             seg_im.append(body[2])
             seg_om.append(body[3])
+            # Per-segment boundaries, in the same order and count the rig will
+            # run them (both walk behavior_iterator), so the GUI can index into
+            # this with the controller's live segment number. `duration_s` is an
+            # UPPER bound wherever a behavior ends on live feedback: offline
+            # there is no sensor_reader, so ramp_break runs every ramp to the
+            # ceiling and the preamble never aborts on drift.
+            segments.append({
+                'id': bid,
+                'type': bdef['type'],
+                'n_cycles': n,
+                't_start': total * dt,
+                'duration_s': n * dt,
+            })
             total += n
             if truncated:
                 break
@@ -281,6 +317,7 @@ def expand_test(test_file, mode, limits=None, max_cycles=MAX_CYCLES):
         result = _route_signals(empty, empty, np.array([], dtype=object),
                                 np.array([], dtype=object), empty)
         result['truncated'] = truncated
+        result['segments'] = segments
         return result
 
     in_cmd = np.concatenate(seg_in)
@@ -291,6 +328,7 @@ def expand_test(test_file, mode, limits=None, max_cycles=MAX_CYCLES):
 
     result = _route_signals(in_cmd, out_cmd, in_mode, out_mode, t)
     result['truncated'] = truncated
+    result['segments'] = segments
     return result
 
 

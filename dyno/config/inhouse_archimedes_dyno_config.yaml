@@ -1,0 +1,487 @@
+# In-house dyno, IMSystems Archimedes Drive (43:1, counter-rotating, 200 deg
+# output travel between internal endstops).
+#
+# See dyno/docs/archimedes_gearbox_implementation_plan.md and the companion
+# archimedes_gearbox_implementation_log.md. Launch with
+# ./launch/archimedes.sh. Kept separate from inhouse_dyno_config.yaml so
+# day-to-day edits there cannot disturb this setup.
+
+load_only: false
+
+# The controller normally copies DUT position into LOAD.position_offset early
+# in each session, with no gear ratio. That corrupts the output position the
+# window reads, so it is off here.
+align_load_position_to_dut: false
+
+# Cross-coupling torque feedforward. It assumes a fixed positive ratio; this
+# drive reverses and creeps, so it is off.
+feedforward_ratio: 0.7
+
+# --- Output position window ---
+# Centre is declared by the operator each session (output vertical); with
+# touch_off.recentre a passing touch-off then moves it to the bumper midpoint.
+# Start is refused until centre is declared, touch-off has passed against that
+# centre, and the output is inside the window. During a test, leaving the window (or a
+# NaN reading) trips the test like any other safety. Units: rad at the output.
+position_window:
+  enabled: true
+  source: devices.LOAD.position   # absorber encoder, direct to output
+  half_window_rad: 1.60           # Half window
+  stop_decel_rad_s2: 70
+  velocity_source: devices.LOAD.velocity
+  require_touch_off: false
+  touch_off:
+    # Which shaft touch-off drives, from the blocks below. input: the DUT motor
+    # turns the input with the output free. output: the absorber backdrives the
+    # gearbox with the input free -- that needs ~20-25 Nm, far over
+    # output.torque_nm, so with the gearbox fitted it declares contact at once.
+    # Each block also enables that shaft's jog buttons.
+    drive: input
+    # After both bumpers are found, move centre to their midpoint and drive
+    # home to it. Refused (touch-off fails, centre unchanged) if the midpoint is
+    # more than max_recentre_rad from the centre the run started from. The GUI
+    # keeps bumper/midpoint positions across runs for repeatability.
+    recentre: true
+    max_recentre_rad: 0.2         # ~11 deg
+    # Both shafts. All output-frame rad, relative to centre.
+    slow_from_rad: 1.40           # moving outward beyond this, use the slow speed
+    expected_half_span_rad: 1.745 # 100 deg each side of centre
+    tolerance_rad: 0.09           # ~5 deg: pass/fail for each bumper
+    max_excursion_rad: 1.95       # jog/touch-off never goes further than this from centre
+
+    # Input shaft: DUT in velocity mode, LOAD disabled. Speeds/torques are
+    # INPUT frame.
+    #
+    # Contact: any torque source reads above (drag baseline + contact_rise_nm),
+    # or above ceiling_nm outright, for trip_samples cycles. The baseline starts
+    # at drag_nm and follows the measured drag while the input turns freely, so
+    # contact is a rise over drag, not a fixed torque. What reaches the bumper
+    # is roughly (input torque - drag) x 43: contact_rise_nm 0.15 is ~6.5 Nm at
+    # the output, close to the old 5 Nm output threshold. ceiling_nm catches a
+    # push that starts against a bumper, before the rise check arms:
+    # (0.6 - 0.3) x 43 is ~13 Nm net. FIRST GUESSES from "~0.3 Nm running": jog
+    # the input freely across the window first -- the stop message reports the
+    # measured drag per source -- and set drag_nm / contact_rise_nm / ceiling_nm
+    # from that. If the breakaway at the start of a jog exceeds ceiling_nm,
+    # every jog stops at once with "contact".
+    #
+    # Which way the output turns for input + is MEASURED on the first input move
+    # (DUT gear_ratio is not trusted for it). Until then every input move is
+    # treated as outward (slow speed near the bumpers).
+    input:
+      velocity_rad_s: 4.0           # beyond slow_from_rad, moving out (~0.093 rad/s output at 43:1)
+      approach_velocity_rad_s: 20.0 # elsewhere (~0.465 rad/s output at 43:1)
+      acceleration_rad_s2: 20.0     # slew on the speed command; a step kicks the torque over ceiling_nm
+      nominal_ratio: 43             # |input/output|; leg timeouts and the slip check
+      ratio_tolerance: 0.3          # measured |ratio| outside 43 +/- 30% stops the move
+      torque_sources:
+        - devices.adc_1.input_torque
+        - [devices.DUT.current, 0.983]  # A x kt: backup if the cell reads dead
+      drag_nm: .5                  # starting baseline, replaced by the measured drag
+      contact_rise_nm: .5
+      ceiling_nm: 1.5
+      arm_input_rad: 1.0            # rise check waits this much input travel into each move (breakaway)
+      drag_tau_s: 0.5               # baseline averaging time constant
+      trip_samples: 10
+
+    # Output shaft: LOAD in velocity mode, DUT disabled. Speeds/torques are
+    # OUTPUT frame. Contact is declared when any of these reads above torque_nm
+    # for trip_samples consecutive cycles. The output cell sits between absorber
+    # and gearbox. Gearbox drag at jog speed must be well under torque_nm.
+    output:
+      torque_sources: [devices.adc_1.load_torque]
+      torque_nm: 5.0                # same low torque every time (rubber compresses)
+      trip_samples: 10              # 10 ms at 1 kHz
+      velocity_rad_s: 0.05          # outward speed beyond slow_from_rad
+      approach_velocity_rad_s: 0.25 # speed inside slow_from_rad and toward centre
+      arm_distance_rad: 0.03        # torque cap waived for this far when backing off a bumper
+
+# --- Throw mode (test_manager.Throw) ---
+# Measured decel of a velocity-0 stop, in OUTPUT-encoder coordinates, one per
+# drive motor (the same motor drives the throw and brakes it). null = not yet
+# measured, and a throw driven by that motor is refused at load. Fit from
+# logged v=0 stops across a speed ladder with the same drive/mode/torque and
+# assisting secondary torque; see docs/archimedes_throw_mode_design.md.
+throw:
+  stop_decel_rad_s2:
+    output: 70
+    input: 40
+  # A stop whose travel grows linearly with speed is predicted as lag x v, and a
+  # lag here REPLACES that drive's constant decel above (which is then unused).
+  # Output drive, AKD velocity loop vl.kp 1.0 / vl.ki 2.0 (gbx_1p2p2
+  # backdriving/velocity_ramp_7, no hold torque): stop travel / v was 0.058-0.061
+  # s at 2-4.3 rad/s and 0.068-0.079 s at 0.7-1.4, so a_eff ran 5 -> 36 rad/s^2
+  # and no constant decel fits. 0.061 is the fast-stop figure (fit_stop_decel) (the ones that can
+  # reach the window); it under-predicts the slowest stops by ~0.015 rad. Refit
+  # with `python -m dyno.src.archimedes.fit_stop_decel <log dir>` after ANY change
+  # to the output drive's velocity-loop gains, and with a hold torque applied.
+  stop_lag_s:
+    output: 0.061
+
+# --- Creep watch (Controller._update_creep) ---
+# Feeds the creep_over / creep_under safeties. Creep is measured per LEG of output
+# travel (reversal to reversal), against the ratio touch-off measured.
+creep_watch:
+  # Floor on the rolled distance the ratio divides by, output rad. Under it the
+  # ratio is meaningless, so the safety becomes an absolute slip limit of
+  # lost_motion_rad + limit * min_travel_rad.
+  min_travel_rad: 0.25
+  # Slip forgiven at the start of every leg, output rad: reversal backlash and
+  # wind-up, which read as input over/under-travel but are not creep. Largest
+  # seen on the 2026-09-29 logs: 0.047 rad, output-driven (decel_test_output);
+  # 0.012 rad input-driven. Raise it if a clean run nuisance-trips just after a
+  # turnaround; lower it once the unit's lost motion is measured.
+  lost_motion_rad: 0.05
+  # Output must back off this far from a leg's extreme before it counts as a
+  # reversal (encoder noise is 0.3 mrad).
+  reversal_hysteresis_rad: 0.02
+
+# --- 0. PORTS ---
+ports:
+  - role: input
+    prefix: dut
+    device: DUT
+    attached: Archimedes Drive input
+    cell: input_torque
+  - role: output
+    prefix: load
+    device: LOAD
+    attached: Archimedes Drive output
+    cell: load_torque
+
+# --- 1. SENSOR CONFIGURATION ---
+sensors:
+  # Output torque cell
+  load_torque:
+    port: RESERVED_ADC_1
+    fs_v: 5
+    fs_pos: 500
+    offset: 0
+    supply: NA
+
+  # Input torque cell
+  input_torque:
+    port: RESERVED_ADC_2
+    fs_v: 10
+    fs_pos: -20
+    offset: 0
+    supply: NA
+
+  # No clamp fitted on this bench. Left declared it reads a flat -0.001 A
+  # (measured 2026-09-14, 148 s passive: sd 0.0003 A over 375 distinct values),
+  # which is a trace of nothing on every scope. Re-enable when one goes back on.
+  # current_clamp:
+  #   port: ADC1
+  #   fs_v: 5
+  #   fs_pos: 50
+  #   offset: 0
+  #   supply: NA
+
+  # The two RTDs actually fitted to the absorber. RESERVED_RTD (ch8) below has
+  # no sensor on it and reads NaN -- confirmed over 147817 consecutive samples
+  # on 2026-09-14 -- so a safety watching only that channel can never fire.
+  # These two are the real thermal protection for the efficiency runs, which
+  # hold 100 Nm continuous on the absorber.
+  pt100_rtd_top:
+    port: RTD1
+    sensor_type: PT100
+
+  pt100_rtd_bottom:
+    port: RTD2
+    sensor_type: PT100
+
+  load_stator_temp:
+    port: RESERVED_RTD
+    sensor_type: PT100
+
+# --- 2. PHYSICAL PANEL WIRING HARNESS ---
+panel_ports:
+  RESERVED_ADC_1:
+    signal_module: adc_1
+    signal_channel: ch1
+  RESERVED_ADC_2:
+    signal_module: adc_1
+    signal_channel: ch2
+  ADC1:
+    signal_module: adc_1
+    signal_channel: ch3
+  ADC2:
+    signal_module: adc_1
+    signal_channel: ch4
+  RTD1:
+    signal_module: rtd_module
+    signal_channel: ch1
+  RTD2:
+    signal_module: rtd_module
+    signal_channel: ch2
+  RTD3:
+    signal_module: rtd_module
+    signal_channel: ch3
+  RTD4:
+    signal_module: rtd_module
+    signal_channel: ch4
+  RESERVED_RTD:
+    signal_module: rtd_module
+    signal_channel: ch8
+
+# --- 3. PHYSICAL HARDWARE BUS ---
+# Positional and must match the scan. The two AKDs keep the order they have in
+# inhouse_dyno_config.yaml; their names (and so their roles) differ.
+expected_slave_layout:
+  - { model: EK1100, name: coupler }
+  - { model: EL3208, name: rtd_module }
+  - { model: ELM3004, name: adc_1 }
+  # Small AKD (RTC-0020): input motor.
+  - model: AKD
+    name: DUT
+    params:
+      absorber_library: false
+      flip_torque_sign: false
+      flip_direction_sign: true
+      gear_ratio: -43.88
+      motor_params:
+        kt: 0.983
+        k_tanh: 0.0001
+      motor_limits:
+        torque: 15              # input cell is 20 Nm FS; test needs ~3.3 Nm + accel
+        continuous_torque: 15
+        velocity: 500           # 3600 rpm = 377 rad/s
+        acceleration: 7500      # rad/s^2, top speeds do not fit the throw at less
+        rotatum: 5000
+      drive_params:
+        i_cont: 7
+  # Large AKD (RTC-0200): absorber, direct to the output.
+  - model: AKD
+    name: LOAD
+    params:
+      absorber_library: false
+      flip_torque_sign: true
+      # Hand test 2026-09-14, output bolted to the lockout plate: rotating the
+      # output negative in the left-handed frame read negative on load_torque
+      # (correct) but a small POSITIVE delta on load_position. Against a
+      # grounded shaft the deflection must follow the applied torque, so the
+      # encoder disagreed with its own cell. Negating it makes K = dT/dtheta
+      # come out positive, which is the whole point of the lockout-plate
+      # stiffness baseline. See log finding 16.
+      # NOTE: this inverts the jog buttons -- "Jog +" now drives the other way
+      # and touch-off's "+ bumper" is the other bumper. Harmless, the bumpers
+      # are symmetric, but expect it at the bench.
+      flip_direction_sign: True
+      gear_ratio: 1 # Output should always be set to 1
+      motor_params:
+        kt: 7.79
+        k_tanh: 0.0164
+      motor_limits:
+        torque: 200
+        continuous_torque: 100
+        velocity: 60            # max test output speed is 8.8 rad/s
+        acceleration: 2000       # rad/s^2; 
+        rotatum: 1000
+      drive_params:
+        i_cont: 15
+
+# Measured values over these limits stop the test. nan_trips: a NaN reading
+# trips too (it would otherwise silently pass). The RTD is left without it
+# because an unfitted RTD reads NaN.
+safeties:
+  output_torque: { source: devices.adc_1.load_torque, limit: 200, nan_trips: true } # Nm; raise only if slip torque needs it
+  input_torque: { source: devices.adc_1.input_torque, limit: 15, nan_trips: true } # Nm; input cell is 20 Nm FS
+  output_velocity: { source: devices.LOAD.velocity, limit: 60, nan_trips: true } # rad/s; tests reach 8.8
+  input_velocity: { source: devices.DUT.velocity, limit: 500, nan_trips: true } # rad/s; tests reach 377
+  # RATIO BREAK -- the slip safety. Added 2026-09-17 after a slip ran the input
+  # to 155 rad/s with the output locked and NOTHING stopped it: the output sits
+  # still, so the position window and output-velocity checks stay happy, while
+  # the input stays well inside its own 500 rad/s limit and neither torque cell
+  # goes near its ceiling. Slip is the one failure every other entry here sleeps
+  # through, because it is the only one that moves no single channel out of
+  # range -- it moves the RELATION between two. The entries below watch that
+  # relation, zeroed at Declare Centre, at the start of every test, and (throws)
+  # at every turnaround.
+  #
+  # `resumable: true` is why a trip offers recentre-and-resume rather than just
+  # ending the run: IMSystems say the drive is designed to slip, so a slip
+  # displaces the shafts instead of damaging them, and the cure is the position
+  # window's cure -- put the output back on centre and restart the segment.
+  #
+  # creep_over / creep_under replace `ratio_break` (2026-09-29). They are the
+  # customer's creep figure as a safety: how far the input shaft's motion is off
+  # from what a no-slip train needs, using the customer report's definition
+  # (efficiency analyzer `_creep`): creep = |1 - r * d_out / d_in|, here per leg
+  # of travel. limit 0.05 = 5.00 % of the observed input travel, i.e. 1.0526 rad
+  # of input for an expected 1.0000 (over) or 0.95 for 1.00 (under). See the
+  # `creep_watch:` block below for how it is measured and why it is per leg.
+  #   creep_over   input moves MORE than expected: the input is driving and the
+  #                output lags (output torque opposing the motion), or the
+  #                contact lets go under drive.
+  #   creep_under  input moves LESS: the output is driving and the input lags
+  #                (output torque assisting the motion, i.e. back-driving).
+  # Two entries so each direction can carry its own limit; both are read against
+  # the motion, so they hold for either rotation sense and either torque sign.
+  # Every leg from rest is protected too: with the output not rolling, an input
+  # runaway trips at lost_motion_rad + limit * min_travel_rad of slip (~0.06 rad
+  # of output, ~2.7 rad of input) -- the 2026-09-17 free-spin ran to 96 rad.
+  # Legit legs sit far below: 0.1-2 % on the 2026-09-29 throw logs. The loaded
+  # efficiency levels are the ones to watch: creep measured on this unit at
+  # 40 Nm is ~4-5 %, right at this limit (dyno/logs/.../analysis_pack).
+
+  #creep_over:  { source: creep_over,  limit: 0.2, trip_samples: 50, resumable: true } # fraction of rolling
+  #creep_under: { source: creep_under, limit: 0.2, trip_samples: 50, resumable: true } # fraction of rolling
+  
+  # ratio_slip is the rate, output rad/s, averaged over 50 ms. This is the one
+  # that catches a runaway fast: the 2026-09-17 free-spin ran at 2.1-2.7 rad/s
+  # and would have been stopped inside ~150 ms, at roughly 20 rad of input
+  # travel instead of 96. Legitimate creep stays far below it -- 5% creep at the
+  # fastest efficiency point (3000 rpm, output 7.16 rad/s) is 0.36 rad/s -- and
+  # the slip test's own detected slip peaked at 0.44 rad/s, so neither trips it.
+  # Raise it if high-speed efficiency ever nuisance-trips; 1.0 rad/s is ~14%
+  # creep at 3000 rpm, already well past what the customer's spec allows.
+  ratio_slip: { source: ratio_slip_rad_s, limit: 5.0, trip_samples: 50, resumable: true } # output rad/s
+  #
+  # None of these carries nan_trips. They read NaN whenever a position is unreadable
+  # or no reference is latched, and the position window already trips on a NaN
+  # output position with a message that says which channel died -- a second
+  # entry tripping on the same cause would only bury it.
+  # Absorber temperature, on the two RTDs actually fitted. The scale is now
+  # trustworthy: the EL3208 element-type enum was swept on the bench 2026-09-14
+  # and devices.py corrected (PT100 is element type 0, not 1), so these read
+  # true degrees C rather than the ~30% low the Ni curve was giving. 100 C is a
+  # real winding limit again rather than the 70 C placeholder.
+  absorber_temp_top: { source: devices.rtd_module.pt100_rtd_top, limit: 100, nan_trips: true } # C
+  absorber_temp_bottom: { source: devices.rtd_module.pt100_rtd_bottom, limit: 100, nan_trips: true } # C
+  # RESERVED_RTD (ch8) is unfitted and reads NaN, so deliberately NO nan_trips
+  # here: this entry is inert until a sensor goes on that channel. The two
+  # entries above are what actually protect the absorber.
+  load_stator_temp: { source: devices.rtd_module.load_stator_temp, limit: 100 } # C
+  # No wkc_error safety. The bus is clean at idle -- 0 events in 147817
+  # consecutive cycles on 2026-09-14 -- and the isolated counts seen before
+  # that were the first cycle after OP entry, not running faults. A frame-loss
+  # trip here would only ever be a nuisance stop mid-test; losing a slave still
+  # faults the drives, which stops the test through the existing drive-fault
+  # path. wkc_error stays in log_keys so a post-mortem can look at it.
+
+# --- What happens after a test ends ---
+# Every ending funnels through DynoController._stop_test: a safety trip, a
+# window trip, a drive fault (which is how an E-Stop arrives here), the Stop
+# button, or a clean finish. Two things now happen before the drives drop.
+post_test:
+  # 1. The logging tail. The log used to close on the sample that ended the
+  # run, so the coast AFTER a trip -- the very thing a stopping-distance safety
+  # is betting on -- was never recorded, and an E-Stop closed the file at the
+  # instant the interesting part began. Keep recording this long past the end,
+  # whatever ended it. Applies to every ending except `shutdown`, where the
+  # process is going away and a tail that outlives it would lose the whole log.
+  log_tail_s: 2.0
+
+  # 2. The active brake, on the INPUT drive.
+  #
+  # Measured 2026-09-17 from the three logs in
+  # dyno/logs/archimedes/gbx_1p2p0/coastdown. Free-coasting, the whole train
+  # decelerates at 20.3 rad/s^2 at the output (889 at the input) -- Coulomb,
+  # near-constant with speed, and the fit over all three runs (J_in 3.63e-4
+  # kg m^2, drag_in 0.323 Nm) closes to under 0.03 Nm. So a trip at the
+  # 8.8 rad/s back-drive speed coasts 1.91 rad: past the window, past the
+  # bumpers. initial_1nm_test already did exactly that -- tripped at -0.817 rad
+  # doing 8.29 rad/s, reached the bumper at ~5.6 rad/s carrying 10.9 J.
+  #
+  # The input drive fixes it nearly for free, because the 43.88:1 ratio
+  # multiplies its torque while the train's inertia is dominated by its own
+  # rotor: 2.2 Nm at the input IS the 158 rad/s^2 at the output that stops
+  # inside the 0.245 rad window->bumper margin. 4 Nm measures out at ~241
+  # rad/s^2, which stops 8.8 rad/s in 0.161 rad (9.2 deg), at 4.1 A_rms against
+  # a 7 A continuous rating.
+  #
+  # The absorber cannot do this job: it needs 96 Nm, and its 1000 Nm/s rotatum
+  # takes 105 ms to reach that, by which time the output has moved 0.92 rad.
+  brake:
+    enabled: true
+    # Which physical drive brakes: `input` (DUT, default) or `output` (LOAD,
+    # direct on the output shaft, no gearbox). ARMED at `input` -- everything
+    # measured below is the input brake. `output` exists for a back-drive
+    # plan, where LOAD (not DUT) is the one holding position at the trip: it
+    # then holds LOAD's own commanded position directly (sign-free, same as
+    # the position-mode case below) instead of opposing it through the input
+    # via the gearbox. NOT YET MEASURED on this rig -- do not switch to
+    # `output` without a tail-logged stop the way the input figures below
+    # were measured (dyno_controller.py, post_test.brake block comment).
+    drive: input
+    # Torque/velocity/position frame of whichever drive is braking. Only used
+    # when that drive is already in torque mode; in velocity or position mode
+    # the brake commands zero speed / hold position and the drive's own loop
+    # does it (no mode switch -- an AKD de-enables to change mode, which
+    # would drop all torque for the duration).
+    torque_nm: 1.0
+    # Braked to rest in the OUTPUT frame, because the output is what the window
+    # and the bumpers are about.
+    velocity_source: devices.LOAD.velocity
+    stop_velocity_rad_s: 0.1   # at or under this, held for settle_s, = stopped
+    settle_s: 0.05
+    min_velocity_rad_s: 0.1    # already this slow: skip the brake, go to tail
+    timeout_s: 0.25             # hard cap; the rig took 90 ms at 0.5 Nm
+    # Which way a positive torque command moves the braking drive's OWN
+    # logged velocity. `auto` derives it from that drive's flip_torque_sign /
+    # flip_direction_sign pair; both of DUT's flag combinations have been
+    # measured and agree with the derivation (finding 21) -- LOAD's have not.
+    # Pin to 1 or -1 only for a drive whose current loop does not follow the
+    # usual convention.
+    polarity: auto
+    # Backstop on that polarity. If the braking drive speeds UP by more than
+    # verify_rise_frac over verify_s, the sign was wrong: the brake aborts to a
+    # plain de-energise and says so in the stop_reason. It should never fire --
+    # if it does, read finding 21 before touching anything here.
+    verify_s: 0.010
+    verify_rise_frac: 0.10
+
+tare:
+  duration_s: 3.0
+  sensors: [load_torque, input_torque]
+  max_velocity: 0.05
+  warn_frac_fs: 0.02
+
+gui_params:
+  window_length_s: 30
+  displayed_samples: 2048
+
+log_keys:
+  - [time, time]
+  - [dut_mode, devices.DUT.servo_drive_mode]
+  - [dut_torque_command, devices.DUT.torque_command]
+  - [dut_velocity_command, devices.DUT.velocity_command]
+  - [dut_position_command, devices.DUT.position_command]
+  - [dut_output_position, devices.DUT.position]
+  - [dut_velocity, devices.DUT.velocity]
+  - [dut_current, devices.DUT.current]
+  - [load_mode, devices.LOAD.servo_drive_mode]
+  - [load_torque_command, devices.LOAD.torque_command]
+  - [load_velocity_command, devices.LOAD.velocity_command]
+  - [load_position_command, devices.LOAD.position_command]
+  - [load_position, devices.LOAD.position]
+  - [load_velocity, devices.LOAD.velocity]
+  - [load_current, devices.LOAD.current]
+  - [load_statusword, devices.LOAD.statusword]
+  - [dut_statusword, devices.DUT.statusword]
+  - [cycle_time_us, cycle_dt_us]
+  # Splits cycle_time_us into "time spent in the controller" vs "time spent in
+  # the master loop around it". The 2026-09-17 runs reached 2.6-3.1 ms cycles
+  # with wkc_error flat at 0 -- clean bus, late cycles -- and every 20 A slam in
+  # those logs sits within a few cycles of one. These two channels say which
+  # side of the wire the time went. telemetry_us lags one cycle by construction.
+  - [step_us, step_us]
+  - [telemetry_us, telemetry_us]
+  # Splits what step_us/telemetry_us leave unaccounted. recv_us is time blocked
+  # waiting for the bus; send_delay_us is how late the send was against its own
+  # deadline, which is where a GIL handoff shows up. On the 2026-09-17 runs the
+  # unaccounted median was 1511 us with wkc_error flat at 0, so the expectation
+  # is recv_us stays small and send_delay_us carries it.
+  - [recv_us, recv_us]
+  - [send_delay_us, send_delay_us]
+  - [wkc_error, wkc_error]
+  - [preamble_sample, preamble_sample]
+  - [breakaway_torque, breakaway_torque]
+  # The ratio-break channels. Logged, not just watched: the slip point is read
+  # off these afterwards (RampBreak's own trigger only decides when to release),
+  # and a run that does NOT trip still shows how close it came.
+  - [ratio_error, ratio_error_rad]
+  - [ratio_slip, ratio_slip_rad_s]
+  # Signed creep of the current leg (+ input over-travel, - under). What the
+  # creep_over / creep_under safeties read; logged so a run shows its margin.
+  - [creep_ratio, creep_ratio]

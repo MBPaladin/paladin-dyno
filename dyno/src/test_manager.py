@@ -1,3 +1,5 @@
+import math
+
 import yaml
 import numpy as np
 import pandas as pd
@@ -5,7 +7,30 @@ import time
 from deployment import dyno_paths
 # test_builder imports nothing from this package, so this stays acyclic. The
 # shared check lives there because the builder must run without numpy/pandas.
-from dyno.src.test_builder import reaction_torque_issue
+from dyno.src.test_builder import (design_multisine, reaction_torque_issue,
+                                   throw_rig_from_config, throw_window_reach)
+
+# PROGRESS CONTRACT. Every behavior class carries two plain ints that the
+# controller reads (on its own thread, inside step()) and republishes for the
+# GUI's progress readout:
+#
+#   repeats  how many repeats this behavior will run, fixed at __init__
+#   repeat   which one is running now, 1-based, 0 before the first
+#
+# A "repeat" is one logged span -- the same unit the <id>-RUN<r>-SETPOINT<n>
+# log flags already number -- so the readout and the log agree on what a repeat
+# is. TestTrace has no spans and is therefore a single repeat.
+#
+# `repeats` is knowable in advance even where DURATION is not: ramp_break
+# releases on a live breakaway, so nobody can say how long its ramps take, but
+# the number of ramps is fixed by hold_levels x cycles x directions. That gap is
+# the whole reason this exists -- for the adaptive behaviors it is the only
+# honest progress signal available.
+#
+# `repeat` is incremented BEFORE the work, so 4/8 means "the 4th is running",
+# not "4 are finished". A behavior that aborts early (preamble drift) simply
+# stops short of `repeats`, which is the truth about what ran.
+
 
 # iterator that yields loops of behaviors
 def loop_iterator(loop_definition):
@@ -40,6 +65,10 @@ class TestTrace:
         self._load_trace() # We want to do all loading of files in the __init__ as that happens before the test definition is placed inside of the control thread
         self.log_id_base = self.parameters['id']+'-RUN' # self.run gets appended to this string to capture how many times a behavior has run within a log
         self.run = 0
+        # A trace is one uninterrupted replay -- no spans to count (see the
+        # progress contract at the top of this module).
+        self.repeats = 1
+        self.repeat = 0
 
     def _load_trace(self):
         f_name = self.settings['trace_file']
@@ -160,12 +189,125 @@ class TestTrace:
         self._in_last = float(self._in_arr[-1])
         self._out_last = float(self._out_arr[-1])
 
+        with open(dyno_paths.dyno_config_directory + '/master_config.yaml') as f:
+            self.dt = yaml.safe_load(f)['cycle_time_us'] / 1e6
+        # Body samples at n*dt for n = 0..n_body-1, the last landing on the
+        # trace's final keyframe. test_preview._expand_trace_body uses the same count.
+        self._n_body = int(math.floor(self._trace_max_time / self.dt + 1e-9)) + 1
 
+        # Typical spacing between keyframes. Median, not mean: these traces open
+        # with a lead-in held for a second or more, and one long gap would drag
+        # a mean well off the rate the body is actually written at.
+        spacing = np.diff(self._t_arr)
+        spacing = spacing[spacing > 1e-9]
+        self._keyframe_dt = float(np.median(spacing)) if spacing.size else self.dt
+
+        # Resample the whole body onto the control grid once, here, rather than
+        # interpolating per cycle in commands(). That keeps np.interp out of the
+        # 1 kHz path, and -- the part that matters -- it is where a position
+        # trace written coarser than the control rate gets reconstructed into
+        # something a position loop can follow. See _smooth_position.
+        self._grid = np.arange(self._n_body) * self.dt
+        self._in_body = np.interp(self._grid, self._t_arr, self._in_arr)
+        self._out_body = np.interp(self._grid, self._t_arr, self._out_arr)
+        if self.input_mode == 'position':
+            self._in_body = self._smooth_position(self._in_body)
+        if self.output_mode == 'position':
+            self._out_body = self._smooth_position(self._out_body)
+
+        # What the drive will ACTUALLY be asked for, cycle by cycle, after
+        # reconstruction. The keyframe corner check above reads the source
+        # trace, which is the wrong grid to judge this on: a trace can pass it
+        # comfortably and still demand thousands of rad/s^2 per cycle once
+        # sampled at 1 kHz (every archimedes_bench_input_spin_* trace did).
+        # A warning, not an assert, for the same reason as the corner check --
+        # several long-standing traces would trip it.
+        for motor, body in (('input', self._in_body), ('output', self._out_body)):
+            if self.settings[f'{motor}_motor']['control_mode'] != 'position':
+                continue
+            if body.size < 3:
+                continue
+            accel = np.abs(np.diff(np.diff(body) / self.dt) / self.dt)
+            limit = self.limits[motor]['acceleration']
+            if accel.size and accel.max() > limit:
+                worst = int(np.argmax(accel))
+                print(f"WARNING: {motor}_motor position trace demands "
+                      f"{accel.max():.0f} rad/s^2 at t={self._grid[worst + 1]:.3f}s "
+                      f"once resampled to the {self.dt * 1e3:g} ms control grid "
+                      f"(limit {limit:g}). The trace is written at "
+                      f"{1.0 / self._keyframe_dt:.0f} Hz; "
+                      "regenerate it at the control rate for real headroom.")
+
+
+
+    def _smooth_position(self, body):
+        """Turn a linearly-interpolated position body into a C1 one.
+
+        np.interp between keyframes gives piecewise-CONSTANT velocity: the
+        commanded speed holds for a whole keyframe spacing and then steps, in
+        one control cycle, to the next. The position loop absorbs that step in
+        about a cycle, so the drive sees an acceleration impulse of
+        (velocity step / dt) -- not the acceleration the trace was built with.
+
+        Measured on archimedes_bench_input_spin_mid, whose traces are written at
+        the segment rate rather than the control rate:
+
+            segment  keyframes  design accel  per-cycle accel, linear
+            V0600     54.9 Hz      345            6283 rad/s^2
+            V1200    109.9 Hz     1381           12566
+            V1800    164.8 Hz     3106           18850
+
+        against a configured motor_limits.acceleration of 5500. The 2026-09-17
+        troubleshooting_initial logs show it as a 108-112 Hz ripple on
+        input_torque, load_torque and dut_current at V1200 -- exactly that
+        trace's 109.9 Hz keyframe rate -- and +/-36 Nm at the output through the
+        43.88:1 ratio. The constant-speed stretches, where linear interpolation
+        is exact, are quiet by comparison (load_torque sd 0.88 Nm, dut_current
+        sd 0.058 A), which is what says the ripple is the reconstruction and not
+        the gearbox.
+
+        The fix is a centred moving average exactly one keyframe spacing wide.
+        That is the matched reconstruction for this defect: averaging a
+        piecewise-constant velocity over one spacing yields a piecewise-LINEAR
+        velocity, so the acceleration comes out at the value the trace was built
+        with instead of a spike (V1200: 12566 -> 1396, against a design 1381).
+        It also preserves both endpoints exactly and does not raise peak speed,
+        which a spline reconstruction does not: PCHIP on the same traces left
+        2784 rad/s^2 and overshot 125.7 rad/s to 127.8.
+
+        Only position channels get this. A torque or velocity trace is already
+        continuous in the quantity being commanded, and smoothing one could lift
+        its slope past the rotatum/acceleration limits asserted above.
+        """
+        width = int(round(self._keyframe_dt / self.dt))
+        if width < 2:
+            return body          # already at (or finer than) the control rate
+        if width % 2 == 0:
+            width += 1           # odd, so the window is centred with no shift
+        if width >= body.size:
+            return body
+        pad = width // 2
+        padded = np.concatenate([np.full(pad, body[0]), body, np.full(pad, body[-1])])
+        smoothed = np.convolve(padded, np.ones(width) / width, mode='valid')
+        # Both endpoints have to land exactly where they did: the trace is
+        # asserted to start at 0, and the hold after the body continues from the
+        # final value, so a discrepancy at either end is a step into or out of
+        # the body. Edge padding leaves them off by up to ~1e-4 rad on the
+        # traces in this repo. Correct that with a LINEAR ramp rather than by
+        # pinning the two samples: pinning removes the endpoint error by putting
+        # a one-cycle step next to it, which is the artefact being removed here.
+        # Spread over the whole body the same error is ~1e-5 rad/s of velocity
+        # bias, i.e. nothing.
+        ends = np.linspace(0.0, 1.0, smoothed.size)
+        start_err = body[0] - smoothed[0]
+        end_err = body[-1] - smoothed[-1]
+        return smoothed + (start_err + (end_err - start_err) * ends)
 
     # method that yields out commands to the test manager. before yielding the last command the class should be in a state from which it can be run again.
     def commands(self):
         # Yield the initial command to set op modes. This command should be yielded before the timer is started, as mode changes may take some time to process
 
+        self.repeat = 1
         yield {
             'input_mode': self.input_mode,
             'output_mode': self.output_mode,
@@ -174,37 +316,40 @@ class TestTrace:
         }
 
 
-        # Use perf_counter (monotonic) instead of time.time(); cached arrays avoid pandas in the hot path.
-        start_time = time.perf_counter()
-        while True:
-            current_time_in_trace = time.perf_counter() - start_time
-            if current_time_in_trace < self._trace_max_time:
-                command = {
-                    'input_mode': self.input_mode,
-                    'output_mode': self.output_mode,
-                    'input_command':  np.interp(current_time_in_trace, self._t_arr, self._in_arr),
-                    'output_command': np.interp(current_time_in_trace, self._t_arr, self._out_arr),
-                }
-                command['log_flag'] = self.log_id_base + str(self.run)
-                yield command
-            else:
-                for i in range(250): # hold constant cmd to stabilize system
-                    yield {
-                        'input_mode': self.input_mode,
-                        'output_mode': self.output_mode,
-                        'input_command': self._in_last,
-                        'output_command': self._out_last,
-                    }
+        # SAMPLE-paced, not wall-clock paced: the n-th command is the trace at
+        # n*dt. The drives are DC-synced and apply one setpoint per cycle on an
+        # exact grid, but step() reads the clock tens of microseconds off that
+        # grid, and that offset can alternate early/late cycle to cycle. Sampling
+        # the trace at the clock turned it into a 500 Hz position zig-zag of
+        # velocity x jitter -- ~15 mrad at 3600 rpm, 6-11 A of current and 3-4 Nm
+        # on the input cell in the 2026-09-16 Archimedes spin runs. Cached arrays
+        # avoid pandas in the hot path.
+        in_body, out_body = self._in_body, self._out_body
+        for n in range(self._n_body):
+            yield {
+                'input_mode': self.input_mode,
+                'output_mode': self.output_mode,
+                'input_command':  in_body[n],
+                'output_command': out_body[n],
+                'log_flag': self.log_id_base + str(self.run),
+            }
 
-                if (self.input_mode == 'position' or self.output_mode == 'position') and not (self.trace[f'{motor_key}_position'].iloc[-1] == 0 for motor_key in ['input_motor', 'output_motor']): # toggle output mode so that the next time a motor switches to position mode it reset
-                    yield {
-                        'input_mode': 'torque',
-                        'output_mode': 'torque',
-                        'input_command': 0,
-                        'output_command': 0
-                    }
-                self.run += 1
-                return # Exits the generator
+        for i in range(250): # hold constant cmd to stabilize system
+            yield {
+                'input_mode': self.input_mode,
+                'output_mode': self.output_mode,
+                'input_command': self._in_last,
+                'output_command': self._out_last,
+            }
+
+        if (self.input_mode == 'position' or self.output_mode == 'position') and not (self.trace[f'{motor_key}_position'].iloc[-1] == 0 for motor_key in ['input_motor', 'output_motor']): # toggle output mode so that the next time a motor switches to position mode it reset
+            yield {
+                'input_mode': 'torque',
+                'output_mode': 'torque',
+                'input_command': 0,
+                'output_command': 0
+            }
+        self.run += 1
 
 class GridSearch:
     def __init__(self, parameters, mode, limits):
@@ -244,7 +389,13 @@ class GridSearch:
             self.settings[key]['control_mode']: self.settings[key]['command_list']
             for key in ['input_motor', 'output_motor']
         }
-        
+
+        # One repeat per grid point: grid_iterator is a full cross product, so
+        # the count is the product of the two axis lengths.
+        self.repeats = (len(self.settings['input_motor']['command_list'])
+                        * len(self.settings['output_motor']['command_list']))
+        self.repeat = 0
+
         # Continuous-torque rating used by the cooldown logic below. Builder
         # generated tests bake the resolved rating into settings; hand-written
         # yamls without it fall back to the historical hardcodes.
@@ -336,8 +487,9 @@ class GridSearch:
         # --- Initialize state for this specific run of the generator ---
         self._state = {'velocity': 0.0, 'torque': 0.0}
         self._point_ct = 0
+        self.repeat = 0
         self._transition_complete_time = None
-        
+
         # yield initial command before timers are started
         yield {
             'input_mode': self.input_mode,
@@ -355,6 +507,7 @@ class GridSearch:
         for raw_setpoint in self._setpoint_generator:
             log_flag = self.log_id_base + str(self.run)+'-SETPOINT'+str(self._point_ct)
             self._point_ct += 1
+            self.repeat = self._point_ct
 
             self._active_setpoint = {
                 self.settings['loop_order'][0]: raw_setpoint[0],
@@ -391,19 +544,1202 @@ class GridSearch:
         yield from self.hold(zero_setpoint, 0.1)
         self.run += 1
 
+class Multisine:
+    """Optional test preamble: a silent hold, optionally followed by a periodic
+    multisine torque excitation at standstill (behavior type 'preamble').
+
+    Deliberately a separate behavior from TestTrace -- it reads no trace file
+    and generates entirely from parameters, so existing tests carry zero
+    regression risk. Everything here is SAMPLE-paced (one yield = one control
+    cycle), never wall-clock paced: coherent averaging in analysis needs exact
+    period boundaries, which perf_counter cannot provide under cycle jitter.
+    For the same reason every command carries a monotonic 'sample_index' that
+    the controller exposes for logging (log key 'preamble_sample').
+
+    Log flags reuse the grid-search span scheme so analysis granularity='run'
+    groups all phases together:
+        <id>-RUN<r>-SETPOINT0    the quiet hold
+        <id>-RUN<r>-SETPOINT<n>  one excitation block per excited role
+    Which span is which phase is left to the data (the quiet span has no
+    active command), matching the applies_to-is-a-data-predicate convention.
+
+    Excitation is torque-mode only (velocity mode would put the drive's
+    velocity loop inside the measurement, and is gated by the far more
+    restrictive acceleration limit). Amplitude is anchored to the noise floor
+    measured during the quiet hold -- never to a fraction of a motor rating,
+    which would be two orders of magnitude wrong across the two ports.
+    """
+
+    # The controller's fixed wiring: DUT always receives input_command, LOAD
+    # always receives output_command. Roles map to devices via the bench's
+    # `ports:` block; this maps the device on to a command-stream side.
+    DEVICE_TO_STREAM = {'DUT': 'input', 'LOAD': 'output'}
+    DRIFT_LIMIT_RAD = 2.0       # |position - start| that aborts an excitation
+    CEILING_FRAC_CONT = 0.05    # absolute safety stop: 5% of continuous torque
+    ROTATUM_MARGIN = 0.9        # keep commanded slew inside 90% of the limit
+    RAMP_DOWN_SAMPLES = 250     # matches TestTrace's stabilizing tail
+    SIGMA_FALLBACK_NM = 0.1     # used when no sensor_reader (preview / no cell)
+
+    def __init__(self, parameters, mode, limits, sensor_reader=None):
+        self.parameters = parameters
+        self.settings = parameters['settings']
+        self.mode = mode                    # bench name, e.g. 'inhouse'
+        self.limits = limits
+        self.sensor_reader = sensor_reader
+        self.log_id_base = parameters['id'] + '-RUN'
+        self.run = 0
+
+        self.preamble_mode = self.settings['mode']
+        assert self.preamble_mode in ('hold', 'multisine'), \
+            f"preamble mode must be 'hold' or 'multisine', got {self.preamble_mode!r}"
+        self.quiet_s = float(self.settings['quiet_s'])
+        assert self.quiet_s >= 1.0, 'preamble quiet_s must be >= 1.0 s'
+
+        with open(f"{dyno_paths.dyno_config_directory}/master_config.yaml") as f:
+            self.dt = yaml.safe_load(f)['cycle_time_us'] / 1e6
+        with open(f"{dyno_paths.dyno_config_directory}/{mode}_dyno_config.yaml") as f:
+            bench = yaml.safe_load(f)
+
+        # Continuous-torque ratings per stream side, for the absolute ceiling.
+        self._cont_torque = {'input': 4.0, 'output': 110.0}  # legacy fallbacks
+        for slave in bench.get('expected_slave_layout', []):
+            side = self.DEVICE_TO_STREAM.get(slave.get('name'))
+            value = (slave.get('params', {}).get('motor_limits', {})
+                     .get('continuous_torque'))
+            if side and value is not None:
+                self._cont_torque[side] = abs(float(value))
+
+        # Resolve the requested role(s) to targets through the bench's ports.
+        ports = bench.get('ports') or [
+            {'role': side, 'device': dev, 'cell': None}
+            for dev, side in self.DEVICE_TO_STREAM.items()]
+        commandable = [p for p in ports
+                       if p.get('device') in self.DEVICE_TO_STREAM]
+        self.targets = []
+        if self.preamble_mode == 'multisine':
+            requested = self.settings.get('role', 'output')
+            chosen = (commandable if requested == 'all' else
+                      [p for p in commandable if p.get('role') == requested])
+            assert chosen, (f"preamble role {requested!r} matches no commandable "
+                            f"port on bench {mode!r} (declared: "
+                            f"{[p.get('role') for p in commandable]})")
+            for p in chosen:
+                self.targets.append({
+                    'role': p.get('role'),
+                    'side': self.DEVICE_TO_STREAM[p['device']],
+                    'cell': p.get('cell'),
+                })
+            self.design = self.settings.get('design') or design_multisine(
+                int(self.settings.get('seed', 1234)), self.dt)
+            self.snr_db = {'gentle': 20.0, 'normal': 30.0, 'hard': 40.0}[
+                self.settings.get('level', 'normal')]
+
+        # The quiet hold is span 0 in every mode, then one excitation block per
+        # target -- the same spans the SETPOINT flags number. A drift abort ends
+        # the behavior below `repeats`, which is what actually happened.
+        self.repeats = 1 + len(self.targets)
+        self.repeat = 0
+
+    # -- waveform synthesis --------------------------------------------------
+
+    def _unit_period(self, weights):
+        """One period of the multisine with per-line amplitudes `weights`,
+        explicitly DC-nulled. Returns a float array of samples_per_period."""
+        N = int(self.design['samples_per_period'])
+        n = np.arange(N)
+        u = np.zeros(N)
+        for line, w in zip(self._excited_lines(), weights):
+            k = line['bin']
+            u += w * np.cos(2 * np.pi * k * n / N + line['phase'])
+        # There is no DC bin by construction, but any numeric DC in a torque
+        # command integrates straight into position runaway on a free shaft.
+        return u - u.mean()
+
+    def _excited_lines(self):
+        return [l for l in self.design['lines'] if not l['detection']]
+
+    def _scaled_period(self, side, sigma):
+        """Synthesize and numerically scale one period for `side`.
+
+        The shaping rule (comment kept ON PURPOSE -- this looks arbitrary
+        later and gets 'simplified' into a bug): shape to equalize SNR per
+        line, which for a roughly white noise floor means FLAT amplitude; then
+        scale to fit the torque ceiling and the rotatum budget; tilt toward
+        1/f ONLY if the slew budget is what binds, and only if that actually
+        buys a better worst-line amplitude. Scaling is numeric (measure the
+        synthesized waveform's real peak and peak slew), not analytic.
+
+        Returns (period_array, report_dict).
+        """
+        N = int(self.design['samples_per_period'])
+        n_avg = (self.design['periods'] - self.design['discard_periods'])
+        # Per-bin amplitude noise of a rectangular-window FFT of N samples,
+        # after coherent averaging across the retained periods.
+        floor = 2.0 * sigma / math.sqrt(N) / math.sqrt(n_avg)
+        target = floor * 10 ** (self.snr_db / 20.0)   # per-line amplitude [Nm]
+
+        ceiling = self.CEILING_FRAC_CONT * self._cont_torque[side]
+        rotatum = self.ROTATUM_MARGIN * self.limits[side]['rotatum']
+
+        lines = self._excited_lines()
+        f_lo = lines[0]['freq_hz']
+
+        def scaled(weights):
+            u = self._unit_period(weights)
+            peak = float(np.max(np.abs(u)))
+            # Periodic waveform: include the wrap-around step in the slew.
+            slew = float(np.max(np.abs(np.diff(np.append(u, u[0]))))) / self.dt
+            s_ceiling = ceiling / peak
+            s_rotatum = rotatum / slew
+            s = min(target, s_ceiling, s_rotatum)
+            bound = ('target SNR' if s == target else
+                     'torque ceiling' if s == s_ceiling else 'rotatum')
+            worst = s * min(weights)      # weakest line's amplitude
+            return u * s, {'scale': s, 'peak_Nm': s * peak,
+                           'peak_slew_Nm_s': s * slew, 'bound': bound,
+                           'worst_line_Nm': worst}
+
+        flat, flat_rep = scaled([1.0] * len(lines))
+        if flat_rep['bound'] != 'rotatum':
+            return flat, dict(flat_rep, shaping='flat', target_line_Nm=target,
+                              floor_Nm=floor, sigma_Nm=sigma)
+        # Slew binds: a 1/f tilt moves amplitude down-band where slew is cheap.
+        tilt, tilt_rep = scaled([f_lo / l['freq_hz'] for l in lines])
+        if tilt_rep['worst_line_Nm'] > flat_rep['worst_line_Nm']:
+            return tilt, dict(tilt_rep, shaping='1/f', target_line_Nm=target,
+                              floor_Nm=floor, sigma_Nm=sigma)
+        return flat, dict(flat_rep, shaping='flat', target_line_Nm=target,
+                          floor_Nm=floor, sigma_Nm=sigma)
+
+    # -- command generation ----------------------------------------------------
+
+    def _cmd(self, side, value, flag=None, sample_index=None):
+        cmd = {'input_mode': 'torque', 'output_mode': 'torque',
+               'input_command': 0.0, 'output_command': 0.0}
+        if side is not None:
+            cmd[f'{side}_command'] = float(value)
+        if flag is not None:
+            cmd['log_flag'] = flag
+        if sample_index is not None:
+            cmd['sample_index'] = float(sample_index)
+        return cmd
+
+    def _read(self):
+        if self.sensor_reader is None:
+            return None
+        try:
+            return self.sensor_reader()
+        except Exception:
+            return None
+
+    def commands(self):
+        # Initial command sets both drives to torque mode before timers start.
+        yield self._cmd(None, 0.0)
+
+        sample = 0
+        setpoint = 0
+        flag_base = self.log_id_base + str(self.run)
+
+        # --- quiet hold: ambient floor, and sigma for the amplitude anchor ---
+        # Runs FIRST in every mode: the floor is needed both to interpret the
+        # excitation and to set its amplitude. Structural, not a user choice.
+        n_quiet = int(round(self.quiet_s / self.dt))
+        n_settle = min(n_quiet // 3, int(round(0.5 / self.dt)))
+        sums, sumsqs, counts = {}, {}, 0
+        flag = f'{flag_base}-SETPOINT{setpoint}'
+        self.repeat = setpoint + 1
+        for i in range(n_quiet):
+            yield self._cmd(None, 0.0, flag, sample)
+            sample += 1
+            if i >= n_settle:
+                reading = self._read()
+                if reading:
+                    for name, value in reading.get('torque', {}).items():
+                        sums[name] = sums.get(name, 0.0) + value
+                        sumsqs[name] = sumsqs.get(name, 0.0) + value * value
+                    counts += 1
+        setpoint += 1
+
+        sigmas = {}
+        for name in sums:
+            mean = sums[name] / counts
+            sigmas[name] = math.sqrt(max(sumsqs[name] / counts - mean * mean, 0.0))
+        if sigmas:
+            print('Preamble: quiet-hold torque cell sigma: '
+                  + ', '.join(f'{k}={v:.4f} Nm' for k, v in sorted(sigmas.items())))
+
+        if self.preamble_mode == 'hold':
+            self.run += 1
+            return
+
+        # --- one excitation block per target role ---------------------------
+        for target in self.targets:
+            side = target['side']
+            sigma = sigmas.get(target['cell'])
+            if sigma is None:
+                # No reader (preview) or no cell on this shaft: fall back and
+                # say so. The fallback is conservative -- amplitudes stay small.
+                sigma = self.SIGMA_FALLBACK_NM
+                print(f"Preamble: no measured sigma for role '{target['role']}'"
+                      f' (cell {target["cell"]!r}); using fallback '
+                      f'{sigma:g} Nm')
+            period, rep = self._scaled_period(side, sigma)
+            print(f"Preamble: role '{target['role']}' ({side} side): "
+                  f"{rep['shaping']} shaping, peak {rep['peak_Nm']:.3f} Nm, "
+                  f"peak slew {rep['peak_slew_Nm_s']:.1f} Nm/s, bound by "
+                  f"{rep['bound']} (per-line target {rep['target_line_Nm'] * 1e3:.2f} mNm "
+                  f"over a {rep['floor_Nm'] * 1e3:.3f} mNm floor). Sanity-check "
+                  f"the peak Nm figure against expected drag.")
+
+            N = len(period)
+            flag = f'{flag_base}-SETPOINT{setpoint}'
+            setpoint += 1
+            self.repeat = setpoint
+            reading = self._read()
+            pos0 = (reading or {}).get('position', {}).get(side)
+            aborted = False
+            last = 0.0
+            for p in range(int(self.design['periods'])):
+                # First period is an amplitude ramp-in (which also satisfies
+                # the start-at-zero invariant); a taper window would destroy
+                # the periodicity the whole scheme depends on.
+                env = None if p else np.arange(N) / N
+                for i in range(N):
+                    last = period[i] * (env[i] if env is not None else 1.0)
+                    yield self._cmd(side, last, flag, sample)
+                    sample += 1
+                # Free-far-shaft safety: zero-mean by construction, but any DC
+                # in command or cell integrates into position runaway. The
+                # config's velocity safety would catch it late; this is early.
+                reading = self._read()
+                pos = (reading or {}).get('position', {}).get(side)
+                if pos0 is not None and pos is not None and \
+                        abs(pos - pos0) > self.DRIFT_LIMIT_RAD:
+                    print(f'Preamble: position drifted {abs(pos - pos0):.2f} rad '
+                          f'during excitation of {side}; aborting this block')
+                    aborted = True
+                    break
+            # Ramp the command back to zero (untagged, like GridSearch ramps).
+            for i in range(self.RAMP_DOWN_SAMPLES):
+                frac = 1.0 - (i + 1) / self.RAMP_DOWN_SAMPLES
+                yield self._cmd(side, last * frac, None, sample)
+                sample += 1
+            if aborted:
+                break
+
+        self.run += 1
+
+
+class Recentre:
+    """Drive the output back to the declared centre using the INPUT shaft
+    (behavior type 'recentre').
+
+    WHY THIS EXISTS. Creep walks the output a little every traverse under load,
+    always in the direction of the applied torque (measured 2026-09-17: the ratio
+    residual rose through outbound and return traverses alike and never
+    reversed). Over an efficiency sweep that drift eats the position window --
+    two runs died at exactly +1.500 rad, 8 and 4 minutes in. Alternating the
+    torque sign cancels it; putting one of these between levels cures it
+    instead, and costs a level's worth of throw rather than half the sweep.
+
+    WHY IT DRIVES IN VELOCITY MODE, NOT POSITION. Two reasons, and the second is
+    the one that bites. A position command would have to be computed from a
+    live error, which is what a behavior generator is for -- fine. But position
+    commands are relative to `pos_cmd_offset`, captured only when the drive
+    ENTERS position mode (devices.py). A recentre that left the input in
+    position mode would be silently undone by the next segment, whose trace
+    starts at 0 and would drag the shaft straight back to where this started.
+    Running in velocity mode forces the next segment's entry into position mode
+    to re-zero against wherever this leaves the shaft, which is exactly the
+    trick RampBreak already uses on its way out.
+
+    NO DIRECTION = NO MOTION. `input_sign` (which way the output turns for a
+    positive input command) is measured by touch-off, not assumed from the
+    config ratio -- see the log's finding 21 for why that sign is not to be
+    trusted. With it unknown, or with no centre declared, or with no
+    sensor_reader at all (preview, offline expansion), this yields a still
+    shaft for `settle_s` and ends. It never guesses: a recentre that picks the
+    wrong way drives the output at the bumper it was trying to move away from.
+
+    The position window stays armed throughout and is the backstop. On top of
+    it this gives up on `timeout_s`, and on an error that grows instead of
+    shrinking -- the cheap self-check that catches a sign that is wrong in a
+    way `input_sign` did not predict.
+    """
+
+    def __init__(self, parameters, mode, limits, sensor_reader=None):
+        self.parameters = parameters
+        self.settings = parameters['settings']
+        self.mode = mode
+        self.limits = limits
+        self.sensor_reader = sensor_reader
+        self.log_id_base = parameters['id'] + '-RUN'
+        self.run = 0
+
+        s = self.settings
+        self.tolerance = abs(float(s.get('tolerance_rad', 0.02)))
+        self.slow_within = abs(float(s.get('slow_within_rad', 0.10)))
+        self.velocity = abs(float(s.get('velocity_rad_s', 4.0)))
+        self.approach = abs(float(s.get('approach_velocity_rad_s', 1.0)))
+        self.accel = abs(float(s.get('acceleration_rad_s2', 20.0)))
+        self.timeout_s = abs(float(s.get('timeout_s', 30.0)))
+        self.settle_s = abs(float(s.get('settle_s', 0.5)))
+        self.hold_mode = s.get('hold_mode', 'torque')
+        self.hold_level = float(s.get('hold_level', 0.0))
+        assert self.hold_mode in ('torque', 'velocity'), \
+            ('recentre hold_mode %r must be torque or velocity: the output is the'
+             ' shaft being moved, so it cannot hold a position' % (self.hold_mode,))
+        assert self.tolerance > 0, 'recentre tolerance_rad must be > 0'
+        assert self.velocity > 0 and self.approach > 0, \
+            'recentre velocities must be > 0'
+        assert self.accel > 0, 'recentre acceleration_rad_s2 must be > 0'
+
+        lim = self.limits['input']
+        assert self.velocity <= lim['velocity'], \
+            ('recentre velocity_rad_s %g exceeds the input motor velocity limit %g'
+             % (self.velocity, lim['velocity']))
+        assert self.accel <= lim['acceleration'], \
+            ('recentre acceleration_rad_s2 %g exceeds the input motor acceleration'
+             ' limit %g' % (self.accel, lim['acceleration']))
+        if self.hold_mode == 'torque':
+            hold_limit = self.limits['output']['torque']
+            assert abs(self.hold_level) <= hold_limit, \
+                ('recentre hold_level %g exceeds the output motor torque limit %g'
+                 % (self.hold_level, hold_limit))
+
+        with open(dyno_paths.dyno_config_directory + '/master_config.yaml') as f:
+            self.dt = yaml.safe_load(f)['cycle_time_us'] / 1e6
+
+        self.repeats = 1
+        self.repeat = 0
+
+    def _cmd(self, input_velocity, flag=None, ratio_reset=False):
+        cmd = {'input_mode': 'velocity', 'input_command': float(input_velocity),
+               'output_mode': self.hold_mode, 'output_command': self.hold_level}
+        if flag is not None:
+            cmd['log_flag'] = flag
+        if ratio_reset:
+            # Tells the controller to re-zero the ratio-break watch HERE. A
+            # recentre moves both shafts together, so it does not reduce the
+            # accumulated ratio error at all -- only this does. Without it the
+            # error carries every level's creep forward and trips `ratio_break`
+            # partway through a sweep that is behaving perfectly.
+            cmd['ratio_reset'] = True
+        return cmd
+
+    def _reading(self):
+        if self.sensor_reader is None:
+            return None
+        try:
+            return self.sensor_reader() or None
+        except Exception:
+            return None
+
+    def _error(self, reading):
+        """How far the output is from centre, output rad, or None if unknown."""
+        if not reading:
+            return None
+        centre = reading.get('centre')
+        position = (reading.get('position') or {}).get('output')
+        if centre is None or position is None:
+            return None
+        try:
+            error = float(centre) - float(position)
+        except (TypeError, ValueError):
+            return None
+        return None if math.isnan(error) else error
+
+    def commands(self):
+        flag = self.log_id_base + str(self.run)
+        self.repeat = 1
+        # Mode-set command first, before any timing, exactly as the others do.
+        yield self._cmd(0.0, flag)
+
+        reading = self._reading()
+        error = self._error(reading)
+        sign = (reading or {}).get('input_sign')
+        if error is None or not sign:
+            why = ('no sensor_reader' if self.sensor_reader is None else
+                   'no centre declared or output position unreadable'
+                   if error is None else 'input_sign not measured (run touch-off)')
+            if self.sensor_reader is not None:
+                # Silent with no reader at all: that is offline expansion, where
+                # every recentre in the plan would say it, and a 480-segment
+                # efficiency sweep would bury the generator's own summary.
+                print('Recentre: skipped -- %s' % (why,))
+            # No reset on this path: nothing was recentred, so the watch must
+            # keep whatever it had rather than forgive drift it never undid.
+            for _ in range(int(round(self.settle_s / self.dt))):
+                yield self._cmd(0.0, flag)
+            self.run += 1
+            return
+
+        start_error = error
+        best = abs(error)
+        speed = 0.0
+        step = self.accel * self.dt
+        n_max = int(round(self.timeout_s / self.dt))
+        outcome = 'timed out'
+        for _ in range(n_max):
+            error = self._error(self._reading())
+            if error is None:
+                outcome = 'feedback lost'
+                break
+            if abs(error) <= self.tolerance:
+                outcome = 'centred'
+                break
+            # Growing error means the direction is wrong in a way input_sign did
+            # not predict. Stop rather than drive on toward a bumper.
+            if abs(error) > best + max(self.tolerance, 0.05):
+                outcome = 'error grew -- direction wrong, stopped'
+                break
+            best = min(best, abs(error))
+            target = (self.approach if abs(error) <= self.slow_within
+                      else self.velocity)
+            # Command sign: `sign` is the output direction a POSITIVE input
+            # command produces, so moving the output toward centre by `error`
+            # wants an input command of sign(error) * input_sign.
+            target *= 1.0 if error > 0 else -1.0
+            target *= 1.0 if sign > 0 else -1.0
+            speed += max(-step, min(step, target - speed))
+            yield self._cmd(speed, flag)
+
+        # Ramp the speed command back to zero rather than dropping it: a step to
+        # zero in velocity mode is the drive's own decel ramp, not ours.
+        while abs(speed) > 1e-9:
+            speed -= max(-step, min(step, speed))
+            yield self._cmd(speed, flag)
+        # Reset only where the output actually ended up centred: a timeout or a
+        # wrong-direction abort leaves it displaced, and forgiving that would
+        # hide exactly the drift the watch exists to catch.
+        reset = outcome == 'centred'
+        for _ in range(int(round(self.settle_s / self.dt))):
+            yield self._cmd(0.0, flag, ratio_reset=reset)
+        final = self._error(self._reading())
+        print('Recentre: %s (%+.4f -> %s rad of centre)'
+              % (outcome, start_error,
+                 'unknown' if final is None else '%+.4f' % (final,)))
+        self.run += 1
+
+
+class Throw:
+    """Limit-to-limit throws: run one motor in velocity mode, stop it on a
+    predicted turnaround angle, reverse (behavior type 'throw').
+
+    See docs/archimedes_throw_mode_design.md. The shape:
+
+      * `drive_motor` (input or output) is commanded in VELOCITY mode. The same
+        motor does the braking. The other motor holds `hold_level` Nm.
+      * Every cycle the output angle and velocity are read from the OUTPUT
+        encoder, whichever motor drives -- position, velocity, target and
+        `stop_decel` are all output-shaft quantities. Only the command sent to
+        the drive is in the drive motor's own frame (via the measured
+        `input_sign` and the gear ratio).
+      * Fire when   x + stop_travel(v)  >=  target_rad,  with x and v measured
+        along the throw direction, where stop_travel is v^2 / (2 * stop_decel)
+        or, for a drive with a measured `stop_lag_s`, stop_lag_s * v. `v` is the
+        LIVE velocity, not the commanded one: in velocity mode the shaft swings
+        well past its command (a 3.0 rad/s command reached 4.2 in
+        velocity_mode_6).
+      * On fire, command velocity 0 and wait for rest, re-zero the slip
+        reference (`ratio_reset`), then throw the other way.
+
+    DRIFT NEEDS NO HANDLING. The trigger reads live position, so creep just
+    shortens the next throw.
+
+    `stop_decel` is MEASURED, one figure per drive motor, in the rig config
+    (`throw.stop_decel_rad_s2: {input:, output:}`). A null entry refuses the
+    plan: a guessed value is unsafe in the direction that matters (too high
+    shortens the predicted stop). `stop_decel_rad_s2` in the settings overrides
+    it, for calibration runs.
+
+    A stop under a velocity loop is not always a constant decel. The output
+    drive's stop travel grows LINEARLY with speed (gbx_1p2p2 velocity_ramp_7:
+    0.05 rad at 0.7 rad/s, 0.25 at 4.3, i.e. a_eff 5 -> 36), which a constant
+    decel fits at only one speed: the configured 70 rad/s^2 is about twice the
+    measured 36 at 4 rad/s, so fast stops were predicted at half their travel
+    and the turnaround came late enough to run the output into the window. For
+    that shape the rig config carries `throw.stop_lag_s: {output: <s>}` and the
+    travel is predicted as stop_lag_s * v. A configured lag REPLACES the
+    constant-decel term for that drive (the two would double count). A
+    `stop_decel_rad_s2` in the settings is a calibration override and wins over
+    the rig lag; `stop_lag_s` in the settings overrides it the other way.
+
+    The position window stays armed behind all this as the abort. The one thing
+    tying them together is the load-time check in __init__ that a nominal throw
+    cannot reach the window's own early-trip boundary.
+
+    NO FEEDBACK = NO MOTION when a sensor_reader exists but cannot say where the
+    output is (no centre, NaN, or -- input drive only -- no input_sign). With NO
+    sensor_reader at all (preview, offline expansion) the behavior dead-reckons
+    the output from its own commands, so the preview shows the nominal throws.
+
+    Log flags: only the steady-speed part of each throw is tagged,
+    <id>-RUN<r>-SETPOINT<k>. Ramp-up, braking and rest are untagged, so
+    post-processing excludes the transients exactly.
+    """
+
+    STOP_TIMEOUT_S = 3.0
+    HOLD_VMAX_OUT = 0.5     # rad/s, output shaft: cap on the position-hold correction
+
+    def __init__(self, parameters, mode, limits, sensor_reader=None):
+        self.parameters = parameters
+        self.settings = parameters['settings']
+        self.mode = mode
+        self.limits = limits
+        self.sensor_reader = sensor_reader
+        self.log_id_base = parameters['id'] + '-RUN'
+        self.run = 0
+
+        s = self.settings
+        self.drive = s.get('drive_motor')
+        assert self.drive in ('input', 'output'), \
+            "throw drive_motor must be 'input' or 'output', got %r" % (self.drive,)
+        self.hold = 'output' if self.drive == 'input' else 'input'
+        self.speed = abs(float(s['speed_rad_s']))
+        self.target = abs(float(s['target_rad']))
+        self.ramp_accel = abs(float(s.get('ramp_accel', 20.0)))
+        self.n_throws = int(s.get('n_throws', 4))
+        self.start_dir = 1.0 if float(s.get('start_dir', 1)) >= 0 else -1.0
+        self.hold_level = float(s.get('hold_level', 0.0))
+        self.hold_follows_dir = bool(s.get('hold_follows_dir', False))
+        self.settle_s = abs(float(s.get('settle_s', 0.2)))
+        self.rest_velocity = abs(float(s.get('rest_velocity_rad_s', 0.05)))
+        self.window_margin = abs(float(s.get('window_margin_rad', 0.05)))
+        # Hold-torque ramps at the ends of the behavior. 0 = the hold torque is a
+        # step at the start and simply stops at the end (the original behaviour).
+        # > 0: ramp 0 -> hold_level at this rate before the first throw, and
+        # hold_level -> 0 after the last one, then sit at 0 Nm for zero_hold_s.
+        # Consecutive throw segments then meet at ZERO torque instead of
+        # stepping straight from +T to -T with the shaft resting at an edge --
+        # which snapped the output through its lost motion at 6 rad/s and tripped
+        # the window (gbx_1p2p2 forward_driving/efficiency_test, 2026-09-29).
+        self.hold_ramp = abs(float(s.get('hold_ramp_nm_s', 0.0)))
+        self.zero_hold_s = abs(float(s.get('zero_hold_s', 0.0)))
+        # Outer position loop for those ramps and the zero dwell, 1/s. 0 = the
+        # drive is held at velocity 0 (the original behaviour). A velocity loop
+        # at zero does NOT hold position while the hold torque changes: its
+        # integrator lets the shaft walk ~ dT / Ki_eff regardless of the ramp
+        # rate (0.0115 rad/Nm on gbx_1p2p2 LOAD, vl.kp 1 / vl.ki 2; bwd
+        # efficiency_03..05, 2026-09-30), which on a +/-T sign flip carried the
+        # output 0.3-0.6 rad past the turnaround and into the window. > 0:
+        # the drive is commanded kp * (x_hold - x), clipped to HOLD_VMAX_OUT,
+        # with x_hold latched where the ramp starts. Velocity mode throughout,
+        # so there is no mode switch to drop the drive's torque mid-ramp.
+        self.hold_kp = abs(float(s.get('hold_position_kp', 0.0)))
+        assert self.speed > 0, 'throw speed_rad_s must be > 0'
+        assert self.target > 0, 'throw target_rad must be > 0'
+        assert self.ramp_accel > 0, 'throw ramp_accel must be > 0'
+        assert self.n_throws >= 1, 'throw n_throws must be >= 1'
+
+        lim = self.limits[self.drive]
+        assert self.speed <= lim['velocity'], \
+            ('throw speed_rad_s %g exceeds the %s motor velocity limit %g'
+             % (self.speed, self.drive, lim['velocity']))
+        assert self.ramp_accel <= lim['acceleration'], \
+            ('throw ramp_accel %g exceeds the %s motor acceleration limit %g'
+             % (self.ramp_accel, self.drive, lim['acceleration']))
+        hold_limit = self.limits[self.hold]['torque']
+        rotatum = self.limits[self.hold].get('rotatum')
+        assert rotatum is None or self.hold_ramp <= rotatum, \
+            ('throw hold_ramp_nm_s %g exceeds the %s motor rotatum limit %g'
+             % (self.hold_ramp, self.hold, rotatum or 0.0))
+        assert abs(self.hold_level) <= hold_limit, \
+            ('throw hold_level %g exceeds the %s motor torque limit %g'
+             % (self.hold_level, self.hold, hold_limit))
+        if self.hold == 'output':
+            reaction = reaction_torque_issue(abs(self.hold_level), self.limits)
+            assert reaction is None, 'throw hold_level: %s' % (reaction,)
+
+        # Everything below is in OUTPUT-shaft units.
+        ratio = abs(self.limits['input'].get('gear_ratio') or 0)
+        if self.drive == 'input':
+            assert ratio > 0, 'throw with the input driving needs a gear_ratio'
+            self.v_out = self.speed / ratio
+            self.accel_out = self.ramp_accel / ratio
+        else:
+            self.v_out = self.speed
+            self.accel_out = self.ramp_accel
+
+        rig = self._load_rig()
+        decel = s.get('stop_decel_rad_s2') or None
+        lag = s.get('stop_lag_s') or None
+        if decel is None and lag is None:
+            lag = (rig.get('stop_lag') or {}).get(self.drive) or None
+        if decel is None and lag is None:
+            decel = (rig.get('stop_decel') or {}).get(self.drive)
+        assert lag is not None or (decel is not None and float(decel) > 0), \
+            ('throw: no stop_decel_rad_s2 or stop_lag_s for drive_motor %r. Measure it '
+             '(v=0 stops across a speed ladder, same drive/mode/torque) and put it under '
+             '`throw.stop_decel_rad_s2` (or `throw.stop_lag_s`) in the rig config.'
+             % (self.drive,))
+        assert lag is None or float(lag) > 0, 'throw stop_lag_s must be > 0'
+        self.stop_lag = None if lag is None else float(lag)
+        self.stop_decel = None if decel is None else float(decel)
+
+        # A nominal throw must not be aborted by the window it runs inside:
+        # target + the window's own predicted stop at this speed + margin has to
+        # sit inside half_window. Refused rather than clipped, so the plan says
+        # what it does.
+        if rig.get('window_enabled') and rig.get('half_window'):
+            window_decel = float(rig.get('window_decel') or 0.0)
+            reach = throw_window_reach(self.target, self.window_margin, self.v_out,
+                                       window_decel)
+            assert reach < float(rig['half_window']), \
+                ('throw target %g rad + margin %g + window look-ahead %.3f (at %g rad/s, '
+                 'window stop_decel %g) = %.3f reaches half_window_rad %g: lower the '
+                 'target or the speed'
+                 % (self.target, self.window_margin, reach - self.target - self.window_margin,
+                    self.v_out, window_decel, reach, float(rig['half_window'])))
+
+        with open(dyno_paths.dyno_config_directory + '/master_config.yaml') as f:
+            self.dt = yaml.safe_load(f)['cycle_time_us'] / 1e6
+
+        # A throw that never fires (frozen feedback) must still end.
+        self.throw_timeout_s = 3.0 * (2.0 * self.target / self.v_out
+                                      + self.v_out / self.accel_out) + 1.0
+
+        self.repeats = self.n_throws
+        self.repeat = 0
+        self.stops = []             # one record per stop, for the decel fit
+
+        self._sign = 1.0            # output direction per +drive command
+        self._last_speed = 0.0      # last commanded speed, driven-shaft frame
+        self._sim = {'rel': 0.0, 'v': 0.0}     # offline dead-reckoning state
+
+    def stop_travel(self, v):
+        """Output angle the shaft covers after a velocity-0 command from speed
+        `v` (>= 0): stop_lag_s * v where a lag is configured, else v^2/(2a)."""
+        if self.stop_lag is not None:
+            return self.stop_lag * v
+        return v * v / (2.0 * self.stop_decel)
+
+    def _load_rig(self):
+        """Rig-config values the throw depends on. Its own method so the sim can
+        substitute them without touching a config file."""
+        with open('%s/%s_dyno_config.yaml'
+                  % (dyno_paths.dyno_config_directory, self.mode)) as f:
+            return throw_rig_from_config(yaml.safe_load(f))
+
+    def _cmd(self, speed, hold_dir, flag=None, ratio_reset=False, hold=None):
+        """`speed` is signed in OUTPUT direction, in the driven shaft's units.
+        `hold` overrides the hold torque (the end ramps)."""
+        self._last_speed = speed
+        if hold is None:
+            hold = self.hold_level * (hold_dir if self.hold_follows_dir else 1.0)
+        self._last_hold = hold
+        cmd = {'input_mode': 'velocity' if self.drive == 'input' else 'torque',
+               'output_mode': 'velocity' if self.drive == 'output' else 'torque',
+               'input_command': speed * self._sign if self.drive == 'input' else hold,
+               'output_command': speed if self.drive == 'output' else hold}
+        if flag is not None:
+            cmd['log_flag'] = flag
+        if ratio_reset:
+            cmd['ratio_reset'] = True
+        return cmd
+
+    def _read(self):
+        """(rel, v, input_sign) in output coordinates, or None if unknown.
+        Offline (no sensor_reader) this also advances the dead-reckoned plant one
+        cycle from the last command."""
+        if self.sensor_reader is None:
+            sim = self._sim
+            target = self._last_speed / (abs(self.limits['input'].get('gear_ratio') or 1)
+                                         if self.drive == 'input' else 1.0)
+            braking = abs(target) < abs(sim['v']) or target * sim['v'] < 0
+            if braking and self.stop_lag is not None:
+                # First-order stop: travel to rest is exactly stop_lag * v0.
+                sim['v'] += (target - sim['v']) * min(1.0, self.dt / self.stop_lag)
+            else:
+                rate = (self.stop_decel if braking else self.accel_out) * self.dt
+                sim['v'] += max(-rate, min(rate, target - sim['v']))
+            sim['rel'] += sim['v'] * self.dt
+            return sim['rel'], sim['v'], 1.0
+        try:
+            r = self.sensor_reader() or {}
+            centre = r.get('centre')
+            pos = (r.get('position') or {}).get('output')
+            v = (r.get('velocity') or {}).get('output')
+            rel = float(pos) - float(centre)
+            v = float(v)
+        except (TypeError, ValueError):
+            return None
+        if math.isnan(rel) or math.isnan(v):
+            return None
+        return rel, v, r.get('input_sign')
+
+    def _still(self, flag=None):
+        hold = self._last_hold if self.hold_ramp else None
+        for _ in range(max(1, int(round(self.settle_s / self.dt)))):
+            yield self._cmd(0.0, 1.0, flag, hold=hold)
+
+    def _hold_ref(self):
+        """Output angle to hold through a torque ramp, or None when the position
+        hold is off or the output cannot be read (the drive then sits at
+        velocity 0, as before)."""
+        if not self.hold_kp:
+            return None
+        reading = self._read()
+        return None if reading is None else reading[0]
+
+    def _hold_speed(self, x_hold):
+        """Drive command, driven-shaft units, that pulls the output back to
+        `x_hold`: kp * error, clipped. 0 when there is nothing to hold."""
+        if x_hold is None:
+            return 0.0
+        reading = self._read()
+        if reading is None:
+            return 0.0
+        v = self.hold_kp * (x_hold - reading[0])
+        v = max(-self.HOLD_VMAX_OUT, min(self.HOLD_VMAX_OUT, v))
+        return v * (abs(self.limits['input'].get('gear_ratio') or 1.0)
+                    if self.drive == 'input' else 1.0)
+
+    def _ramp_hold(self, a, b, x_hold=None):
+        """Hold torque a -> b at hold_ramp Nm/s, drive holding `x_hold` (latched
+        here if not given) or, with no position hold, at velocity 0."""
+        n = int(math.ceil(abs(b - a) / (self.hold_ramp * self.dt))) if b != a else 0
+        if x_hold is None:
+            x_hold = self._hold_ref()
+        for i in range(1, n + 1):
+            yield self._cmd(self._hold_speed(x_hold), 1.0, hold=a + (b - a) * i / n)
+
+    def _ramp_out(self):
+        """End of the behavior: hold torque to zero, then a zero-torque dwell."""
+        if not self.hold_ramp:
+            return
+        x_hold = self._hold_ref()
+        yield from self._ramp_hold(self._last_hold, 0.0, x_hold)
+        for _ in range(int(round(self.zero_hold_s / self.dt))):
+            yield self._cmd(self._hold_speed(x_hold), 1.0, hold=0.0)
+
+    def commands(self):
+        say = self.sensor_reader is not None
+        self.repeat = 0
+        self._last_hold = 0.0
+        # Mode-set, before any timing. With a hold ramp the torque starts at 0.
+        yield self._cmd(0.0, self.start_dir, hold=0.0 if self.hold_ramp else None)
+
+        first = self._read()
+        if first is None or (self.drive == 'input' and not first[2]):
+            if say:
+                print('Throw: skipped -- %s' % (
+                    'no centre declared or output position unreadable' if first is None
+                    else 'input_sign not measured (run touch-off)'))
+            yield from self._still()
+            self.run += 1
+            return
+        if self.drive == 'input':
+            self._sign = 1.0 if first[2] > 0 else -1.0
+
+        direction = self.start_dir
+        if direction * first[0] >= self.target:
+            direction = -direction          # already at that end: go the other way
+        if self.hold_ramp:
+            yield from self._ramp_hold(
+                0.0, self.hold_level * (direction if self.hold_follows_dir else 1.0),
+                first[0] if self.hold_kp else None)
+        step = self.ramp_accel * self.dt
+        n_timeout = int(round(self.throw_timeout_s / self.dt))
+        n_rest = max(1, int(round(self.settle_s / self.dt)))
+        n_stop_timeout = int(round(self.STOP_TIMEOUT_S / self.dt))
+        speed = 0.0
+        ok = True
+
+        for k in range(1, self.n_throws + 1):
+            self.repeat = k
+            flag = '%s%d-SETPOINT%d' % (self.log_id_base, self.run, k)
+            goal = direction * self.speed
+            fired = None
+            for _ in range(n_timeout):
+                reading = self._read()
+                if reading is None:
+                    break
+                rel, v, _s = reading
+                x, vx = direction * rel, max(direction * v, 0.0)
+                if x + self.stop_travel(vx) >= self.target:
+                    fired = (rel, v)
+                    break
+                speed += max(-step, min(step, goal - speed))
+                steady = abs(speed - goal) < 1e-9
+                yield self._cmd(speed, direction, flag if steady else None)
+            if fired is None:
+                if say:
+                    print('Throw %d: no turnaround (feedback lost or timed out) -- ended' % k)
+                ok = False
+                break
+
+            # Fire: velocity 0, then wait for rest.
+            speed = 0.0
+            peak = direction * fired[0]
+            at_rest, outcome = 0, 'stopped'
+            for i in range(n_stop_timeout):
+                yield self._cmd(0.0, direction)
+                reading = self._read()
+                if reading is None:
+                    outcome = 'feedback lost'
+                    break
+                peak = max(peak, direction * reading[0])
+                at_rest = at_rest + 1 if abs(reading[1]) < self.rest_velocity else 0
+                if at_rest >= n_rest:
+                    break
+            else:
+                outcome = 'did not come to rest'
+            if outcome != 'stopped':
+                if say:
+                    print('Throw %d: %s after the stop command -- ended' % (k, outcome))
+                ok = False
+                break
+
+            # At rest: the slip reference is re-zeroed here, once per stop.
+            yield self._cmd(0.0, direction, ratio_reset=True)
+            vx_fire = max(direction * fired[1], 0.0)
+            self.stops.append({
+                'throw': k, 'direction': direction,
+                'fire_rel': fired[0], 'fire_v': fired[1],
+                'peak_rel': direction * peak, 'rest_rel': reading[0],
+                'travel': peak - direction * fired[0],
+                'predicted_travel': self.stop_travel(vx_fire),
+            })
+            if say:
+                print('Throw %d (%+d): fired at %+.4f rad, %.2f rad/s; peak %+.4f, rest %+.4f '
+                      '(travel %.4f, predicted %.4f)'
+                      % (k, direction, fired[0], fired[1], direction * peak, reading[0],
+                         peak - direction * fired[0], self.stop_travel(vx_fire)))
+            direction = -direction
+
+        if not ok:
+            yield from self._still()
+        yield from self._ramp_out()
+        self.run += 1
+
+
+class RampBreak:
+    """Event-terminated torque ramp: the stiction / breakaway test
+    (behavior type 'ramp_break').
+
+    One motor ramps torque slowly from zero while the other holds; the moment
+    the shaft is seen to move, the ramp stops and releases back to zero, rests,
+    and the next ramp starts (in the opposite direction, if bipolar). The
+    breakaway torque is the static friction.
+
+    WHY THIS IS A BEHAVIOR AND NOT A TRACE PATTERN. A trace is precomputed and
+    replayed open-loop by TestTrace, so its release point is a wall-clock time
+    fixed before the test ran. Releasing on the *event* needs live feedback in
+    the command loop, which only a generator can do. The plumbing already
+    existed for the multisine preamble: TestManager passes `sensor_reader`
+    straight through, and the controller's snapshot is read inside the
+    generator, on the control thread, one cycle behind the command.
+
+    TRIGGER IS NOT MEASUREMENT. The detector here only decides *when to
+    release*. The breakaway torque itself is still read off the log afterwards
+    from the window just before motion onset (see the stiction analysis), which
+    is why the online detector can afford to be conservative: a trigger a few
+    milliseconds late costs nothing, a trigger on sensor noise costs a whole
+    ramp cycle. The predicate matches the offline one -- |velocity| over
+    threshold after having been below it for `stuck_s` -- which is causal (the
+    stuck window looks backwards only), so it ports to a running counter with
+    no change of meaning.
+
+    NO SENSOR = NO DETECTION, BY DESIGN. With `sensor_reader` None (preview,
+    offline expansion) or a reading that does not carry velocity, every ramp
+    runs to `amplitude` and releases on the ceiling. That is the worst case the
+    hardware could be asked for, which is exactly what the limit checks and the
+    preview plot should be showing. `amplitude` is therefore always a real
+    ceiling, never merely a hint -- on the rig too, a shaft that never breaks
+    free stops the ramp there.
+
+    Everything is SAMPLE-paced (one yield = one control cycle), not wall-clock
+    paced: the commanded torque at the trigger is then an exact function of the
+    sample count, so cycle jitter cannot smear the number the whole test exists
+    to measure.
+
+    Log flags reuse the grid-search span scheme, one span per ramp attempt,
+    covering ramp + release + rest so a span holds one complete breakaway
+    story:  <id>-RUN<r>-SETPOINT<n>. The moves between hold levels are
+    untagged, like GridSearch's ramps.
+    """
+
+    RAMP_DOWN_SAMPLES = 250     # matches TestTrace's stabilizing tail
+
+    def __init__(self, parameters, mode, limits, sensor_reader=None):
+        self.parameters = parameters
+        self.settings = parameters['settings']
+        self.mode = mode
+        self.limits = limits
+        self.sensor_reader = sensor_reader
+        self.log_id_base = parameters['id'] + '-RUN'
+        self.run = 0
+
+        s = self.settings
+        self.ramp_motor = s['ramp_motor']
+        assert self.ramp_motor in ('input', 'output'), \
+            "ramp_break ramp_motor must be 'input' or 'output', got %r" % (self.ramp_motor,)
+        self.hold_motor = 'output' if self.ramp_motor == 'input' else 'input'
+        self.hold_mode = s.get('hold_mode', 'torque')
+        assert self.hold_mode in ('torque', 'velocity', 'position'), \
+            'ramp_break hold_mode %r is not a control mode' % (self.hold_mode,)
+
+        self.hold_levels = [float(v) for v in s.get('hold_levels', [0.0])] or [0.0]
+        self.hold_rate = max(abs(float(s.get('hold_rate', 1.0))), 1e-12)
+        self.hold_settle_s = max(float(s.get('hold_settle_s', 0.0)), 0.0)
+        self.lead_in_s = max(float(s.get('lead_in_s', 0.0)), 0.0)
+
+        self.amplitude = abs(float(s['amplitude']))
+        self.rate = abs(float(s['rate']))
+        assert self.amplitude > 0, 'ramp_break amplitude must be > 0'
+        assert self.rate > 0, 'ramp_break rate must be > 0'
+        self.release_s = max(float(s.get('release_s', 1.0)), 1e-3)
+        self.rest_s = max(float(s.get('rest_s', 0.0)), 0.0)
+        self.bipolar = bool(s.get('bipolar', True))
+        # Which way a non-bipolar ramp pushes. Absent (every plan written before
+        # this existed) means +1, which is what a non-bipolar ramp always did.
+        self.direction = 1.0 if float(s.get('direction', 1)) >= 0 else -1.0
+        self.cycles = max(1, int(s.get('cycles', 1)))
+
+        detect = s.get('detect') or {}
+        self.v_thresh = abs(float(detect.get('velocity_threshold', 0.5)))
+        self.stuck_s = max(float(detect.get('stuck_s', 0.25)), 0.0)
+        self.debounce = max(1, int(detect.get('debounce_cycles', 5)))
+        self.arm_fraction = min(max(float(detect.get('arm_fraction', 0.05)), 0.0), 1.0)
+        assert self.v_thresh > 0, 'ramp_break velocity_threshold must be > 0'
+
+        with open(dyno_paths.dyno_config_directory + '/master_config.yaml') as f:
+            self.dt = yaml.safe_load(f)['cycle_time_us'] / 1e6
+        self.stuck_samples = int(round(self.stuck_s / self.dt))
+
+        # The same ceilings TestTrace enforces, applied to the plan rather than
+        # to a trace file. The release slew is checked at `amplitude` because
+        # that is the largest value a release can ever start from.
+        ramp_limits = self.limits[self.ramp_motor]
+        assert self.amplitude <= ramp_limits['torque'], \
+            ('ramp_break amplitude %g Nm exceeds the %s motor torque limit %g'
+             % (self.amplitude, self.ramp_motor, ramp_limits['torque']))
+        assert self.rate <= ramp_limits['rotatum'], \
+            ('ramp_break rate %g Nm/s exceeds the %s motor rotatum limit %g'
+             % (self.rate, self.ramp_motor, ramp_limits['rotatum']))
+        assert self.amplitude / self.release_s <= ramp_limits['rotatum'], \
+            ('ramp_break release slew %g Nm/s exceeds the %s motor rotatum '
+             'limit %g; lengthen release_s'
+             % (self.amplitude / self.release_s, self.ramp_motor,
+                ramp_limits['rotatum']))
+        if self.ramp_motor == 'output':
+            reaction = reaction_torque_issue(self.amplitude, self.limits)
+            assert reaction is None, 'ramp_break amplitude: %s' % (reaction,)
+
+        hold_peak = max(abs(v) for v in self.hold_levels)
+        hold_limit = self.limits[self.hold_motor].get(self.hold_mode)
+        if hold_limit is not None:
+            assert hold_peak <= hold_limit, \
+                ('ramp_break hold level %g exceeds the %s motor %s limit %g'
+                 % (hold_peak, self.hold_motor, self.hold_mode, hold_limit))
+        if self.hold_mode == 'torque' and self.hold_motor == 'output':
+            reaction = reaction_torque_issue(hold_peak, self.limits)
+            assert reaction is None, 'ramp_break hold level: %s' % (reaction,)
+
+        self._peak = 0.0        # command value the last ramp ended on
+
+        # One repeat per ramp attempt. Fixed here even though the DURATION of
+        # each attempt is not: a ramp releases whenever the shaft breaks free,
+        # anywhere between the arm floor and the amplitude ceiling. This count
+        # is the only part of a ramp_break's progress that can be stated up
+        # front, which is exactly why the readout leads with it.
+        self.repeats = (len(self.hold_levels) * self.cycles
+                        * (2 if self.bipolar else 1))
+        self.repeat = 0
+
+    # -- command helpers -----------------------------------------------------
+
+    def _cmd(self, ramp_value, hold_value, flag=None, breakaway=None):
+        cmd = {self.ramp_motor + '_mode': 'torque',
+               self.ramp_motor + '_command': float(ramp_value),
+               self.hold_motor + '_mode': self.hold_mode,
+               self.hold_motor + '_command': float(hold_value)}
+        if flag is not None:
+            cmd['log_flag'] = flag
+        if breakaway is not None:
+            # Marks the single sample the detector fired on, carrying the
+            # command value it fired at (log key 'breakaway_torque', NaN
+            # everywhere else). Without it a reader cannot tell a release that
+            # was triggered from one that merely hit the ceiling.
+            cmd['breakaway'] = float(breakaway)
+        return cmd
+
+    def _read_speed(self):
+        """|velocity| of the ramping motor, or None when it cannot be read --
+        which the caller must treat as 'no detection possible', never as zero
+        (zero would mean 'definitely stuck' and arm the detector on nothing)."""
+        if self.sensor_reader is None:
+            return None
+        try:
+            reading = self.sensor_reader()
+        except Exception:
+            return None
+        velocity = (reading or {}).get('velocity') or {}
+        value = velocity.get(self.ramp_motor)
+        if value is None:
+            return None
+        return abs(float(value))
+
+    def _dwell(self, ramp_value, hold_value, duration, flag=None):
+        for _ in range(int(round(duration / self.dt))):
+            yield self._cmd(ramp_value, hold_value, flag)
+
+    def _move_hold(self, start, target):
+        """Rate-limited move of the hold motor, ramp motor at zero, untagged."""
+        n = int(round(abs(target - start) / self.hold_rate / self.dt))
+        for i in range(n):
+            yield self._cmd(0.0, start + (target - start) * (i + 1) / n)
+
+    # -- the ramp ------------------------------------------------------------
+
+    def _ramp_to_break(self, sign, hold_value, flag):
+        """Ramp torque until the shaft breaks free, or until `amplitude`.
+
+        Leaves the command value it stopped at in self._peak, for the release.
+        """
+        step = self.rate * self.dt
+        max_samples = int(math.ceil(self.amplitude / step))
+        arm_floor = self.arm_fraction * self.amplitude
+        stuck = 0               # consecutive samples seen below threshold
+        stuck_at_onset = 0      # how long it had been stuck when motion started
+        moving_run = 0          # consecutive samples seen above threshold
+        value = 0.0
+
+        for i in range(1, max_samples + 1):
+            value = sign * min(i * step, self.amplitude)
+            speed = self._read_speed()
+            if speed is not None and speed > self.v_thresh:
+                if moving_run == 0:
+                    stuck_at_onset = stuck
+                moving_run += 1
+                stuck = 0
+            else:
+                # An unreadable sensor lands here too, but it can never trigger
+                # a release: moving_run stays 0, so the ramp runs to the ceiling.
+                moving_run = 0
+                stuck += 1
+            # `stuck` starts at 0 on every ramp rather than carrying over from
+            # the rest period: after a lurch the shaft may still be coasting
+            # when the next ramp begins, and re-earning the stuck window is what
+            # stops that coast from reading as an instant breakaway. It costs
+            # stuck_s of ramp, which at these rates is a few mNm.
+            if (moving_run >= self.debounce
+                    and stuck_at_onset >= self.stuck_samples
+                    and abs(value) >= arm_floor):
+                self._peak = value
+                print('RampBreak: breakaway at %+.4g Nm (%s motor)'
+                      % (value, self.ramp_motor))
+                yield self._cmd(value, hold_value, flag, breakaway=value)
+                return
+            yield self._cmd(value, hold_value, flag)
+
+        self._peak = value
+        print('RampBreak: no breakaway; ramp hit the %+.4g Nm ceiling' % (value,))
+
+    def _release(self, hold_value, flag):
+        n = max(1, int(round(self.release_s / self.dt)))
+        start = self._peak
+        for i in range(1, n + 1):
+            yield self._cmd(start * (1.0 - i / n), hold_value, flag)
+
+    # -- command generation --------------------------------------------------
+
+    def commands(self):
+        # Initial command sets op modes before any timing starts.
+        yield self._cmd(0.0, 0.0)
+
+        flag_base = self.log_id_base + str(self.run)
+        span = 0
+        self.repeat = 0
+        hold_value = 0.0
+        directions = (1.0, -1.0) if self.bipolar else (self.direction,)
+
+        if self.lead_in_s > 0:
+            yield from self._dwell(0.0, 0.0, self.lead_in_s)
+
+        for level in self.hold_levels:
+            if level != hold_value:
+                yield from self._move_hold(hold_value, level)
+                hold_value = level
+            if self.hold_settle_s > 0:
+                yield from self._dwell(0.0, hold_value, self.hold_settle_s)
+            for _ in range(self.cycles):
+                for sign in directions:
+                    flag = flag_base + '-SETPOINT' + str(span)
+                    span += 1
+                    self.repeat = span
+                    yield from self._ramp_to_break(sign, hold_value, flag)
+                    yield from self._release(hold_value, flag)
+                    if self.rest_s > 0:
+                        yield from self._dwell(0.0, hold_value, self.rest_s, flag)
+
+        if hold_value != 0.0:
+            yield from self._move_hold(hold_value, 0.0)
+        for _ in range(self.RAMP_DOWN_SAMPLES):
+            yield self._cmd(0.0, 0.0)
+        if self.hold_mode == 'position':
+            # The same reset TestTrace does: toggling out of position mode makes
+            # the next entry into it re-zero against the current shaft angle.
+            yield {'input_mode': 'torque', 'output_mode': 'torque',
+                   'input_command': 0.0, 'output_command': 0.0}
+
+        self.run += 1
+
+
 class TestManager:
-    def __init__(self, test_file, mode, limits):
+    def __init__(self, test_file, mode, limits, sensor_reader=None):
+        # sensor_reader: optional zero-arg callable returning
+        # {'torque': {sensor_name: Nm}, 'position': {'input': rad, 'output': rad},
+        #  'velocity': {'input': rad/s, 'output': rad/s}}
+        # snapshotted from live telemetry. Used by the preamble (noise-floor
+        # anchoring + drift supervision) and by ramp_break (breakaway
+        # detection); None (as in preview / offline expansion) degrades to
+        # documented fallbacks -- for ramp_break, ramping to the ceiling.
         self.behaviors = {}
         self.test_config = None
         self.mode = mode
         self.limits = limits
+        self.sensor_reader = sensor_reader
         self.name = test_file.split('.')[0]
 
         with open(f"{dyno_paths.dyno_test_directory}/{test_file}", "r") as f:
             self.test_config = yaml.safe_load(f)
 
         self._load_yaml(test_file)
+
+        # Segment progress. The count needs no expansion -- behavior_iterator
+        # unrolls loops over plain config dicts, so walking it is free, and the
+        # preview walks the identical sequence (see test_preview.expand_test),
+        # which is what makes segment i of N mean the same thing in both places.
+        self.segment_count = sum(1 for _ in behavior_iterator(self.test_config))
+        self._clear_segment()
+
         print('Test loaded.')
+
+    def _clear_segment(self):
+        self.segment_index = 0      # 1-based once running
+        self.segment_id = None
+        self.segment_type = None
+        self.current_behavior = None
+
+    def progress(self):
+        """Where the run is, for the GUI's readout (telemetry slot -1).
+
+        Read by the controller on the control thread, between next_command()
+        calls, so these are plain attribute reads with no synchronization.
+        `repeat`/`repeats` come from the running behavior -- see the progress
+        contract at the top of this module.
+        """
+        behavior = self.current_behavior
+        return {
+            'segment': self.segment_index,
+            'segments': self.segment_count,
+            'segment_id': self.segment_id,
+            'segment_type': self.segment_type,
+            'repeat': getattr(behavior, 'repeat', 0),
+            'repeats': getattr(behavior, 'repeats', 0),
+        }
 
     def _load_yaml(self, file):
         with open(f"{dyno_paths.dyno_test_directory}/{file}", "r") as f:
@@ -421,15 +1757,36 @@ class TestManager:
             self.behaviors[behavior['id']] = TestTrace(behavior, self.mode, self.limits)
         elif behavior['type'] == 'grid_search' and behavior['id'] not in self.behaviors:
             self.behaviors[behavior['id']] = GridSearch(behavior, self.mode, self.limits)
+        elif behavior['type'] == 'preamble' and behavior['id'] not in self.behaviors:
+            self.behaviors[behavior['id']] = Multisine(
+                behavior, self.mode, self.limits, self.sensor_reader)
+        elif behavior['type'] == 'ramp_break' and behavior['id'] not in self.behaviors:
+            self.behaviors[behavior['id']] = RampBreak(
+                behavior, self.mode, self.limits, self.sensor_reader)
+        elif behavior['type'] == 'recentre' and behavior['id'] not in self.behaviors:
+            self.behaviors[behavior['id']] = Recentre(
+                behavior, self.mode, self.limits, self.sensor_reader)
+        elif behavior['type'] == 'throw' and behavior['id'] not in self.behaviors:
+            self.behaviors[behavior['id']] = Throw(
+                behavior, self.mode, self.limits, self.sensor_reader)
         elif behavior['type'] == 'loop':
             for looped_behavior in behavior['behaviors']:
                 self._load_behavior(looped_behavior)
         else:
             raise ValueError('Print invalid test "type" specified: '+behavior['type'])
 
-    def reset(self):
+    def reset(self, start_segment=1):
+        """Arm a fresh run. `start_segment` (1-based) skips every segment before
+        it, so a run interrupted mid-plan can be picked up at the start of the
+        segment it was in. Segments are counted the same way progress() and the
+        preview count them (behavior_iterator order, loops unrolled), so the
+        number the GUI showed when the run stopped is the number to pass here.
+        Skipped segments still advance segment_index, so the readout on a
+        resumed run reads k/N exactly as it did on the original."""
         self._test_start_real_time = time.time() # Capture new start time for the run
         self._test_complete = False              # Test is no longer complete
+        self._clear_segment()                    # Nothing is running yet
+        self._start_segment = max(1, int(start_segment))
 
         # Re-create the top-level behavior generator
         self._behavior_gen = behavior_iterator(self.test_config)
@@ -444,6 +1801,26 @@ class TestManager:
         for behavior_definition in self._behavior_gen:
             behavior_id = behavior_definition['id']
             behavior_instance = self.behaviors[behavior_id]
+
+            # Published before the first command of the segment is yielded, so
+            # the readout never lags the rig by a behavior.
+            self.segment_index += 1
+            self.segment_id = behavior_id
+            self.segment_type = behavior_definition['type']
+            self.current_behavior = behavior_instance
+            if self.segment_index < self._start_segment:
+                # Resuming past this one. Nothing is yielded, so the drives
+                # never see it; the first segment that does run yields its own
+                # mode command first, exactly as it would on a fresh start.
+                print(f"--- Skipping Behavior: '{behavior_id}' "
+                      f"({self.segment_index}/{self.segment_count}, resumed run) ---")
+                continue
+            # commands() is a generator: its body -- including the repeat reset
+            # -- does not run until the first command is pulled. Behaviors are
+            # shared across loop passes, so without this the readout would show
+            # the PREVIOUS pass's final repeat for a cycle ("8/8" at the start
+            # of a fresh segment).
+            behavior_instance.repeat = 0
 
             print(f"\n--- Starting Behavior: '{behavior_id}' ({behavior_definition['type']}) ---")
             

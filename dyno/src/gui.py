@@ -34,30 +34,10 @@ if '--sim' in sys.argv:
     print('#### SIMULATION MODE ####')
 
 
-# Both of the settings below work around one root cause: setup.sh grants the
-# venv interpreter file capabilities (cap_net_raw etc), so the kernel execs us
-# with AT_SECURE=1 and dumpable=2, which leaves /proc/<pid>/* owned by root.
-# xdg-desktop-portal probes /proc/<pid>/root to classify the caller, cannot open
-# it, and denies every request:
-#   "Portal operation not allowed: Unable to open /proc/<pid>/root"
-# Dropping the capabilities is not an option - the GUI itself calls
-# sched_setscheduler(SCHED_FIFO) and forks the EtherCAT Controller, which
-# inherits its privileges. PR_SET_DUMPABLE(1) restores the /proc ownership but
-# the portal still refuses, so both fixes below avoid the portal instead.
-
-# On Wayland, GNOME does not decorate Qt windows; Qt draws its own title bar and
-# reads the button layout from the (denied) Settings portal, so the window ends
-# up with no close/minimize/maximize buttons. XWayland gets mutter's server-side
-# decorations and never consults the portal. run_sim.sh already pins this for
-# unrelated WSLg reasons; only default it so an explicit setting still wins.
-if not os.environ.get('QT_QPA_PLATFORM') and os.environ.get('WAYLAND_DISPLAY'):
-    os.environ['QT_QPA_PLATFORM'] = 'xcb'
-
-# Qt's native file dialog is portal-backed. When the portal denies the request
-# the dialog window is created but never mapped, leaving getOpenFileName parked
-# in its modal event loop - the GUI looks hung with nothing on screen. Qt's own
-# widget dialog needs no portal. Must be set before the QApplication exists.
-QApplication.setAttribute(Qt.ApplicationAttribute.AA_DontUseNativeDialogs, True)
+# Portal/capability workarounds (QT_QPA_PLATFORM, AA_DontUseNativeDialogs).
+# Shared with the standalone analysis UI, which runs the same cap-granted
+# interpreter and hits the same portal denials. Must run before QApplication.
+from dyno.src import qt_env  # noqa: E402,F401
 
 from dyno.src import logger, test_builder
 from dyno.src.logger import Logger
@@ -153,7 +133,54 @@ class Window(QWidget):
         # make a buffer for incoming telementry
         self.telemetry_samples = []
 
-        # log-flag transition tracking (for log folder naming + notes prompt)
+        # Consumer-side lag instrumentation. The handoff doc's Q3 could not be
+        # answered because nothing on this side of the queue was ever measured:
+        # the 'time' channel is the CONTROLLER's perf_counter, so a log full of
+        # clean timestamps says nothing about how stale the plots were.
+        #
+        # _drain_lag is the accrued difference between wall time elapsed here and
+        # sample time elapsed in the stream. It needs no clock sync between the
+        # processes because both terms are differences from the same baseline: it
+        # starts at 0 and grows by exactly the amount this window falls behind.
+        # That is the quantity the operator reports growing over a run.
+        #
+        # _backlog is Queue.qsize(), which counts puts minus gets and so ALSO
+        # sees the samples parked in the producer's feeder-thread deque -- the
+        # unbounded buffer the plots actually fall behind in, and the one no
+        # other measurement can reach.
+        self._lag_wall0 = None
+        self._lag_t0 = None
+        self._drain_lag = 0.0
+        self._lag_peak = 0.0
+        self._backlog = 0
+        self._backlog_peak = 0
+        self._lag_warned = 0.0
+        self._lag_at_run_start = 0.0
+        self._run_ended_pending = False
+
+        # Recentre-and-resume after a position-window trip. The controller
+        # reports the resume point in control_state['resume'] and the GUI runs
+        # the operator through it in two steps: (1) recentre or abort, once the
+        # brake and log tail are done; (2) after return-to-centre ends, confirm
+        # the output is really at centre (rules out the OUTPUT having slipped)
+        # and resume from the start of the interrupted segment, or abort.
+        # _resume_key identifies the offer already handled so a 50 Hz state
+        # heartbeat does not re-raise it; _recover holds the step-2 watch.
+        self._resume_key = None
+        self._recover = None
+        self._resume_box = None
+
+        # Default parent directory for the post-experiment "Save to" row.
+        # Blank/absent means the directory the run already recorded into, so a
+        # plain Save is a no-op rename.
+        _saved_parent = (self.master_params.get('saved_runs_directory') or '').strip()
+        self._saved_runs_parent = (os.path.expanduser(_saved_parent) if _saved_parent
+                                   else dyno_paths.dyno_logs_directory)
+
+        # log-flag transition tracking (for log folder naming + notes prompt).
+        # _active_log_dir is an ABSOLUTE path: the notes dialog can relocate a
+        # finished run anywhere, so a basename under dyno/logs no longer
+        # identifies it.
         self._log_active = False
         self._active_log_dir = None
         self._active_log_test = None
@@ -174,6 +201,20 @@ class Window(QWidget):
         self._controller_fault = False
         self._arm_threads = []  # QThreads must outlive their run()
         self._syncing_select = False
+
+        # Progress readout. The plan half comes from the arm-time expansion
+        # (per-segment durations, which are upper bounds — see
+        # test_preview.expand_test); the live half comes from the controller in
+        # telemetry slot -1. Wall clocks are stamped here rather than taken from
+        # the controller because what the operator is timing is the run they
+        # watched start, which is the log-flag transition this window sees.
+        self._plan_segments = []
+        self._plan_duration = 0.0
+        self._plan_truncated = False
+        self._run_started = None
+        self._segment_started = None
+        self._segment_seen = None
+        self._progress = None
 
         # initialize ui
         self.__build_ui()
@@ -291,7 +332,6 @@ class Window(QWidget):
         self.plots = []
         for i in range(self.num_plots):
             plot_key = list(self.plot_params.keys())[i]
-            plot_params = self.plot_params[plot_key]
 
             # Create the drop down selector to change what the scope shows
             selection_box = QComboBox()
@@ -300,9 +340,7 @@ class Window(QWidget):
             selection_box.currentIndexChanged.connect(self.__change_scopes)
 
             # creat thge plot. the y range is defined from the plot_config file
-            plot = self.plot_widget.addPlot(row=i, col=0, title=plot_params['title'])
-            # plot.getViewBox().setYRange(plot_params['range'][0], plot_params['range'][1])
-            plot.setLabel('left', plot_params['unit'])
+            plot = self.plot_widget.addPlot(row=i, col=0)
             plot.showGrid(x=True, y=True, alpha=0.5)
             if i == 0:
                 # We drive the x-range ourselves (rolling window in redraw), so keep
@@ -310,27 +348,36 @@ class Window(QWidget):
                 plot.getViewBox().enableAutoRange(x=False)
             if i > 0:
                 plot.setXLink(self.plots[0]['plot']) # link x range of all other plots to the first
+
+            # One legend per scope, parented once here. __load_scope refills it;
+            # parenting a fresh LegendItem on every scope change stacks the old
+            # ones on top of each other in the corner.
             legend = pg.LegendItem(offset=(80, 10))
             legend.setParentItem(plot)
 
-            # for each curve that should be on the graph, load that trace from the data buffer and plot it
-            curves = []
-            for ui, data_key in enumerate(plot_params['data_keys']):               
-                curve = plot.plot(self.gui_data[0,:], self.trace(data_key), pen=plot_params['pens'][ui], name=plot_params['legends'][ui])
-                legend.addItem(curve, plot_params['legends'][ui])
-                curves.append(curve)
-
-            # create a dictionary of the objects associated with the scope in order to adjust them later
-            plot = {
-                'plot':plot,
-                'selector':selection_box,
-                'curves': curves,
-                'data_keys':self.plot_params[plot_key]['data_keys']
+            # a dictionary of the objects associated with the scope, so they can be adjusted later
+            entry = {
+                'plot': plot,
+                'selector': selection_box,
+                'legend': legend,
+                'curves': [],
+                'data_keys': [],
+                'key': None,
             }
+            self.__load_scope(entry, plot_key)
 
             # append that dictionary to a list of plots, and add the plot to the gui
-            self.plots.append(plot)
+            self.plots.append(entry)
             self.controls_layout.addWidget(selection_box)
+
+        self.clear_plots_button = QPushButton('Clear Plots')
+        self.clear_plots_button.setToolTip(
+            'Drop the history from every scope and start drawing again from the '
+            'newest sample.\nDisplay only — logging is unaffected. Use it when a '
+            'large past motion is\nholding the y-axis open and hiding small '
+            'recent detail.')
+        self.clear_plots_button.clicked.connect(self.__clear_plots)
+        self.controls_layout.addWidget(self.clear_plots_button)
 
         # --- Test Selection section: centered header, launcher button beneath
         # (same size as Start/Stop), then the Quick Select dropdown. ---
@@ -357,6 +404,16 @@ class Window(QWidget):
         self.status_light = StatusLight()
         self.controls_layout.addWidget(self.status_light)
 
+        # Progress lives in its own label rather than the status light's
+        # caption: the caption is guarded against redundant restyling by
+        # comparing text (StatusLight.set_state), and a ticking clock in it
+        # would defeat that guard on every update.
+        self.progress_label = QLabel()
+        self.progress_label.setWordWrap(True)
+        self.progress_label.setStyleSheet('font-size: 11px; color: gray;')
+        self.progress_label.setVisible(False)
+        self.controls_layout.addWidget(self.progress_label)
+
         title_label = QLabel('Test Controls', alignment=Qt.AlignmentFlag.AlignCenter)
         title_label.setStyleSheet('font-size: 16px;')
         self.controls_layout.addWidget(title_label)
@@ -370,6 +427,26 @@ class Window(QWidget):
         self.stop_button.setStyleSheet('background-color: red; color: white;')
         self.controls_layout.addWidget(self.stop_button)
         self.stop_button.clicked.connect(self.__stop_test)
+
+        # Fault reset, with its outcome underneath. The status light says a
+        # drive is faulted but not which one, and clearing it otherwise means
+        # leaving the rig for Workbench or release_drives.sh. Only ever a
+        # request: the reset drops the DS402 latch, it does not remove the
+        # cause, so the label below is where the operator learns whether the
+        # fault actually went away.
+        self.clear_faults_button = QPushButton('Clear Drive Faults')
+        self.clear_faults_button.setToolTip(
+            'Send a DS402 fault reset to every faulted drive on the bus.\n'
+            'No test may be running. This clears the latch, not the cause — a '
+            'drive whose\nfault condition is still present will simply fault '
+            'again.')
+        self.clear_faults_button.clicked.connect(self.__clear_faults)
+        self.controls_layout.addWidget(self.clear_faults_button)
+
+        self.clear_faults_label = QLabel('No drive faults')
+        self.clear_faults_label.setWordWrap(True)
+        self.clear_faults_label.setStyleSheet('font-size: 11px; color: gray;')
+        self.controls_layout.addWidget(self.clear_faults_label)
 
         # Tare, with its result underneath: the bias alone does not say whether
         # it is reasonable (0.5 Nm is noise on a 500 Nm cell and 2.5% on a 20 Nm
@@ -390,11 +467,22 @@ class Window(QWidget):
         self.tare_label.setStyleSheet('font-size: 11px; color: gray;')
         self.controls_layout.addWidget(self.tare_label)
 
+        window_cfg = self.dyno_params.get('position_window')
+        self._has_window = bool(window_cfg) and bool(window_cfg.get('enabled', True))
+        if self._has_window:
+            self.__build_window_panel()
+
         self.__build_safeties_panel()
 
         self.controls_layout.addStretch(1)
         self.main_layout.addWidget(self.plot_widget, stretch=5)
         self.main_layout.addWidget(self.controls_widget, stretch=1)
+
+        # Open larger than the layout's natural hint, which packs the scopes
+        # tighter than is readable at a glance across the bench. Taller than it
+        # is wider: the extra height is what the stacked scopes actually need.
+        hint = self.sizeHint()
+        self.resize(int(hint.width() * 1.2), int(hint.height() * 1.4))
 
     def __build_safeties_panel(self):
         """Collapsible read-only view of the config's `safeties:` section, one
@@ -443,6 +531,179 @@ class Window(QWidget):
             grid.addWidget(edit_link, i, 2)
             self._safety_rows.append(
                 (value_label, path_to_row.get(spec.get('source')), limit))
+
+    def __build_window_panel(self):
+        """Centre / jog / return / touch-off controls for a limited-travel output
+        (config `position_window:`). Jog is hold-to-run: press sends 'jog',
+        release sends 'jog_stop'; Return to Centre and Touch Off are one click.
+        The controller enforces every limit; the buttons only offer what it
+        would accept."""
+        title = QLabel('Output Position', alignment=Qt.AlignmentFlag.AlignCenter)
+        title.setStyleSheet('font-size: 16px;')
+        self.controls_layout.addWidget(title)
+
+        self.window_label = QLabel('No centre declared')
+        self.window_label.setWordWrap(True)
+        self.window_label.setStyleSheet('font-size: 11px; color: #b58900;')
+        self.controls_layout.addWidget(self.window_label)
+
+        centre_row = QHBoxLayout()
+        self.declare_centre_button = QPushButton('Declare Centre')
+        self.declare_centre_button.setToolTip(
+            'Store the current output position as centre for this session.\n'
+            'The rig must be still. Clears any earlier touch-off.')
+        self.declare_centre_button.clicked.connect(
+            lambda: self.control_command_queue.put_nowait(['declare_centre', 0]))
+        centre_row.addWidget(self.declare_centre_button)
+
+        # Click-to-run, not hold-to-run like the jog buttons: one move, and the
+        # controller decides when it is done. Stop ends it early.
+        self.return_centre_button = QPushButton('Return to Centre')
+        self.return_centre_button.setToolTip(
+            'Drive the input shaft (DUT motor) back to the declared centre with '
+            'the output free.\nThe leg touch-off ends with, on its own. Stops at '
+            'centre, on contact, or on Stop.')
+        self.return_centre_button.clicked.connect(
+            lambda: self.control_command_queue.put_nowait(['return_centre', 0]))
+        centre_row.addWidget(self.return_centre_button)
+        self.controls_layout.addLayout(centre_row)
+
+        # Output buttons drive LOAD with the input free; input buttons drive DUT
+        # with the output free. Input "+" is a + command to the input drive:
+        # which way that turns the output is measured, and shown below.
+        self.jog_buttons = []
+        self.input_jog_buttons = []
+        # The held jog button. `released` is not reliable: Qt skips it when the
+        # mouse is let go off the button with no move event in between, which
+        # left a jog running. So a timer also watches isDown(), sends a
+        # keepalive while it is held (the controller stops a jog without one),
+        # and sends jog_stop the moment it is not.
+        self._jog_held = None
+        self._jog_timer = QTimer(self)
+        self._jog_timer.timeout.connect(self.__jog_tick)
+        self._jog_timer.start(100)
+        for drive, label, tip in (
+                ('output', 'Output', 'Hold to jog the output shaft (absorber) under the '
+                                     'touch-off torque cap.\nThe input is left free, so the '
+                                     'gearbox must be backdriven.'),
+                ('input', 'Input', 'Hold to jog the input shaft (DUT motor); the output '
+                                   'is left free.\nStops on a torque rise over the '
+                                   'measured drag.')):
+            jog_row = QHBoxLayout()
+            for text, direction in ((f'{label} −', -1), (f'{label} +', +1)):
+                button = QPushButton(text)
+                button.setToolTip(tip + '\nStops on release, contact, or max excursion.')
+                button.pressed.connect(
+                    lambda b=button, d=direction, s=drive: self.__jog_press(b, d, s))
+                button.released.connect(self.__jog_release)
+                jog_row.addWidget(button)
+                self.jog_buttons.append(button)
+                if drive == 'input':
+                    self.input_jog_buttons.append(button)
+            self.controls_layout.addLayout(jog_row)
+
+        self.touch_off_button = QPushButton('Touch Off')
+        self.touch_off_button.setToolTip(
+            'Drive to one bumper, then the other, then back to centre, on the '
+            'shaft set by\nposition_window.touch_off.drive. Passes if both contacts '
+            'are within tolerance. Stop aborts it.')
+        self.touch_off_button.clicked.connect(
+            lambda: self.control_command_queue.put_nowait(['touch_off', 0]))
+        self.controls_layout.addWidget(self.touch_off_button)
+
+        self.touch_off_label = QLabel('No touch-off this session')
+        self.touch_off_label.setWordWrap(True)
+        self.touch_off_label.setStyleSheet('font-size: 11px; color: gray;')
+        self.controls_layout.addWidget(self.touch_off_label)
+
+    def __jog_press(self, button, direction, drive):
+        self._jog_held = button
+        self.control_command_queue.put_nowait(['jog', direction, drive])
+
+    def __jog_release(self):
+        self._jog_held = None
+        self.control_command_queue.put_nowait(['jog_stop', 0])
+
+    def __jog_tick(self):
+        if self._jog_held is None:
+            return
+        if self._jog_held.isDown():
+            self.control_command_queue.put_nowait(['jog_alive', 0])
+        else:
+            self.__jog_release()
+
+    def __refresh_window(self, state):
+        w = state.get('window')
+        if not w:
+            return
+        test_active = bool(state.get('test_active'))
+        centred = w.get('centre') is not None
+        self.declare_centre_button.setEnabled(not test_active and not w.get('jog'))
+        self.return_centre_button.setEnabled(not test_active and centred
+                                             and not w.get('jog')
+                                             and bool(w.get('input_jog')))
+        self.touch_off_button.setEnabled(not test_active and centred and not w.get('jog'))
+        for button in self.jog_buttons:
+            # Never disabled mid-press: a disabled button can swallow its release.
+            if not button.isDown():
+                button.setEnabled(not test_active and centred
+                                  and w.get('jog') != 'touch_off'
+                                  and bool(w.get('input_jog') if button in self.input_jog_buttons
+                                           else w.get('output_jog')))
+
+        rows = []
+        if not centred:
+            rows.append('No centre declared')
+            colour = '#b58900'
+        else:
+            rel, half = w.get('rel'), w['half_window']
+            if rel is None:
+                rows.append('Output position unreadable')
+                colour = 'red'
+            else:
+                rows.append(f'Output {rel:+.3f} rad ({np.degrees(rel):+.1f}°) from centre, '
+                            f'window ±{half:g}')
+                colour = ('red' if abs(rel) > half else
+                          '#b58900' if abs(rel) > 0.8 * half else 'green')
+        if w.get('input_sign') is not None:
+            rows.append(f'Input + turns output {"+" if w["input_sign"] > 0 else "−"}, '
+                        f'measured ratio {w["input_ratio"]:+.1f}')
+        rows.append('Ready to start' if not w.get('refusal')
+                    else f'Start blocked: {w["refusal"]}')
+        if w.get('message'):
+            rows.append(w['message'])
+        self.window_label.setText('\n'.join(rows))
+        self.window_label.setStyleSheet(f'font-size: 11px; color: {colour};')
+
+        t = w.get('touch_off')
+        # Repeatability over the session, in the encoder frame so recentring
+        # between runs does not move the numbers.
+        history = [h for h in (w.get('touch_off_history') or [])
+                   if h.get('midpoint_abs_rad') is not None]
+        if w.get('jog') == 'touch_off':
+            text, colour = f'Touch-off ({w.get("jog_drive")} shaft) running…', '#b58900'
+        elif not t:
+            text, colour = 'No touch-off since centre was declared', 'gray'
+        else:
+            text = 'Touch-off ' + ('PASSED' if t['passed'] else 'FAILED')
+            if t.get('plus_rad') is not None and t.get('minus_rad') is not None:
+                text += (f': +{np.degrees(t["plus_rad"]):.2f}° / '
+                         f'{np.degrees(t["minus_rad"]):.2f}°, midpoint '
+                         f'{np.degrees(t["centre_error_rad"]):+.2f}° from run centre')
+            if t.get('centre_shift_rad') is not None:
+                text += '\nCentre moved to the midpoint'
+            if t.get('problems'):
+                text += '\n' + '; '.join(t['problems'])
+            colour = 'green' if t['passed'] else 'red'
+        if len(history) > 1:
+            stats = [(name, np.degrees([h[key] for h in history])) for name, key in (
+                ('+ bumper', 'plus_abs_rad'), ('− bumper', 'minus_abs_rad'),
+                ('midpoint', 'midpoint_abs_rad'), ('span', 'span_rad'))]
+            text += f'\n{len(history)} runs, spread (sd):'
+            for name, values in stats:
+                text += f'\n  {name}: {np.ptp(values):.2f}° ({np.std(values, ddof=1):.2f}°)'
+        self.touch_off_label.setText(text)
+        self.touch_off_label.setStyleSheet(f'font-size: 11px; color: {colour};')
 
     def __open_config_at_safety(self, safety_name):
         """Open the rig config in VS Code at the named safety's line
@@ -496,6 +757,34 @@ class Window(QWidget):
 
     def __clear_tare(self):
         self.control_command_queue.put_nowait(['clear_tare', 0])
+
+    def __clear_faults(self):
+        self.control_command_queue.put_nowait(['clear_faults', 0])
+
+    def __refresh_fault_clear(self, state):
+        """Render which drives are faulted, and the outcome of the last reset.
+
+        Naming the drives is the part the status light cannot do, and it is what
+        decides where the operator walks: a faulted DUT after a run is usually
+        the test doing its job, a faulted LOAD is not."""
+        faulted = state.get('faulted_drives') or []
+        message = state.get('fault_clear_message')
+
+        if state.get('fault_clear_active'):
+            self.clear_faults_label.setText(message or 'Clearing faults…')
+            colour = '#b58900'
+        elif faulted:
+            # The live fault leads: a 'cleared' message from a minute ago must
+            # not sit above drives that are faulted right now.
+            text = 'In fault: ' + ', '.join(faulted)
+            if message:
+                text += f'\n{message}'
+            self.clear_faults_label.setText(text)
+            colour = '#cb4b16'
+        else:
+            self.clear_faults_label.setText(message or 'No drive faults')
+            colour = '#859900' if message and 'cleared' in message.lower() else 'gray'
+        self.clear_faults_label.setStyleSheet(f'font-size: 11px; color: {colour};')
 
     def __refresh_tare(self, state):
         """Render the controller's tare state under the button.
@@ -570,26 +859,61 @@ class Window(QWidget):
         no file is written in that case either. The 'Delete test log' button
         deletes the run's entire log folder instead.
 
+        The 'Save to' row names the folder the run ends up in. It is prefilled
+        with the timestamp the Logger already used and the configured default
+        parent, so leaving it alone reproduces the old behaviour exactly;
+        editing the name or browsing to another directory moves the run there
+        on save. It is a row rather than a fourth 'Save As' button because the
+        destination and what-happens-next are independent -- a button per
+        combination would need a 'Save As && Analyze' too.
+
         Shown non-modally via open() rather than exec(): exec() would suspend
         update_data() (this is called from the 30 ms timer), freezing the
         plots and telemetry drain until the dialog closes."""
-        log_dir = self._active_log_dir
-        if log_dir is None:
+        src_dir = self._active_log_dir
+        if src_dir is None:
             return
         test_name = self._active_log_test
         dialog = QDialog(self)
         dialog.setWindowTitle('Experiment Notes')
         layout = QVBoxLayout(dialog)
-        layout.addWidget(QLabel(f'Test finished: {test_name}\n'
-                                f'Log folder: {log_dir}\n\n'
+        layout.addWidget(QLabel(f'Test finished: {test_name}\n\n'
                                 'Anything worth remembering about this run?'))
+
+        dest_row = QHBoxLayout()
+        name_edit = QLineEdit(os.path.basename(src_dir))
+        name_edit.setToolTip('Folder name for this run. Defaults to the '
+                             'timestamp the log was recorded under.')
+        parent_edit = QLineEdit(self._saved_runs_parent)
+        parent_edit.setToolTip(
+            'Directory the run folder is saved into. Editable so a share path '
+            'can be pasted; it is created if it does not exist yet.')
+        browse_btn = QPushButton('Browse…')
+
+        def on_browse():
+            picked = QFileDialog.getExistingDirectory(
+                dialog, 'Save run in',
+                parent_edit.text() or self._saved_runs_parent)
+            if picked:
+                parent_edit.setText(picked)
+
+        browse_btn.clicked.connect(on_browse)
+        dest_row.addWidget(QLabel('Save to:'))
+        dest_row.addWidget(name_edit, 2)
+        dest_row.addWidget(QLabel('in'))
+        dest_row.addWidget(parent_edit, 3)
+        dest_row.addWidget(browse_btn)
+        layout.addLayout(dest_row)
+
         text_edit = QTextEdit()
         layout.addWidget(text_edit)
         buttons = QHBoxLayout()
-        save_btn = QPushButton('Save Notes')
+        ANALYZE_RESULT = 3  # save notes, then open the analysis UI on this log
+        analyze_btn = QPushButton('Save && Analyze')
+        analyze_btn.setStyleSheet('background-color: #2e9e3e; color: white;')
+        analyze_btn.clicked.connect(lambda: dialog.done(ANALYZE_RESULT))
+        save_btn = QPushButton('Save Data')
         save_btn.clicked.connect(dialog.accept)
-        skip_btn = QPushButton('Skip')
-        skip_btn.clicked.connect(dialog.reject)
         DELETE_RESULT = 2  # distinct from QDialog Accepted (1) / Rejected (0)
         delete_btn = QPushButton('Delete test log')
         delete_btn.setStyleSheet('background-color: #c62828; color: white;')
@@ -614,8 +938,8 @@ class Window(QWidget):
 
         revert_timer.timeout.connect(disarm)
         delete_btn.clicked.connect(on_delete_clicked)
+        buttons.addWidget(analyze_btn)
         buttons.addWidget(save_btn)
-        buttons.addWidget(skip_btn)
         buttons.addWidget(delete_btn)
         layout.addLayout(buttons)
         text_edit.setFocus()
@@ -625,11 +949,27 @@ class Window(QWidget):
         def on_finished(result):
             self._notes_dialog = None
             if result == DELETE_RESULT:
-                self.__delete_test_log(log_dir)
+                self.__delete_test_log(src_dir)
                 return
             notes = text_edit.toPlainText().strip() if result else ''
+            # Empty notes write nothing: the Logger already wrote the setup
+            # half of <test>.txt, and there is nothing to add to it. This is
+            # exactly what the retired Skip button did.
             if notes:
-                self.__save_experiment_notes(log_dir, test_name, notes)
+                self.__save_experiment_notes(src_dir, test_name, notes)
+            # Relocate only when a Save button was pressed -- dismissing the
+            # dialog with Esc or the window X (result 0) must not act on a
+            # half-typed destination. Done AFTER the notes rewrite so the
+            # report travels with the folder, and BEFORE analysis so the
+            # window opens on the run's final home.
+            folder = src_dir
+            if result:
+                folder = self.__relocate_log(
+                    src_dir, parent_edit.text(), name_edit.text())
+            if result == ANALYZE_RESULT:
+                # Notes are saved above, BEFORE the window opens, so the
+                # analysis never races the notes write.
+                self.__launch_analysis(folder)
 
         dialog.finished.connect(on_finished)
         # Center over the main window; some window managers (WSLg
@@ -641,31 +981,119 @@ class Window(QWidget):
             geo.moveCenter(self.frameGeometry().center())
             dialog.move(geo.topLeft())
         dialog.adjustSize()
+        # adjustSize() sizes to the layout's hint, which truncates the run
+        # name and the destination path in the 'Save to' row -- the two fields
+        # this dialog exists to let you read. Widen by half.
+        dialog.resize(int(dialog.width() * 1.5), dialog.height())
         center()
         dialog.open()
         pg.Qt.QtCore.QTimer.singleShot(0, center)
         pg.Qt.QtCore.QTimer.singleShot(100, center)
 
-    def __delete_test_log(self, log_dir):
-        folder = f"{dyno_paths.dyno_logs_directory}/{log_dir}"
+    def __relocate_log(self, src, parent, name):
+        """Move a just-finished run to <parent>/<name>, per the notes dialog's
+        'Save to' row. Returns the folder the run actually ended up in — the
+        untouched source path if the move was refused or failed, so the caller
+        still has somewhere real to point analysis at.
+
+        Never overwrites an existing folder. The Logger rmtree's a same-second
+        collision (logger.start_logging), which is defensible for a name it
+        stamped itself; here the name came from a person, and clobbering it
+        would destroy a run nobody asked to delete."""
+        name = name.strip().strip('/')
+        if not name:
+            QMessageBox.warning(
+                self, 'Save run',
+                f'The folder name is empty, so the run was left at {src}.')
+            return src
+        seps = [s for s in (os.sep, os.altsep) if s]
+        if any(s in name for s in seps):
+            QMessageBox.warning(
+                self, 'Save run',
+                f'"{name}" contains a path separator. Use Browse to choose the '
+                f'directory instead; the run was left at {src}.')
+            return src
+        # A sim run stays labelled as one however it gets renamed: sim data in
+        # a folder that reads like a real run is the one mixup worth spending
+        # a prefix on.
+        if os.path.basename(src).startswith('sim_') and not name.startswith('sim_'):
+            name = 'sim_' + name
+
+        parent = os.path.expanduser(parent.strip()) or self._saved_runs_parent
+        dest = os.path.join(parent, name)
+        if os.path.abspath(dest) == os.path.abspath(src):
+            return src  # default destination: nothing to do
+        if os.path.exists(dest):
+            QMessageBox.warning(
+                self, 'Save run',
+                f'{dest} already exists, so the run was left at {src}.\n\n'
+                'Pick a different name and save again, or move the old folder '
+                'out of the way first.')
+            return src
+        try:
+            os.makedirs(parent, exist_ok=True)
+            # Crossing a filesystem (external drive, network share) turns this
+            # into a byte-for-byte copy of the whole hdf5, which is slow enough
+            # to look like a hang without the cursor.
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            try:
+                shutil.move(src, dest)
+            finally:
+                QApplication.restoreOverrideCursor()
+        except OSError as e:
+            QMessageBox.warning(
+                self, 'Save run',
+                f'Could not save the run to {dest}: {e}\n\nIt was left at {src}.')
+            return src
+        print(f'Saved run to {dest}')
+        return dest
+
+    def __launch_analysis(self, folder):
+        """Open the analysis UI preselected on a just-finished log, given the
+        absolute path to its folder.
+
+        A separate process, not a shared in-process window: a crash in the
+        analysis path must not take the rig GUI (and its EtherCAT child) down
+        with it. Launched under `nice -n 10` unconditionally -- this GUI runs
+        SCHED_FIFO and forks the EtherCAT controller, and a matplotlib
+        subprocess competing for CPU is a real-time hazard, not a cosmetic one.
+        """
+        if self._log_active:
+            QMessageBox.warning(
+                self, 'Test running',
+                'A test is logging right now. Analysis competes with the '
+                'real-time loop for CPU; run it after the test finishes.')
+            return
+        script = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(
+                os.path.abspath(__file__)))), 'launch', 'analysis.sh')
+        try:
+            subprocess.Popen(['nice', '-n', '10', script, folder],
+                             start_new_session=True)
+        except OSError as e:
+            QMessageBox.warning(self, 'Analysis',
+                                f'Could not launch the analysis UI: {e}')
+
+    def __delete_test_log(self, folder):
         try:
             if os.path.isdir(folder):
                 shutil.rmtree(folder)
-                print(f'Deleted log folder {log_dir}')
+                print(f'Deleted log folder {folder}')
             else:
-                print(f'Log folder {log_dir} not found, nothing to delete')
+                print(f'Log folder {folder} not found, nothing to delete')
         except OSError as e:
-            print(f'Failed to delete log folder {log_dir}: {e}')
+            print(f'Failed to delete log folder {folder}: {e}')
 
-    def __save_experiment_notes(self, log_dir, test_name, notes):
+    def __save_experiment_notes(self, folder, test_name, notes):
         """Re-render the run's companion report with the operator's notes on
         top. The Logger already wrote the setup half when the test stopped;
         this rewrites the whole file rather than overwriting it, so the two
         writers never clobber each other. Falls back to a notes-only file if
-        the log has no resolved config to render (e.g. a pre-existing log)."""
+        the log has no resolved config to render (e.g. a pre-existing log).
+
+        'folder' is the absolute path to the run's folder."""
         from dyno.src import setup_summary
 
-        folder = f"{dyno_paths.dyno_logs_directory}/{log_dir}"
         base = os.path.splitext(os.path.basename(test_name or 'log'))[0] or 'log'
         path = setup_summary.report_path(folder, base)
         try:
@@ -676,7 +1104,7 @@ class Window(QWidget):
                     f.write(notes + '\n')
             else:
                 setup_summary.write_report(path, resolved, meta, notes=notes)
-            print(f'Experiment notes saved to {log_dir}/{base}.txt')
+            print(f'Experiment notes saved to {folder}/{base}.txt')
         except OSError as e:
             print(f'Failed to save experiment notes: {e}')
 
@@ -747,6 +1175,10 @@ class Window(QWidget):
         # after the test yaml.
         self.logging_queue.put_nowait({'test_name': test_file})
         duration = result['t'][-1] if result['n_cycles'] else 0.0
+        # Kept for the progress readout during the run.
+        self._plan_segments = result.get('segments') or []
+        self._plan_duration = duration
+        self._plan_truncated = result['truncated']
         # `truncated` is a preview cap (MAX_CYCLES), not a problem with the
         # plan — the rig runs the whole thing, so say so and arm it anyway.
         note = ' — preview capped, full test is longer' if result['truncated'] else ''
@@ -788,6 +1220,9 @@ class Window(QWidget):
         self._armed_caption = ''
         self._armed_stale = False
         self._arm_error = None
+        self._plan_segments = []
+        self._plan_duration = 0.0
+        self._plan_truncated = False
         self.control_command_queue.put_nowait(['clear_test', 0])
         self.logging_queue.put_nowait({'test_name': None})
 
@@ -798,6 +1233,7 @@ class Window(QWidget):
         holds the plan, the GUI has only asked for it.
         """
         self._controller_fault = bool(state.get('fault'))
+        self._progress = state.get('progress')
 
         # Taring is only legal with the rig idle and no test running, so the
         # button follows the controller's own precondition rather than letting
@@ -805,6 +1241,19 @@ class Window(QWidget):
         self.tare_button.setEnabled(not state.get('test_active')
                                     and not state.get('tare_active'))
         self.__refresh_tare(state)
+
+        # Same reasoning as the tare button: the controller refuses a reset with
+        # a test running, and a reset with nothing faulted is a no-op, so the
+        # button offers itself only when it would do something.
+        self.clear_faults_button.setEnabled(
+            bool(state.get('faulted_drives'))
+            and not state.get('test_active')
+            and not state.get('fault_clear_active'))
+        self.__refresh_fault_clear(state)
+
+        if self._has_window:
+            self.__refresh_window(state)
+        self.__refresh_resume(state)
 
         armed = state.get('armed')
         if self._requested_arm is not None:
@@ -823,6 +1272,143 @@ class Window(QWidget):
             # The controller holds nothing, whatever we believed. This only
             # ever narrows our claim to match it, which is the safe direction.
             self._armed_test = None
+
+    # Output-frame tolerance for "at centre" after a return-to-centre. The
+    # controller's own deadband is 0.005 rad; this is looser because the
+    # question here is whether the shaft came back at all, not whether the
+    # last millirad landed. A return that stopped on contact or on the
+    # ratio check leaves the output far outside this.
+    RESUME_CENTRE_TOL_RAD = 0.05
+
+    def __refresh_resume(self, state):
+        offer = state.get('resume')
+        if offer is None:
+            # Consumed (resumed), aborted, or overwritten by a fresh start.
+            self._resume_key = None
+            self._recover = None
+            if self._resume_box is not None:
+                self._resume_box.close()
+                self._resume_box = None
+            return
+        if state.get('test_active') or state.get('post_test') is not None:
+            return  # brake / log tail still running; the offer waits
+        key = (offer.get('test'), offer.get('segment'))
+        w = state.get('window') or {}
+
+        if self._recover is None:
+            if self._resume_key == key:
+                return  # already asked; a box is up or the answer is pending
+            self._resume_key = key
+            self.__offer_recentre(offer, w)
+            return
+
+        # Step 2: watching the return-to-centre the operator asked for.
+        r = self._recover
+        jog = w.get('jog')
+        if jog == 'return_centre':
+            r['seen'] = True
+            return
+        if jog is not None:
+            return  # some other jog; leave it alone
+        message = w.get('message') or ''
+        refused = (message != r['message_at_send']
+                   and message.startswith('Return to centre refused'))
+        # A refusal that repeats the previous message word for word (a retry
+        # against the same faulted drive, say) is invisible to the comparison
+        # above, so a return that has not started within a few seconds is
+        # treated as refused rather than waited on forever.
+        if not r['seen'] and not refused and time.time() - r['sent_at'] < 3.0:
+            return  # command not acted on yet
+        self._recover = None
+        self.__confirm_centre(offer, w, message)
+
+    def __offer_recentre(self, offer, w):
+        rel = w.get('rel')
+        where = '' if rel is None else f' Output is now {rel:+.3f} rad from centre.'
+        # A slip displaces the INPUT against a stationary output, so the output
+        # can sit at centre with nothing to recentre. Say what moved, or the
+        # 'Output is now +0.000 rad from centre' line reads as a broken dialog.
+        if (offer.get('check') or '').startswith('ratio'):
+            where += (' The output has fallen behind the input; the output itself'
+                      ' may not have moved.')
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle(offer.get('label') or 'Position window trip')
+        box.setText(f'{offer["test"]} stopped in segment {offer["segment"]}/'
+                    f'{offer["segments"]} ({offer["segment_id"]}).')
+        box.setInformativeText(
+            f'{offer.get("detail") or "position window trip"}.{where}\n\n'
+            'Brake and log tail are done. Drive the output back to centre on the '
+            f'input shaft, then restart segment {offer["segment"]} from its '
+            'beginning? Centre itself is not moved: the output encoder is the '
+            'reference and should not have changed.')
+        recentre = box.addButton('Recentre, then resume', QMessageBox.AcceptRole)
+        box.addButton('Abort experiment', QMessageBox.RejectRole)
+        box.setDefaultButton(recentre)
+        box.setModal(False)
+
+        def done(button):
+            self._resume_box = None
+            if button is recentre:
+                self._recover = {'seen': False, 'sent_at': time.time(),
+                                 'message_at_send': (w.get('message') or '')}
+                self.control_command_queue.put_nowait(['return_centre', 0])
+            else:
+                self.control_command_queue.put_nowait(['abort_resume', 0])
+        box.buttonClicked.connect(done)
+        self._resume_box = box
+        box.open()
+
+    def __confirm_centre(self, offer, w, message):
+        rel = w.get('rel')
+        at_centre = rel is not None and abs(rel) <= self.RESUME_CENTRE_TOL_RAD
+        box = QMessageBox(self)
+        box.setWindowTitle('Confirm centre before resuming')
+        lines = []
+        if rel is None:
+            lines.append('Output position is unreadable.')
+        else:
+            lines.append(f'Output is {rel:+.4f} rad ({np.degrees(rel):+.2f}°) from the '
+                         f'declared centre.')
+        if w.get('input_ratio') is not None:
+            lines.append(f'Input/output ratio measured on the return: '
+                         f'{w["input_ratio"]:+.1f} (nominal 43).')
+        if message:
+            lines.append(f'Controller: {message}')
+        box.setText('\n'.join(lines))
+        if at_centre:
+            box.setIcon(QMessageBox.Question)
+            box.setInformativeText(
+                'Check the rig: does the output look centred against its marks? '
+                'If the OUTPUT shaft slipped on its coupling this reading is '
+                f'wrong and you should abort.\n\nResume {offer["test"]} from the '
+                f'start of segment {offer["segment"]}/{offer["segments"]} '
+                f'({offer["segment_id"]})?')
+            go = box.addButton(f'Resume segment {offer["segment"]}', QMessageBox.AcceptRole)
+        else:
+            box.setIcon(QMessageBox.Warning)
+            box.setInformativeText(
+                'The output did NOT come back to centre (it stopped on contact, on '
+                'the ratio check, or the move was refused). Retry the return, or '
+                'abort and sort it out by hand.')
+            go = box.addButton('Retry recentre', QMessageBox.AcceptRole)
+        box.addButton('Abort experiment', QMessageBox.RejectRole)
+        box.setDefaultButton(go)
+        box.setModal(False)
+
+        def done(button):
+            self._resume_box = None
+            if button is not go:
+                self.control_command_queue.put_nowait(['abort_resume', 0])
+            elif at_centre:
+                self.control_command_queue.put_nowait(['resume_test', 0])
+            else:
+                self._recover = {'seen': False, 'sent_at': time.time(),
+                                 'message_at_send': message}
+                self.control_command_queue.put_nowait(['return_centre', 0])
+        box.buttonClicked.connect(done)
+        self._resume_box = box
+        box.open()
 
     def __set_status(self, state, text):
         self.status_light.set_state(state, text)
@@ -850,6 +1436,93 @@ class Window(QWidget):
             self.__set_status('armed', self._armed_caption)
         else:
             self.__set_status('idle', 'No test armed')
+
+    @staticmethod
+    def __fmt_duration(seconds):
+        """'45s' / '6m12s' / '1h04m'. Whole seconds, so a label refreshed on
+        every 30 ms tick only actually changes once a second."""
+        seconds = int(max(seconds, 0))
+        if seconds < 60:
+            return f'{seconds}s'
+        if seconds < 3600:
+            return f'{seconds // 60}m{seconds % 60:02d}s'
+        return f'{seconds // 3600}h{(seconds % 3600) // 60:02d}m'
+
+    def __refresh_progress(self):
+        """Where the run is: segment, repeat within it, and the clock.
+
+        Every duration here is an UPPER bound, and is written with a `≤` for
+        that reason. Three things make the expansion's timing a ceiling rather
+        than a prediction: a ramp_break releases as soon as the shaft breaks
+        free but expands as running every ramp to the amplitude ceiling, a
+        preamble can abort a block on drift, and neither is knowable offline.
+        Only the COUNTS (segment i/N, repeat j/m) are exact — which is why they
+        lead, and why there is no progress bar or percentage here. Mode-switch
+        stalls push the other way (the controller holds a command while a drive
+        changes mode), so an overrun is possible and is labelled as one rather
+        than clamped to a comfortable-looking zero.
+        """
+        if not self._log_active or self._run_started is None:
+            self.progress_label.setVisible(False)
+            self._segment_started = None
+            self._segment_seen = None
+            return
+
+        progress = self._progress or {}
+        index = progress.get('segment') or 0
+        count = progress.get('segments') or 0
+
+        # Stamp when the segment changed, for the in-segment estimate. The
+        # controller publishes the number; only this window knows the wall
+        # clock the operator is reading.
+        if index != self._segment_seen:
+            self._segment_seen = index
+            self._segment_started = time.time()
+
+        lines = []
+        if index and count:
+            line = f'Segment {index}/{count}'
+            if progress.get('segment_type'):
+                line += f' — {progress["segment_type"]}'
+            lines.append(line)
+
+        # A single-repeat behavior (a trace) has nothing to say here; showing
+        # '1/1' would only be noise next to the segment line.
+        repeat, repeats = progress.get('repeat') or 0, progress.get('repeats') or 0
+        if repeat and repeats > 1:
+            line = f'Repeat {repeat}/{repeats}'
+            budget = self.__segment_budget(index)
+            if budget is not None and self._segment_started is not None:
+                left = budget - (time.time() - self._segment_started)
+                # Floored at 1 s: a bound that counts down to '≤ 0s' and then
+                # sits there reads as a stall, when all it means is that the
+                # ceiling is about to be reached.
+                line += ('  ·  over estimate' if left <= 0 else
+                         f'  ·  ≤ {self.__fmt_duration(max(left, 1))} left here')
+            lines.append(line)
+
+        elapsed = self.__fmt_duration(time.time() - self._run_started)
+        if self._plan_duration and not self._plan_truncated:
+            lines.append(f'{elapsed} elapsed of ≤ '
+                         f'{self.__fmt_duration(self._plan_duration)}')
+        else:
+            # Truncated expansions have no total worth quoting — the plan runs
+            # past where the preview stopped looking.
+            lines.append(f'{elapsed} elapsed')
+
+        # Always at least the elapsed line: a running test with no progress
+        # block yet (the controller has not published one) still gets a clock,
+        # which is better than a panel that blinks in and out.
+        self.progress_label.setText('\n'.join(lines))
+        self.progress_label.setVisible(True)
+
+    def __segment_budget(self, index):
+        """The expansion's duration for segment `index` (1-based), or None if
+        the plan does not reach it — a truncated expansion stops early, so the
+        tail segments genuinely have no estimate to offer."""
+        if 1 <= index <= len(self._plan_segments):
+            return self._plan_segments[index - 1]['duration_s']
+        return None
 
     def __refresh_test_list(self):
         current = self.test_select.currentText()
@@ -918,31 +1591,66 @@ class Window(QWidget):
         self._armed_stale = True
         self.__refresh_status()
 
+    def __load_scope(self, entry, plot_key):
+        # Point one scope at plot_key: drop whatever it was drawing and rebuild
+        # its curves, pens and legend from that key's config.
+        #
+        # The curves have to be torn down every time, not only when the number
+        # of traces changes. A curve owns its pen and its legend label, so
+        # reusing one for a different key draws the new data in the old color
+        # under the old legend text; and any curve left behind in the plot keeps
+        # showing its last frame forever, because redraw() only ever feeds the
+        # curves listed in entry['curves'].
+        plot = entry['plot']
+        plot_params = self.plot_params[plot_key]
+
+        for curve in entry['curves']:
+            plot.removeItem(curve)
+        entry['legend'].clear()
+
+        plot.setTitle(plot_params['title'])
+        plot.setLabel('left', plot_params['unit'])
+        # plot.getViewBox().setYRange(plot_params['range'][0], plot_params['range'][1])
+
+        # for each curve that should be on the graph, load that trace from the data buffer and plot it
+        curves = []
+        for ui, data_key in enumerate(plot_params['data_keys']):
+            curve = plot.plot(self.gui_data[0,:], self.trace(data_key), pen=plot_params['pens'][ui], name=plot_params['legends'][ui])
+            entry['legend'].addItem(curve, plot_params['legends'][ui])
+            curves.append(curve)
+
+        entry['curves'] = curves
+        entry['data_keys'] = plot_params['data_keys']
+        entry['key'] = plot_key
+
     # called if you change which scope is selected in the dropdown
     def __change_scopes(self):
-        # Find the changed scope
-        inds_changed = [i for i in range(self.num_plots) if not self.plots[i]['plot'].titleLabel.text == self.plots[i]['selector'].currentText()]
-        
-        for i in inds_changed:
-            plot_key = self.plots[i]['selector'].currentText()
-            plot_params = self.plot_params[plot_key]
+        # Find the changed scope. This compares against the key we last loaded,
+        # not the plot's title: the title is the config's 'title' field, which
+        # is a different string from the dropdown entry (the config key), so the
+        # old title comparison flagged every scope on every change.
+        for entry in self.plots:
+            plot_key = entry['selector'].currentText()
+            if plot_key != entry['key']:
+                self.__load_scope(entry, plot_key)
 
-            self.plots[i]['plot'].setTitle(plot_params['title'])
-            self.plots[i]['data_keys'] = plot_params['data_keys']
-            # self.plots[i]['plot'].getViewBox().setYRange(plot_params['range'][0], plot_params['range'][1])
-            self.plots[i]['plot'].setLabel('left', plot_params['unit'])
-
-            if not len(self.plots[i]['curves']) == len(self.plots[i]['data_keys']):
-                legend = pg.LegendItem(offset=(80, 10)) # Adjust offset as needed
-                legend.setParentItem(self.plots[i]['plot'])
-
-                curves = []
-                for ui, data_key in enumerate(plot_params['data_keys']):               
-                    curve = self.plots[i]['plot'].plot(self.gui_data[0,:], self.trace(data_key), pen=plot_params['pens'][ui], name=plot_params['legends'][ui])
-                    legend.addItem(curve, plot_params['legends'][ui])
-                    curves.append(curve)
-                
-                self.plots[i]['curves'] = curves
+    def __clear_plots(self):
+        # Wipe the displayed history so recent, small motions are readable again:
+        # a large past excursion holds the auto-ranged y-axis open for the whole
+        # 30 s window (there is no fixed setYRange), which is the thing being
+        # cleared here as much as the trace itself. NaN rather than zero, because
+        # pyqtgraph's default connect='auto' both breaks the curve at non-finite
+        # points and leaves them out of the auto-range; zeros would draw a flat
+        # line and still count as data.
+        #
+        # All scopes share self.gui_data, so this necessarily clears all of them.
+        # Two rows/columns are deliberately spared:
+        #   row 0        the time axis, so the window keeps scrolling normally
+        #   last column  the newest sample, so the safeties readout
+        #                (__update_safeties_panel reads [:, -1]) keeps a real
+        #                value instead of flashing 'nan' until the next tick
+        self.gui_data[1:, :-1] = np.nan
+        self.redraw()
 
     def trace(self, trace_key):
         if trace_key in self.log_keys:
@@ -955,6 +1663,7 @@ class Window(QWidget):
 
         # pull samples from telemetry queue
         control_state = None
+        newest_sample_time = None
         read_queue = True
         while read_queue:
             try:
@@ -967,26 +1676,63 @@ class Window(QWidget):
                 log_flag = sample[-2].get('log', False)
                 if log_flag and not self._log_active:
                     self._log_active = True
-                    self._active_log_dir = logger.log_dir_name()
+                    self._run_started = time.time()
+                    self._segment_started = None
+                    self._segment_seen = None
+                    # Per-run baselines for the lag readout. The lag itself is
+                    # NOT reset: it accrues across a session and zeroing it here
+                    # would hide that. Only what this run added is reported.
+                    self._lag_at_run_start = self._drain_lag
+                    self._lag_peak = self._drain_lag
+                    self._backlog_peak = self._backlog
+                    # The Logger resolves 'log_dir' against dyno_logs_directory
+                    # itself, so it gets the bare name; we keep the absolute
+                    # path, which is what survives a later relocation.
+                    log_name = logger.log_dir_name()
+                    self._active_log_dir = os.path.join(
+                        dyno_paths.dyno_logs_directory, log_name)
                     # The armed plan, not the dropdown text — the two differ
                     # whenever a pick failed to load.
                     self._active_log_test = self._armed_test
-                    self.logging_queue.put_nowait({'log_dir': self._active_log_dir})
+                    self.logging_queue.put_nowait({'log_dir': log_name})
                 elif not log_flag and self._log_active:
                     self._log_active = False
                     self._notes_prompt_pending = True
+                    self._run_ended_pending = True
                 # Slot -1: the controller's own view of what it holds. Keep the
-                # newest; it is reconciled once, after the drain.
-                control_state = sample[-1]
+                # newest; it is reconciled once, after the drain. It arrives on a
+                # ~50 Hz heartbeat rather than every sample (it was 75-80% of
+                # every sample's pickled bytes and was filling the 64 KiB queue
+                # pipe in 52 ms -- see Controller._send_telemetry), so slot -1 is
+                # None on most samples and a None must never overwrite the last
+                # real state.
+                if sample[-1] is not None:
+                    control_state = sample[-1]
+                newest_sample_time = sample[0]
                 self.logging_queue.put_nowait(sample) #forward sample to the logging thread
                 self.telemetry_samples.append(sample[:-2])
             except:
                 read_queue = False
                 pass
 
+        self.__measure_drain_lag(newest_sample_time)
+
         if control_state is not None:
             self.__reconcile_controller(control_state)
         self.__refresh_status()
+        self.__refresh_progress()
+
+        # Reported here rather than in the drain loop: that loop's except is
+        # bare, so anything raised inside it silently ends the drain -- which
+        # looks exactly like the lag this is measuring.
+        if self._run_ended_pending:
+            self._run_ended_pending = False
+            accrued = self._drain_lag - self._lag_at_run_start
+            print(f'GUI: run ended. Plot lag accrued during this run: '
+                  f'{accrued:+.2f} s (now {self._drain_lag:.2f} s behind, peak '
+                  f'{self._lag_peak:.2f} s). Telemetry backlog peak '
+                  f'{self._backlog_peak} samples = '
+                  f'{self._backlog_peak / 1000.0:.2f} s at 1 kHz.')
 
         if self._notes_prompt_pending:
             self._notes_prompt_pending = False
@@ -1008,6 +1754,39 @@ class Window(QWidget):
 
         self.__update_safeties_panel()
         self.redraw()
+
+    def __measure_drain_lag(self, newest_sample_time):
+        """How far behind the rig this window is, and how deep the backlog is.
+
+        Both are relative to the first sample this window ever drained, so a
+        constant offset between the two processes' clocks cancels and only the
+        ACCRUAL shows. A healthy pipeline holds this near 0 for a whole run; the
+        symptom being chased is it climbing to several seconds by the end."""
+        try:
+            self._backlog = self.telemetry_queue.qsize()
+            self._backlog_peak = max(self._backlog_peak, self._backlog)
+        except NotImplementedError:
+            pass  # qsize is unavailable on some platforms; not worth failing over
+
+        if newest_sample_time is None:
+            return  # nothing drained this tick, so nothing new to compare
+
+        now = time.time()
+        if self._lag_wall0 is None:
+            self._lag_wall0 = now
+            self._lag_t0 = newest_sample_time
+            return
+
+        self._drain_lag = ((now - self._lag_wall0)
+                           - (newest_sample_time - self._lag_t0))
+        self._lag_peak = max(self._lag_peak, self._drain_lag)
+
+        # Say it once per whole second of lag rather than on every tick, so a
+        # genuinely lagging run is loud without a healthy one printing at 33 Hz.
+        if self._drain_lag >= self._lag_warned + 1.0:
+            self._lag_warned = self._drain_lag
+            print(f'GUI: plots are {self._drain_lag:.1f} s behind the rig '
+                  f'({self._backlog} samples queued)')
 
     def redraw(self):
         draw_start = time.time()

@@ -1,0 +1,62 @@
+# Syno 1.2.1 -- the new gearbox fitted 2026-09-18, the first unit run against
+# the 100 Nm slip plans.
+#
+# Copied from gbx_1p2p0.yaml. The only substantive difference is `exclude`:
+# see the note there.
+
+unit: "1.2.1"
+unit_label: "Syno 1.2.1"
+
+# Everything beneath this is searched, recursively, for .hdf5 logs.
+log_root: dyno/logs/archimedes/gbx_1p2p1
+
+# Path components to skip. NOTE the difference from 1.2.0: `calibration` is NOT
+# excluded here. On 1.2.0 that folder held V0030/V0060 bring-up spins that would
+# have landed in the customer's velocity ramp. On this unit the only thing under
+# it is calibration/gravity_map, which is the real archimedes_fwd_gravity_map
+# run (SLOW/FAST segments, kind=gravity) -- a customer test, not bring-up.
+# Excluding the component by name would silently drop it.
+#
+# If bring-up spins are later dropped under this unit's calibration/, move them
+# to initial_setup/ rather than adding the component back, or the gravity map
+# goes with them.
+exclude:
+  - initial_setup
+  - troubleshooting_initial
+  # post_backdriving_abort holds bench spins taken AFTER the back-driving
+  # failure on 2026-09-18, at V0600/V0900/V1200/V1500/V1800. Those five speeds
+  # are also in the real fwd_drive/velocity_ramp run, at identical length, so
+  # the duplicate rule ('equal length means the sweep was re-run, later file
+  # wins') handed all five to the troubleshooting copy -- five post-failure
+  # points dropped into the middle of the customer's forward drag curve, with
+  # nothing in the report to say so. Excluded by component, like 1.2.0's
+  # bring-up folder.
+  - troubleshooting
+
+# Customer's hard limit for this unit (1.2.0/1.2.1 = 100 Nm, 1.2.2 = 140 Nm).
+torque_cap_nm: 100.0
+# What the unit is rated to, for the "does it meet spec" finding on slip.
+rated_torque_nm: 100.0
+
+# Output position window in force during these runs, for the endstop figure.
+# These ran 2026-09-18 15:03-15:17, after the raise to 1.60 (see the config).
+position_half_window_rad: 1.6
+
+# Nameplate ratio as stamped on the drive. Reported as the nominal ratio in the
+# test-conditions table; the ratio the report refers quantities through is the
+# one measured from the no-load sweep, where there is one.
+ratio_nameplate: 43
+
+# Nameplate, used only if the no-load sweep is missing and the ratio cannot be
+# measured. This unit does have a forward no-load sweep (fwd_drive/velocity_ramp),
+# so the ratio in the report is measured, not this.
+ratio: 43.88
+
+# Optional report sections. The 1.2.2 Paladin Test Request's test list marks
+# 'Slip torque' and 'Stiffness' No for 1.2.0 and 1.2.1 and Yes for 1.2.2, so
+# neither section is in this unit's report. Both analyzers still run and the
+# pack still carries their figures, CSVs and findings. Set either true on the
+# 1.2.2 unit file. Note that the slip section also carries the breakaway
+# results.
+report_slip: false
+report_stiffness: false

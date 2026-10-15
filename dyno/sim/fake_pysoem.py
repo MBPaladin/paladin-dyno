@@ -47,6 +47,32 @@ def wrap_i32(value):
     return ((int(value) + 2**31) % 2**32) - 2**31
 
 
+def _fault_injection(drive_name):
+    """Scheduled fault for one drive, from DYNO_SIM_FAULT.
+
+    Format: comma-separated `NAME@SECONDS[:sticky]`, e.g. 'LOAD@3,DUT@3:sticky'
+    -- fault LOAD three seconds into the run, clearable by a DS402 reset, and
+    fault DUT at the same time with a cause that never goes away, so a reset
+    drops the latch and the drive puts it straight back.
+
+    Sticky is the case worth simulating: a reset that appears to work and a
+    reset that only cleared the latch look identical from the button, and the
+    second one is the one that will surprise an operator.
+
+    Returns (seconds, sticky) or None.
+    """
+    for spec in (os.environ.get('DYNO_SIM_FAULT') or '').split(','):
+        spec = spec.strip()
+        if not spec:
+            continue
+        target, _, when = spec.partition('@')
+        if target != drive_name:
+            continue
+        when, _, flag = when.partition(':')
+        return float(when or 0.0), flag.strip().lower() == 'sticky'
+    return None
+
+
 # --------------------------------------------------------------------------
 # Device behavior models
 # --------------------------------------------------------------------------
@@ -218,6 +244,19 @@ class AKDBehavior(Behavior):
         self.tau_limit = self.params.get('motor_limits', {}).get('torque', 10)
         self.flip = self.params.get('flip_torque_sign', False)
         self.coupling = -1.0 if self.flip else 1.0  # mounting direction on shaft
+        # `hardware_torque_sign: true` in sim_params (injected per drive in
+        # config_init). Off by default, which keeps this fake drive's long-
+        # standing convention: it UNDOES the device-side flip_torque_sign, so
+        # positive torque always turns the sim shaft the same way whatever the
+        # flag says. That is not what the real AKD does -- the hardware logs
+        # settle it, `sign(load_torque_command) == sign(load_current)` is 0% of
+        # 1.8M samples on a (True, True) drive, i.e. a positive command really
+        # does send negative current and make negative torque in the drive's
+        # own frame. Log finding 10 called the mismatch out; this flag is how a
+        # test opts into the hardware behaviour, and anything that depends on
+        # the torque SIGN (DynoController._brake_polarity) has to be tested
+        # with it on.
+        self.hw_torque_sign = bool(self.params.get('sim_hardware_torque_sign', False))
         self.is_input_side = layout_entry['name'] == 'DUT'
 
         self.state = 'switch_on_disabled'
@@ -226,6 +265,9 @@ class AKDBehavior(Behavior):
         self._pending_mode = None
         self._pending_countdown = 0
         self.tau_motor = 0.0
+        # Velocity-mode integrator, Nm. A P-only loop sits short of its target
+        # by drag / kv, which on a geared input is most of a slow jog speed.
+        self._v_integral = 0.0
         # Position-command unwrap state (raw i32 counts). devices.AKD scales
         # position at 2^32 counts/rev into an int32 PDO field, so the raw
         # command wraps every half motor revolution; a real drive follows the
@@ -233,6 +275,10 @@ class AKDBehavior(Behavior):
         # snaps the target by a full revolution at +/-pi and rails the PD).
         self._pos_cmd_prev_raw = None
         self._pos_cmd_counts = 0.0
+
+        # Test-only scheduled fault; see _fault_injection and step().
+        self._fault_injection = _fault_injection(layout_entry['name'])
+        self._elapsed_s = 0.0
 
     # -- SDO ---------------------------------------------------------------
     def sdo_read(self, index, subindex, size=None, ca=False):
@@ -316,14 +362,17 @@ class AKDBehavior(Behavior):
                 # one that simply never receives it.
                 i_cmd = (getattr(rx, 'current_command', 0) / 1000.0
                          + getattr(rx, 'torque_ff', 0) * self.i_cont / 1000.0)
-                if self.flip:
+                if self.flip and not self.hw_torque_sign:
                     i_cmd = -i_cmd  # undo the device-side sign flip
                 tau = self._current_to_torque(i_cmd)
             elif self.op_mode == 3:  # velocity mode: stiff first-order servo
                 v_cmd = getattr(rx, 'velocity_command', 0) / 1000.0 * 2 * math.pi / 60.0
                 # gain limited by explicit-Euler stability at the 1 ms cycle
                 kv = min(self.tau_limit / 0.5, j_motor * 200.0)
-                tau = kv * (v_cmd - omega_m)
+                err = v_cmd - omega_m
+                self._v_integral = max(-self.tau_limit, min(
+                    self.tau_limit, self._v_integral + 20.0 * kv * err * CYCLE_S))
+                tau = kv * err + self._v_integral
             elif self.op_mode == 7:  # position mode: critically damped PD
                 raw = getattr(rx, 'position_command', 0)
                 if self._pos_cmd_prev_raw is None:
@@ -343,6 +392,8 @@ class AKDBehavior(Behavior):
                 tau = kp * (theta_cmd - theta_m) - kd * omega_m
             tau = max(-self.tau_limit, min(self.tau_limit, tau))
 
+        if self.op_mode != 3 or self.state != 'operation_enabled':
+            self._v_integral = 0.0
         if self.op_mode != 7 or self.state != 'operation_enabled':
             self._pos_cmd_prev_raw = None  # re-seed on next position-mode entry
 
@@ -355,6 +406,18 @@ class AKDBehavior(Behavior):
                 is_input_side=self.is_input_side)
 
     def step(self, dt_s, output_buf):
+        # Scheduled fault, applied before the status word is packed. A sticky
+        # one re-latches every cycle, so the fault bit never actually clears on
+        # the wire even though pre_step honoured the reset -- which is what a
+        # real drive does when the condition behind the fault is still there.
+        self._elapsed_s += dt_s
+        if self._fault_injection is not None:
+            at_s, sticky = self._fault_injection
+            if self._elapsed_s >= at_s:
+                self.fault = True
+                if not sticky:
+                    self._fault_injection = None
+
         tx = self._TxPDO()
         # Only the status word is in every profile; the rest are populated if
         # the active map carries them.
@@ -370,7 +433,7 @@ class AKDBehavior(Behavior):
         else:
             omega_m, theta_m = 0.0, 0.0
         current = self._torque_to_current(self.tau_motor)
-        if self.flip:
+        if self.flip and not self.hw_torque_sign:
             current = -current
 
         emit('op_mode', self.op_mode)
@@ -447,6 +510,12 @@ class Master:
         self.state = NONE_STATE
         self.plant = None
         self._opened = False
+        # DYNO_SIM_WKC_DROP='SECONDS[,SECONDS...]': lose one frame (working
+        # counter one short) at each of those times after config_init.
+        self._cycles = 0
+        self._wkc_drops = sorted(float(s) for s in
+                                 (os.environ.get('DYNO_SIM_WKC_DROP') or '').split(',')
+                                 if s.strip())
 
     # -- lifecycle ---------------------------------------------------------
     def open(self, ifname, ifname_red=None):
@@ -468,6 +537,20 @@ class Master:
         self.plant = Plant(sim_params)
 
         layout = cfg['expected_slave_layout']
+        # `drive_gear_ratio: {DUT: -43}` in sim_params: the sim shaft's ratio for
+        # that drive, independent of the config's gear_ratio (which the
+        # controller uses for limits and may be left at 1).
+        for name, ratio in (sim_params.get('drive_gear_ratio') or {}).items():
+            layout = [dict(e, params=dict(e.get('params') or {}, gear_ratio=ratio))
+                      if e.get('name') == name else e for e in layout]
+        # `hardware_torque_sign: true` in sim_params: make every drive treat
+        # flip_torque_sign the way the real one does (see _SimAKD.__init__).
+        # Injected through the layout params for the same reason the ratio is --
+        # the behaviours never see sim_params themselves.
+        if sim_params.get('hardware_torque_sign'):
+            layout = [dict(e, params=dict(e.get('params') or {},
+                                          sim_hardware_torque_sign=True))
+                      for e in layout]
         self.slaves = [
             _SimSlave(entry, DEVICE_CLASSES[entry['model']]['id'], noise)
             for entry in layout]
@@ -538,6 +621,10 @@ class Master:
         # 3) sensors and drives publish the new state as input bytes
         for s in self.slaves:
             s.input = s._behavior.step(CYCLE_S, s.output)
+        self._cycles += 1
+        if self._wkc_drops and self._cycles * CYCLE_S >= self._wkc_drops[0]:
+            self._wkc_drops.pop(0)
+            return self.expected_wkc - 1
         return self.expected_wkc
 
     @property
