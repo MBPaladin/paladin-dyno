@@ -174,7 +174,7 @@ class Logger:
         # Attach the resolved device configuration (written by the master at
         # bring-up) so every log records exactly what parameters ran. Kept
         # parsed as well, to render the companion report when the log closes.
-        resolved_path = f"{dyno_paths.dyno_logs_directory}/resolved_config.json"
+        resolved_path = dyno_paths.resolved_config_path()
         self.resolved = None
         self.config_warning = None
         if os.path.exists(resolved_path):

@@ -10,6 +10,7 @@ import threading
 from operator import attrgetter
 from deployment import dyno_paths
 from dyno.src.test_manager import TestManager
+from dyno.src.config_utils import compile_feedforward
 
 SCHED_POLICY = os.SCHED_FIFO
 SCHED_PRIO = 50
@@ -182,8 +183,16 @@ class Controller(Master):
         self._align_load_position = bool(
             self.dyno_params.get('align_load_position_to_dut', True))
 
-        # Scale on the cross-coupling torque feedforward in step(). 0 disables it.
-        self._feedforward_ratio = float(self.dyno_params.get('feedforward_ratio', 0.8))
+        # Cross-coupling torque feedforward in step(): `feedforward:` block or
+        # legacy `feedforward_ratio:` (config_utils.compile_feedforward). Sign
+        # conventions are derived once here from the drive flags -- see
+        # _load_feedforward. load_torque_ff is what LOAD was last sent (Nm, LOAD
+        # command frame), for the `load_torque_ff` log key.
+        self._ff = compile_feedforward(self.dyno_params)
+        # Derived on first use: the drives do not exist until Master.run().
+        self._ff_signs = None
+        self.load_torque_ff = 0.0
+        print(f"Controller: feedforward {self._ff}")
 
         # --- Output position window (limited-travel DUTs) ---
         # Config `position_window:`; absent means the feature is off and every
@@ -1255,6 +1264,97 @@ class Controller(Master):
             raise ValueError(f'post_test.brake in {self.mode}_dyno_config.yaml '
                              'needs timeout_s > 0, or the brake can never run')
         return post
+
+    @staticmethod
+    def _drive_polarity(dev):
+        """+1 when a positive torque command pushes `dev`'s own reported
+        position positive. Same derivation as _brake_polarity: flip_torque_sign
+        acts on the current command, flip_direction_sign on the feedback."""
+        p = 1
+        if getattr(dev, 'flip_torque_sign', False):
+            p = -p
+        if getattr(dev, 'flip_direction_sign', False):
+            p = -p
+        return p
+
+    def _feedforward_signs(self):
+        """Sign conventions for _load_feedforward, from the drive flags.
+
+        dut_push: +1 when a positive DUT torque command pushes the OUTPUT toward
+          LOAD's positive position. DUT polarity times the sign of the signed
+          gear ratio (dut position = gear_ratio x load position).
+        load_push: +1 when a positive LOAD torque command pushes LOAD's own
+          position positive.
+        cross: the sign the cancelling term needs when written, like the
+          original, as r x tc x G with G signed: -dut_push x load_push x sign(G).
+          LOAD must push against whatever the DUT pushes.
+
+        Measured on the in-house rig 2026-10-21 (DUT flags True/True, LOAD
+        True/False, G +26): dut_push +1, load_push -1, cross +1, which is the
+        sign the original hardcoded `ratio x tc x G` has; the warm Skip refit
+        gave the drag term the sign load_push predicts. Every rig config in the
+        repo derives cross = +1 the same way (with G negative on Archimedes),
+        so fixed mode keeps the hardcoded formula and only warns on a mismatch
+        -- quadrant mode uses the derived signs throughout.
+        """
+        G = float(self.devices.DUT.params['gear_ratio'])
+        dut_push = self._drive_polarity(self.devices.DUT) * (1 if G >= 0 else -1)
+        load_push = self._drive_polarity(self.devices.LOAD)
+        cross = -dut_push * load_push * (1 if G >= 0 else -1)
+        signs = {'dut_push': dut_push, 'load_push': load_push, 'cross': cross}
+        if cross != 1:
+            print('WARNING: the drive flags say the cross-coupling feedforward '
+                  f'needs sign {cross:+d}, but fixed mode hardcodes +ratio x tc x G. '
+                  'Fixed mode would ADD to the DUT torque on this rig: check the '
+                  'flip flags before running with feedforward, or use quadrant mode, '
+                  'which uses the derived sign.')
+        return signs
+
+    def _load_feedforward(self, tc, output_command):
+        """LOAD torque feedforward (Nm, LOAD command frame) for DUT torque tc.
+
+        fixed:    ratio x tc x G, the original formula.
+        quadrant: cross x r x tc x G + load_push x drag x tanh(v / v_blend)
+                  r blends from backdrive_ratio to forward_ratio across a speed
+                  reversal: tanh(v / v_blend) x sign(tc) x dut_push is +1 when
+                  the DUT pushes with the motion (forward) and -1 against it.
+                  Reversals at nonzero torque are the only discontinuity the
+                  model has, and the blend spreads them over ~2 v_blend. At tc
+                  crossing zero the cross term is continuous by itself.
+                  v is LOAD's velocity COMMAND, so the quadrant is known before
+                  the motion: with LOAD in position mode there is no command
+                  speed, and the term falls back to the mean ratio and no drag.
+        Both modes are clipped to feedforward.max_nm, else LOAD's torque limit. NaN-safe: a
+        non-finite command (a mode switch in flight) gives 0.
+        """
+        ff = self._ff
+        try:
+            tc = float(tc)
+        except (TypeError, ValueError):
+            return 0.0
+        if not math.isfinite(tc) or ff['mode'] == 'off':
+            return 0.0
+        if self._ff_signs is None:
+            self._ff_signs = self._feedforward_signs()
+            print(f"Controller: feedforward signs {self._ff_signs}")
+        G = float(self.devices.DUT.params['gear_ratio'])
+        cap = ff.get('max_nm', abs(self.devices.LOAD.torque_limit))
+        if ff['mode'] == 'fixed':
+            return max(-cap, min(cap, ff['ratio'] * tc * G))
+        s = self._ff_signs
+        blend = 0.0
+        if self.devices.LOAD.mode == 'velocity':
+            try:
+                v = float(output_command)
+            except (TypeError, ValueError):
+                v = 0.0
+            if math.isfinite(v):
+                blend = math.tanh(v / ff['v_blend_rad_s'])
+        sigma = s['dut_push'] * (1 if tc > 0 else -1 if tc < 0 else 0) * blend
+        r = (0.5 * (ff['forward_ratio'] + ff['backdrive_ratio'])
+             + 0.5 * (ff['forward_ratio'] - ff['backdrive_ratio']) * sigma)
+        out = s['cross'] * r * tc * G + s['load_push'] * ff['drag_nm'] * blend
+        return max(-cap, min(cap, out))
 
     def _brake_polarity(self, drive='input'):
         """Which way a *torque* command on the braking drive moves its own
@@ -2683,7 +2783,9 @@ class Controller(Master):
         if self.current_cmd.get('ratio_reset'):
             self._latch_ratio_reference()
 
-        ff_ratio = self._feedforward_ratio
+        # The DUT-side term (LOAD in torque, DUT not) stays the single fixed
+        # ratio in every mode but off; only the LOAD side has a quadrant model.
+        ff_ratio = 0.0 if self._ff['mode'] == 'off' else self._ff['ratio']
 
         # The feedforward terms exist to cancel the torque the *other* machine is
         # putting through the coupling. Load-only has no DUT contribution to
@@ -2692,9 +2794,12 @@ class Controller(Master):
         # operator was told stays dormant.
         load_command = self._load_command_for_mode(self.current_cmd)
         if not self._load_only and self.devices.DUT.mode == 'torque' and not self.devices.LOAD.mode == 'torque':
-            torque_ff = ff_ratio*self.current_cmd['input_command'] * self.devices.DUT.params['gear_ratio']
+            torque_ff = self._load_feedforward(self.current_cmd['input_command'],
+                                               self.current_cmd['output_command'])
+            self.load_torque_ff = torque_ff
             self.devices.LOAD.send_command(load_command, torque_ff)
         else:
+            self.load_torque_ff = 0.0
             self.devices.LOAD.send_command(load_command)
 
         if not self._load_only:

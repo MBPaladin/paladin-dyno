@@ -11,7 +11,7 @@ import yaml
 import gc
 import json
 from dyno.src.timing import hybrid_sleep_until, set_cyclic_thread_priority
-from dyno.src.config_utils import augment_log_keys
+from dyno.src.config_utils import augment_log_keys, compile_feedforward
 from dyno.src.devices import DEVICE_CLASSES, EL2004
 import types
 from operator import attrgetter
@@ -30,6 +30,7 @@ class Master:
         self._ch_thread_stop_event = threading.Event()
         self._actual_wkc = 0
         self.wkc_error = 0 # per-cycle missing working counter (expected - actual); 0 when healthy
+        self.wkc_bad_streak = 0 # consecutive cycles with WKC short; see _bus_healthy_after_op
         self.cycle_dt_us = 0.0 # measured interval between PDO sends, logged per-sample
         # Splits the "unaccounted" part of a late cycle -- the 1.5 ms median that
         # is outside both step_us and telemetry_us -- into the two places it can
@@ -142,11 +143,16 @@ class Master:
                             device_instance.write_rxpdo()
 
                 if self._actual_wkc < self._master.expected_wkc:
+                    self.wkc_bad_streak += 1
                     wkc_error_count += 1
-                    if wkc_error_count >= max_wkc_errors_before_warning and not self.shutdown:
+                    # Not before OP: in the SAFE-OP dwell the slaves ignore
+                    # outputs, so a short WKC there is expected, not a fault.
+                    if (wkc_error_count >= max_wkc_errors_before_warning
+                            and self._master.in_op and not self.shutdown):
                         print(f'WARNING: Incorrect WKC. Expected: {self._master.expected_wkc}, Actual: {self._actual_wkc}')
                         wkc_error_count = 0 # Reset counter after printing warning
                 else:
+                    self.wkc_bad_streak = 0
                     wkc_error_count = 0 # Reset if WKC is correct
 
                 cycle_start_time += self.process_data_cycle_time_us * 1000 - start_time_shift
@@ -205,6 +211,8 @@ class Master:
                         # Inject config into hardware params
                         sig_mod.params[sig_ch] = config
                         setattr(sig_mod, sensor_name, 0.0)
+                        if config.get('split_mv'):  # see ScaledChannels._scale
+                            setattr(sig_mod, sensor_name + '_raw', 0.0)
                         supply_req = config.get('supply', 'NA')
                         power_key = f'power_{supply_req}'
                         if power_key in port_mapping:
@@ -218,6 +226,8 @@ class Master:
                     sig_ch = config.get('signal_channel', 'ch1')
                     sig_mod.params[sig_ch] = config
                     setattr(sig_mod, sensor_name, 0.0)
+                    if config.get('split_mv'):
+                        setattr(sig_mod, sensor_name + '_raw', 0.0)
 
         # --- 3. SDO Configuration ---
         print('\nStep 3: Executing device setups...')
@@ -255,6 +265,10 @@ class Master:
                     # device names to log prefixes / roles / attached labels
                     # without re-opening the bench config (see Segment.ports).
                     'ports': self.dyno_params.get('ports'),
+                    # Effective torque feedforward (config_utils.compile_feedforward):
+                    # the drives cannot report it, so without this a log cannot
+                    # say which feedforward it ran with.
+                    'feedforward': compile_feedforward(self.dyno_params),
                     'devices': {}}
         for device_name, device in vars(self.devices).items():
             entry = {'class': type(device).__name__}
@@ -264,7 +278,9 @@ class Master:
                 entry['provenance'] = device.params_provenance
             resolved['devices'][device_name] = entry
         os.makedirs(dyno_paths.dyno_logs_directory, exist_ok=True)
-        with open(f'{dyno_paths.dyno_logs_directory}/resolved_config.json', 'w') as f:
+        # A sim bring-up writes its own file (dyno_paths.resolved_config_path),
+        # so it can never stamp its configuration onto a live rig's next log.
+        with open(dyno_paths.resolved_config_path(), 'w') as f:
             json.dump(resolved, f, indent=2, default=str)
 
         # --- 4. Transition to OP ---
@@ -280,16 +296,34 @@ class Master:
         control_thread = threading.Thread(target=self._processdata_loop)
         control_thread.start()
 
+        # Cycle process data in SAFE-OP before asking for OP. config_map()
+        # leaves the chain in SAFE-OP and dc_sync() only starts SYNC0 after
+        # that, so requesting OP straight away gave the AKDs no time to lock
+        # on: intermittently (14 of 40 launches, 2026-10-19..21) an AKD dropped
+        # out within ms of OP, 0x1C32:01 read back 0 (free run) instead of 1,
+        # and it stayed off the bus for the whole run.
+        self._master.state = pysoem.SAFEOP_STATE
+        self._master.write_state()
+        if self._master.state_check(pysoem.SAFEOP_STATE, timeout=2_000_000) != pysoem.SAFEOP_STATE:
+            print('WARNING: chain did not confirm SAFE-OP before the OP request.')
+        time.sleep(self.master_params.get('safeop_dwell_ms', 300) / 1000.0)
+
         self._master.state = pysoem.OP_STATE
         self._master.write_state()
-        
+
         if self._master.state_check(pysoem.OP_STATE, timeout=5_000_000) == pysoem.OP_STATE:
             print('SUCCESS: Systems OPERATIONAL.')
             self.in_op = True
+            # _check_thread is gated on this one. It used to be set False in
+            # __init__ and never set True, so slave recovery never ran.
+            self._master.in_op = True
             self._print_sync_diagnostics('at OP')
-            
+
             check_thread = threading.Thread(target=self._check_thread)
             check_thread.start()
+
+            if not self._bus_healthy_after_op():
+                self.shutdown = True
 
             while not self.shutdown:
                 time.sleep(0.1)
@@ -309,6 +343,7 @@ class Master:
         self._release_drives()
 
         self.in_op = False
+        self._master.in_op = False
         self._pd_thread_stop_event.set()
         self._ch_thread_stop_event.set()
         control_thread.join()
@@ -361,6 +396,41 @@ class Master:
                 parts.append('ESC DC registers=n/a')
             print(f'Sync {label}: {name} ({model}) 0x1C32: ' + ', '.join(parts))
 
+    def _bus_healthy_after_op(self, settle_s=1.0, bad_cycles=50):
+        '''False if WKC is still short settle_s after OP.
+
+        settle_s gives _check_thread a chance to ack and recover a slave that
+        dropped out at the transition. bad_cycles is consecutive short cycles,
+        so an occasional lost frame does not abort a start-up.
+        '''
+        deadline = time.monotonic() + settle_s
+        while time.monotonic() < deadline:
+            if self.shutdown:
+                return True # closed during start-up; nothing to report
+            time.sleep(0.01)
+        if self.wkc_bad_streak < bad_cycles:
+            return True
+
+        self._master.read_state()
+        print(f'\nERROR: EtherCAT bus not healthy {settle_s:.1f} s after OP: WKC '
+              f'{self._actual_wkc} of {self._master.expected_wkc}, short for the '
+              f'last {self.wkc_bad_streak} cycles. Aborting start-up rather than '
+              f'running with a drive off the bus.')
+        for i, slave in enumerate(self._master.slaves):
+            if slave.state != pysoem.OP_STATE:
+                name = self._expected_slave_layout[i].get('name', slave.name)
+                print(f'\t{name} (slave {i}): {self._describe_state(slave)}')
+        print('\tRelaunch; if it happens again, run '
+              './dyno/utilities/release_drives.sh --clear-faults first.')
+        return False
+
+    @staticmethod
+    def _describe_state(slave):
+        al = getattr(slave, 'al_status', 0)
+        to_string = getattr(pysoem, 'al_status_code_to_string', None)
+        text = f' ({to_string(al)})' if to_string and al else ''
+        return f'state {slave.state:#04x}, AL status {al:#06x}{text}'
+
     def _release_drives(self, timeout_s=2.0):
         '''Walk every DS402 drive to Switch on Disabled before PDOs stop.
 
@@ -406,11 +476,11 @@ class Master:
     @staticmethod
     def _check_slave(slave, pos):
         if slave.state == (pysoem.SAFEOP_STATE + pysoem.STATE_ERROR):
-            print(f'ERROR : slave {pos} is in SAFE_OP + ERROR (AL status code: {slave.state}), attempting ack.')
+            print(f'ERROR : slave {pos} is in SAFE_OP + ERROR ({Master._describe_state(slave)}), attempting ack.')
             slave.state = pysoem.SAFEOP_STATE + pysoem.STATE_ACK
             slave.write_state()
         elif slave.state == pysoem.SAFEOP_STATE:
-            print(f'WARNING : slave {pos} is in SAFE_OP (AL status code: {slave.state}), try change to OPERATIONAL.')
+            print(f'WARNING : slave {pos} is in SAFE_OP ({Master._describe_state(slave)}), try change to OPERATIONAL.')
             slave.state = pysoem.OP_STATE
             slave.write_state()
         elif slave.state > pysoem.NONE_STATE:

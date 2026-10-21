@@ -207,10 +207,54 @@ class ScaledChannels:
     def _init_channels(self):
         self.tare = {}      # sensor name -> bias added on top of the config offset
         self.untared = {}   # sensor name -> reading with offset applied, tare not
+        self._split_announced = set()
 
-    def _publish_channel(self, ch_name, scaled):
+    # Full-scale count of the ELM3000 series' extended-range scaling: a reading
+    # of this many counts is fs_v on the wire and fs_pos in sensor units.
+    FULL_SCALE_COUNTS = 7812500
+
+    def _scale(self, ch_params, raw):
+        """Raw counts -> sensor units, with the optional 0 V split correction.
+
+        `split_mv` (and `split_center_mv`, default 0) in a sensor's config undo
+        a signal chain that pushes readings AWAY from a point on the wire: every
+        reading above it sits split_mv/2 high and every one below it
+        split_mv/2 low, leaving a gap with almost no samples in it. The Skip
+        load cell has one (~4 mV at 0 V, 2026-10-21 checkout: it follows the
+        cell's chain, not the terminal channel or its range). The correction
+        pulls each side back by split_mv/2, and maps the few samples that land
+        inside the gap to its centre rather than throwing them across it.
+
+        It acts on the wire voltage, BEFORE offset and tare, because the gap is
+        at a fixed voltage whatever the zero is; correcting after a tare would
+        put it in the wrong place. Volts rather than sensor units so a range
+        change (fs_v / fs_pos) does not change the number.
+        """
+        frac = raw / self.FULL_SCALE_COUNTS
+        split = ch_params.get('split_mv')
+        if split:
+            mv_fs = 1000.0 * float(ch_params.get('fs_v', 10))
+            centre = float(ch_params.get('split_center_mv', 0.0))
+            x = frac * mv_fs - centre
+            frac = (centre + math.copysign(max(abs(x) - 0.5 * float(split), 0.0), x)) / mv_fs
+            name = ch_params.get('name')
+            if name not in self._split_announced:
+                self._split_announced.add(name)
+                print(f'{name}: correcting a {float(split):g} mV signal split at '
+                      f'{centre:+g} mV on the wire ({float(split) * ch_params.get("fs_pos", 1.0) / mv_fs:.3f} '
+                      f'sensor units); uncorrected reading published as {name}_raw')
+        return ch_params.get('fs_pos', 1.0) * frac + ch_params.get('offset', 0.0)
+
+    def _publish_channel(self, ch_name, scaled, ch_params=None, raw=None):
         self.untared[ch_name] = scaled
         setattr(self, ch_name, scaled + self.tare.get(ch_name, 0.0))
+        # With a split correction, keep the reading it replaced: untared and
+        # uncorrected, i.e. exactly what the wire said, so the correction can be
+        # checked or redone afterwards. Log it as devices.<module>.<name>_raw.
+        if ch_params is not None and ch_params.get('split_mv'):
+            setattr(self, ch_name + '_raw',
+                    ch_params.get('fs_pos', 1.0) * raw / self.FULL_SCALE_COUNTS
+                    + ch_params.get('offset', 0.0))
 
 
 class ELM3002(ScaledChannels):
@@ -272,15 +316,13 @@ class ELM3002(ScaledChannels):
             ch_name = ch_params.get('name')
             
             if ch_name:
-                fs_pos = ch_params.get('fs_pos', 1.0)
-                offset = ch_params.get('offset', 0.0)
-                
-                # Formula for ELM 3000 series scaling
-                scaled_value = (fs_pos * raw_values[i] / 7812500) + offset
+                # ELM 3000 series scaling (fs_pos * raw / 7812500 + offset),
+                # plus the sensor's split correction if it has one.
+                scaled_value = self._scale(ch_params, raw_values[i])
 
                 # Creates or updates the attribute (e.g. self.load_torque),
                 # with any session tare on top -- see ScaledChannels.
-                self._publish_channel(ch_name, scaled_value)
+                self._publish_channel(ch_name, scaled_value, ch_params, raw_values[i])
 
 class EL3208:
     class TxPDO(ctypes.Structure):
@@ -494,15 +536,13 @@ class ELM3004(ScaledChannels):
             ch_name = ch_params.get('name')
             
             if ch_name:
-                fs_pos = ch_params.get('fs_pos', 1.0)
-                offset = ch_params.get('offset', 0.0)
-                
-                # Formula for ELM 3000 series scaling
-                scaled_value = (fs_pos * raw_values[i] / 7812500) + offset
+                # ELM 3000 series scaling (fs_pos * raw / 7812500 + offset),
+                # plus the sensor's split correction if it has one.
+                scaled_value = self._scale(ch_params, raw_values[i])
 
                 # Creates or updates the attribute (e.g. self.load_torque),
                 # with any session tare on top -- see ScaledChannels.
-                self._publish_channel(ch_name, scaled_value)
+                self._publish_channel(ch_name, scaled_value, ch_params, raw_values[i])
 
 class EL5042:
     class TxPDO(ctypes.Structure):
@@ -629,6 +669,12 @@ AKD_PDO_PROFILES = {
 }
 
 AKD_PDO_PROFILE_DEFAULT = 'extended'
+
+# drive_params.velocity_op_mode -> the 0x6060 value AKD 'velocity' mode writes.
+# See AKD.__init__ for why there are two.
+AKD_VELOCITY_OP_MODES = {'profile': 3, 'csv': 9}
+# A mode switch the drive has not confirmed after this many cycles is reported.
+AKD_SWITCH_WARN_CYCLES = 2000
 
 _PDO_STRUCT_CACHE = {}
 
@@ -819,11 +865,37 @@ class AKD:
         self._fault_reset_cycles = 0
 
         self.digital_out_state = 0x00000000
-        self.mode_dict = {7:2,3:1,4:0,0:-1} #Converts from KM mode nomenclature to 0 = torque, 1 = velocity, 2 = position
+        self.mode_dict = {7:2,3:1,9:1,4:0,0:-1} #Converts from KM mode nomenclature to 0 = torque, 1 = velocity, 2 = position
         # The same mapping the other way, for what update_modes writes into
         # 0x6060. Kept as data rather than inline literals because ELMO shares
         # update_modes and drives the cyclic synchronous modes (8/9/10) instead.
-        self._mode_to_op = {'position':7,'velocity':3,'torque':4}
+        #
+        # drive_params.velocity_op_mode picks which DS402 mode 'velocity' means.
+        # 'profile' (3, the default and what every rig ran until 2026-10-21)
+        # IGNORES the torque offset 0x60B2: the CiA 402 profile defines it as a
+        # feedforward input only in the cyclic synchronous modes, and the
+        # 2026-10-21 Skip ff check showed LOAD current identical at
+        # feedforward_ratio 0 and 0.8. 'csv' (9, cyclic synchronous velocity)
+        # is the mode that honours it.
+        #
+        # The other difference: in profile velocity the drive ramps to each new
+        # target with its own profile accel/decel; in CSV it tracks the command
+        # every cycle with no ramp of its own. Trace plans are already checked
+        # against motor_limits.acceleration in software (TestTrace), and a stop
+        # de-enables the drive through a mode switch, so neither path relied on
+        # the drive's ramp -- but anything that steps a velocity command (a jog,
+        # a hand-written plan) is a real step in CSV.
+        vel_mode = self.params.get('drive_params', {}).get('velocity_op_mode', 'profile')
+        if vel_mode not in AKD_VELOCITY_OP_MODES:
+            raise ValueError(f"{self.name}: drive_params.velocity_op_mode must be one of "
+                             f"{sorted(AKD_VELOCITY_OP_MODES)}, got {vel_mode!r}")
+        self.velocity_op_mode = vel_mode
+        self._mode_to_op = {'position':7,'velocity':AKD_VELOCITY_OP_MODES[vel_mode],'torque':4}
+        # Cycles spent in the current mode switch, so a drive that never
+        # confirms the requested mode (firmware without CSV, say) is reported
+        # instead of silently stalling the test. See update_modes.
+        self._switch_cycles = 0
+        self._switch_warned = False
 
     def _rx_set(self, field, value):
         '''Write an RxPDO field the active profile maps. Returns whether it did.
@@ -957,6 +1029,18 @@ class AKD:
                         self.position_cmd_origin = self.position
                     self.mode = self.target_mode
 
+            self._switch_cycles += 1
+            if (self._switch_cycles > AKD_SWITCH_WARN_CYCLES and not self._switch_warned
+                    and self.target_mode in self._mode_to_op):
+                self._switch_warned = True
+                print(f"WARNING: {self.name} has not confirmed {self.target_mode} mode "
+                      f"(0x6060 = {self._mode_to_op[self.target_mode]}) after "
+                      f"{self._switch_cycles} cycles; it reports op mode "
+                      f"{getattr(self._tx_pdo, 'op_mode', '?')} in state {self.state}."
+                      + (" velocity_op_mode is 'csv': this drive's firmware may not "
+                         "support cyclic synchronous velocity."
+                         if getattr(self, 'velocity_op_mode', None) == 'csv' else ''))
+
             # Once drive confirms mode change, return to normal operation        
             if self.servo_drive_mode == 2 and self.target_mode == 'position':
                 self.switching_modes = False      
@@ -1051,6 +1135,8 @@ class AKD:
             self._rx_set('position_command',
                          getattr(self._tx_pdo, 'actual_position', 0))
         self.target_mode = mode
+        self._switch_cycles = 0
+        self._switch_warned = False
         self.switching_modes = True # by setting this flag to true, the above switching logic will commence
 
         self.torque_command = math.nan
@@ -1166,7 +1252,9 @@ class AKD:
         if self.flip_direction_sign:
             self.velocity = -self.velocity
         self.current = raw_current / 1000 # units = A_rms
-        self.servo_drive_mode = self.mode_dict[raw_op_mode]
+        # .get: a mode this table does not know (one the drive was never
+        # asked for) reads as -1 rather than killing the 1 kHz loop.
+        self.servo_drive_mode = self.mode_dict.get(raw_op_mode, -1)
         # Raw DS402 status word, exposed so it can go in log_keys. Without it a
         # log records the *consequences* of a bad drive state (NaN commands,
         # frozen position) but never the state itself, which is the one number
@@ -1565,7 +1653,10 @@ class ELMO:
         self._rx_pdo.control_mode = 10
         self.mode = 'torque'
         self.switching_modes = False
+        # Both re-based by the shared AKD.update_modes on entry to position
+        # mode; see position_command_frame.
         self.pos_cmd_offset = 0
+        self.position_cmd_origin = 0.0
 
         self.position_offset = 0
         self.flip_torque_sign = self.params['flip_torque_sign']
@@ -1586,6 +1677,9 @@ class ELMO:
         # 2 = position. csp/csv/cst, against the AKD's ip/pv/tq.
         self.mode_dict = {8: 2, 9: 1, 10: 0, 0: -1}
         self._mode_to_op = {'position': 8, 'velocity': 9, 'torque': 10}
+        # update_modes is AKD's (shared below) and counts cycles in a mode switch.
+        self._switch_cycles = 0
+        self._switch_warned = False
 
     # --- shared with AKD, verbatim ---------------------------------------
     _rx_set = AKD._rx_set
@@ -1608,6 +1702,8 @@ class ELMO:
             self._rx_set('target_position',
                          getattr(self._tx_pdo, 'actual_position', 0))
         self.target_mode = mode
+        self._switch_cycles = 0
+        self._switch_warned = False
         self.switching_modes = True
 
         self.torque_command = math.nan
@@ -1718,14 +1814,22 @@ class ELMO:
     def position_command_frame(self):
         '''Where the shaft is NOW, as a position command that would hold it there.
 
-        Same contract as AKD.position_command_frame, different arithmetic: this
-        drive never re-bases pos_cmd_offset on a mode switch (it is set to 0 in
-        __init__ and left there), so a command of 0 parks the shaft at raw zero,
-        where `position` reads position_offset. The gap between the feedback and
-        command frames is therefore position_offset alone.
+        Same contract and the same arithmetic as AKD.position_command_frame,
+        because it is the same mode-switch code: ELMO borrows AKD.update_modes,
+        which re-bases pos_cmd_offset to the raw position (and records
+        position_cmd_origin) every time the drive enters position mode. So a
+        command of 0 parks the shaft where it was at entry, and the command
+        frame is `position` minus that entry position.
+
+        This used to say the Elmo never re-bases and returned position minus
+        position_offset. That was a step of the whole entry position for any
+        hold built from it -- 108 rad at the motor in the first sim run with
+        the fake Elmo (dyno/sim/elmo_behavior_test.py, 2026-10-21), the same
+        slam the AKD had on Archimedes. No rig had run the Elmo in position
+        mode yet.
         '''
         try:
-            return float(self.position) - float(self.position_offset)
+            return float(self.position) - float(self.position_cmd_origin)
         except (TypeError, ValueError):
             return math.nan
 

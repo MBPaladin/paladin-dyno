@@ -1,11 +1,13 @@
 # In-house dyno (new build) - BRINGUP CONFIG
 #
-# Bus as scanned by ./dyno/bus_scan.sh: 5 slaves.
+# Bus as scanned by ./dyno/utilities/bus_scan.sh: 6 slaves.
 #   0 EK1100   coupler
 #   1 EL3208   RTD  (8 ch)
 #   2 ELM3004  ADC  (4 ch)
-#   3 AKD      DUT
+#   3 AKD      SMALL_INHOUSE_MOTOR (was DUT; renamed so tests do not pick it as
+#              the input motor)
 #   4 AKD      LOAD
+#   5 ELMO     DUT  (actuator input side, 26:1 reduction to the output)
 #
 # Relative to actuator_production this rig has NO EL2502 (pwm), NO EL5042
 # (encoder), NO EL2004/EL2004_12v power modules, and one ELM3004 instead of
@@ -19,7 +21,40 @@
 # motor's torque is not reacted into the DUT, so LOAD may be commanded to its
 # full 200 Nm. Clearing this flag re-arms that check and caps output torque at
 # DUT.torque x DUT.gear_ratio = 25 Nm until the DUT derate below is raised.
-load_only: true
+load_only: false
+
+# Cross-coupling torque feedforward onto LOAD (dyno_controller.step), sent as
+# a current offset (AKD 0x60B2). See config_utils.compile_feedforward and
+# Controller._load_feedforward.
+#   fixed:    ratio x DUT torque command x DUT gear_ratio.
+#   quadrant: forward_ratio when the DUT drives the load, backdrive_ratio when
+#             the load drives the DUT (blended across speed reversals over
+#             v_blend_rad_s), plus drag_nm along the LOAD velocity command.
+#             Signs come from the drive flags, so the numbers are magnitudes.
+# What LOAD is sent is logged as load_torque_ff; the effective settings are
+# recorded in every log's resolved_config.
+#
+# History, 2026-10-21 (logs/skip/troubleshooting/feedforward_test):
+#   - the old feedforward_ratio code default (0.8) applied silently to every
+#     earlier run, but never reached the drive;
+#   - it needed LOAD in cyclic synchronous velocity (velocity_op_mode: csv,
+#     below) AND the drive's IL.KBUSFF set to 1 (default 0, saved in the drive);
+#   - the fixed sign is only right with DUT flip_torque_sign: True (below).
+#
+# Quadrant numbers: refit on the warm Skip runs (ff_postwarmup_03/_04, LOAD
+# VL.KP 4 / VL.KI 3): forward 1.02, backdrive 2.73, drag 1.38 Nm, 0.24 Nm rms
+# over 20 plateaus. They agree with the 2026-10-19 cogging fit (1.02 / 2.68 /
+# 1.26). They are per DUT torque COMMAND at DUT kt 0.02: change that kt and
+# they change. Check with skip_ff_check_12A + check_ff.py, which reads the
+# settings from the log.
+feedforward:
+  mode: fixed            # quadrant for the pilot; fixed reproduces the 0.8 runs
+  ratio: 0.8
+  forward_ratio: 1.02
+  backdrive_ratio: 2.73
+  drag_nm: 1.38
+  v_blend_rad_s: 0.005
+  max_nm: 30             # the client's output torque cap; also the cell safety
 
 # --- 0. PORTS ---
 # The rig's mechanical ports. `role` is what commands / the UI / analysis
@@ -49,6 +84,18 @@ sensors:
     fs_pos: 500
     offset: 0
     supply: NA
+    # The cell's signal chain splits its reading at 0 V on the wire: readings
+    # above sit ~2 mV high, readings below ~2 mV low, and almost nothing lands
+    # in between (a 0.4 Nm hole at 10 mV/Nm). Seen in every log since
+    # 2026-08-27; the 2026-10-21 checkout (logs/skip/troubleshooting/
+    # cell_torque_isolation) showed it follows the cell, amplifier or cable, not
+    # the ELM3004 channel or its range: gap 3.9 / 3.6 / 3.0 mV on ch1 +/-5 V,
+    # ch1 +/-10 V, ch2. Corrected in software before offset and tare, so the
+    # GUI, the tare, the safeties and the log all see the corrected torque;
+    # the uncorrected reading is logged as load_torque_raw. Delete both lines if
+    # the amplifier is re-zeroed or fixed. See devices.ScaledChannels._scale.
+    split_mv: 4.0
+    split_center_mv: 0.0
 
   # Input torque cell
   input_torque:
@@ -134,7 +181,7 @@ expected_slave_layout:
   - { model: EL3208, name: rtd_module }
   - { model: ELM3004, name: adc_1 }
   - model: AKD
-    name: DUT
+    name: SMALL_INHOUSE_MOTOR
     params:
       absorber_library: false
       flip_torque_sign: True
@@ -166,7 +213,55 @@ expected_slave_layout:
         acceleration: 20 #Rad/s^2
         rotatum: 1000 #Nm/s, 4 x peak torque value
       drive_params:
-        i_cont: 15           
+        i_cont: 15
+        # Cyclic synchronous velocity (9) instead of profile velocity (3), so
+        # the torque feedforward reaches the current loop. No drive-side ramp
+        # in this mode: the drive tracks each 1 ms command. See devices.AKD.
+        velocity_op_mode: csv
+
+  # Actuator input drive. Position and velocity are in INPUT-shaft rad, rad/s:
+  # the encoder is on the motor side and the actuator's 26:1 reduction sits
+  # between it and the output. Hand-turn test 2026-10-15: one input rev read
+  # ~8,090 counts and one output rev ~212,778, i.e. 2^13 = 8192 counts/rev x 26
+  # to within hand error (1.2% / 0.1%). 0x6064 accumulated across 26 input revs
+  # with no 8192-count steps, so the drive does not wrap per rev (bits 32).
+  #
+  # READ-ONLY FOR NOW. The 'telemetry' profile maps no position/velocity/torque
+  # targets, and load_only is true so DUT is never enabled. The values marked
+  # PLACEHOLDER only have to exist for the ELMO class to construct; none has
+  # been commissioned. Before commanding this drive: set kt to the real motor,
+  # i_rated against the torque cell (the drive's 0x6075/0x6076 both read 14.14,
+  # i.e. an uncommissioned 1 Nm/A), and settle flip_direction_sign (the count
+  # fell for a hand turn the operator called positive).
+  - model: ELMO
+    name: DUT
+    params:
+      absorber_library: false   # drive reports 'Drum'; keep absorbers.yaml out
+      # True from 2026-10-21. With False, a positive torque command pushed the
+      # shaft toward negative load_position and the load cell read negative
+      # (2026-10-19 Skip cogging log). True aligns both with the command.
+      # The cost: dut_current is logged in the drive's own frame, so it now
+      # reads NEGATIVE for a positive command (about -50 A per Nm at kt 0.02).
+      # In logs from before this date, forward (DUT drives) is tc*v < 0; from
+      # here on it is tc*v > 0.
+      flip_torque_sign: True
+      flip_direction_sign: True
+      gear_ratio: 26
+      motor_params:
+        kt: 0.02                 # PLACEHOLDER, drive's internal Nm/A
+        k_tanh: 0.0001
+      motor_limits:
+        torque: 1               # derated; nothing should command this yet
+        continuous_torque: .5
+        velocity: 1200
+        acceleration: 1000 #Rad/s^2
+        rotatum: 200 #Nm/s
+      drive_params:
+        i_cont: 30.0           
+        i_rated: 30.0          
+        counts_per_rev: 8192
+        position_counter_bits: 32
+        pdo_profile: compact
 
 # Measured values over these limits stop the test.
 #
@@ -180,9 +275,9 @@ expected_slave_layout:
 # never > limit - so a failed/disconnected RTD reads NaN and silently disables
 # this check rather than tripping it.
 safeties:
-  output_torque: { source: devices.adc_1.load_torque, limit: 500 } # Nm
+  output_torque: { source: devices.adc_1.load_torque, limit: 30 } # Nm
   output_velocity: { source: devices.LOAD.velocity, limit: 200 } # rad/s, derated for bringup
-  input_velocity: { source: devices.DUT.velocity, limit: 300 } # rad/s, catches a back-driven DUT
+  input_velocity: { source: devices.DUT.velocity, limit: 1200 } # rad/s, catches a back-driven DUT
   load_stator_temp: { source: devices.rtd_module.load_stator_temp, limit: 100 } # C
 
 # Torque cell tare: the GUI's Tare button averages each listed cell at rest and
@@ -228,6 +323,12 @@ log_keys:
   # ready/switched on/enabled. 0 in bits 0-3 and 6 is the 'undefined' state.
   - [load_statusword, devices.LOAD.statusword]
   - [dut_statusword, devices.DUT.statusword]
+  # The AKD that used to be DUT. Logged so its data is not lost to the rename.
+  - [small_motor_mode, devices.SMALL_INHOUSE_MOTOR.servo_drive_mode]
+  - [small_motor_position, devices.SMALL_INHOUSE_MOTOR.position]
+  - [small_motor_velocity, devices.SMALL_INHOUSE_MOTOR.velocity]
+  - [small_motor_current, devices.SMALL_INHOUSE_MOTOR.current]
+  - [small_motor_statusword, devices.SMALL_INHOUSE_MOTOR.statusword]
   - [cycle_time_us, cycle_dt_us] # measured PDO loop interval
   - [wkc_error, wkc_error] # expected - actual working counter; 0 = healthy
   # Multisine preamble sample index (NaN outside a preamble). Analysis splits
@@ -236,3 +337,9 @@ log_keys:
   # ramp_break breakaway marker: the commanded torque the online detector
   # fired at, on that one sample only (NaN on every other sample).
   - [breakaway_torque, breakaway_torque]
+  # Load cell before its split correction (sensors.load_torque.split_mv):
+  # untared and uncorrected, i.e. what the wire said.
+  - [load_torque_raw, devices.adc_1.load_torque_raw]
+  # LOAD torque feedforward actually sent, Nm in LOAD's command frame
+  # (feedforward: above). 0 whenever the feedforward branch is not active.
+  - [load_torque_ff, load_torque_ff]

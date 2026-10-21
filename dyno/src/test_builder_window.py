@@ -404,6 +404,8 @@ class TestBuilderWindow(QWidget):
         # Primary drive: the motor running the pattern, and the pattern itself.
         self.primary_box = QGroupBox('Primary drive')
         self.pattern_layout = QFormLayout(self.primary_box)
+        # Long labels (throw) wrap above their field rather than pushing it off-screen.
+        self.pattern_layout.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
         self.primary_motor = QComboBox()
         self.primary_motor.addItems(test_builder.MOTORS)
         self.pattern_layout.addRow('Motor', self.primary_motor)

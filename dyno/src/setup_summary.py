@@ -40,11 +40,14 @@ PARAM_INFO = {
     'motor_limits.rotatum':      ('Nm/s',        'Limit on how fast torque may change'),
     'drive_params.i_cont':       ('A_rms',       'Drive continuous current rating (must match drive setting)'),
     'drive_params.current_units': ('peak|rms',  'Whether this drive reports current as peak or rms (labelling only - nothing converts)'),
+    'drive_params.velocity_op_mode': ('profile|csv', 'AKD velocity mode: profile (3, ignores torque feedforward) or cyclic synchronous (9)'),
     # --- sensor channel params ---
     'port':                      ('',            'Front panel connector the sensor plugs into'),
     'supply':                    ('',            'Excitation supply switched on for this sensor'),
     'fs_v':                      ('V',           'Analog input range (full scale voltage)'),
     'fs_pos':                    ('sensor units', 'Reading at full scale voltage (e.g. Nm for a torque cell)'),
+    'split_mv':                  ('mV',          'Signal-chain split corrected at acquisition (gap width on the wire)'),
+    'split_center_mv':           ('mV',          'Where on the wire that split sits'),
     'offset':                    ('sensor units', 'Constant added to every reading (zero offset)'),
     'sensor_type':               ('',            'RTD element type'),
 }

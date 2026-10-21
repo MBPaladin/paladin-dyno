@@ -200,11 +200,10 @@ PATTERNS = {
         'amplitude':    ('Amplitude', 10.0, float),
         'rate':         ('Ramp rate [units/s]', 1.0, float),
         'peak_dwell_s': ('Dwell at peak [s]', 1.0, float),
-        'bipolar':      ('Bipolar (sweep to -amplitude too)', True, bool),
+        'bipolar':      ('Bipolar', True, bool),
         # Cycle peak to peak (+A <-> -A) instead of through zero
         # (0 -> +A -> -A -> 0). Ignored when not bipolar. See _pattern_keys.
-        'start_at_peak': ('Cycle peak-to-peak (ramp to +amplitude first)',
-                          False, bool),
+        'start_at_peak': ('Cycle peak-to-peak', False, bool),
         'cycles':       ('Cycles', 1, int),
         # Hold at 0 after each cycle finishes, separating one sawtooth from
         # the next (and the last one from the secondary's next level).
@@ -310,6 +309,11 @@ PATTERNS = {
         'levels':               ('Pattern-motor levels (comma separated)',
                                  [15.0, 30.0, 60.0, 100.0], list),
         'duration_per_point_s': ('Hold per gridpoint [s]', 3.0, float),
+        # Extend the hold at slow speeds so every point covers at least this many
+        # OUTPUT-shaft revolutions (the reduced side, whichever motor holds the
+        # velocity). 0 keeps a constant hold. See gridpoint_hold_s.
+        'min_output_revs':      ('Min output revolutions per point (0 = off)', 0.0, float),
+        'max_hold_s':           ('Longest hold min revolutions may stretch to [s]', 600.0, float),
         'settle_time_s':        ('Settle before logging [s]', 0.5, float),
         'transition_rate':      ('Transition rate (fraction of limit)', 0.25, float),
         'velocity_inner':       ('Velocity is inner loop (default: torque)', False, bool),
@@ -645,10 +649,47 @@ def gridpoint_settings(segment):
             'command_list': [float(v) for v in secondary.get('levels', [0.0])]},
         'loop_order': loop_order,
         'duration_per_point_s': float(p('duration_per_point_s')),
+        'min_output_revs': float(p('min_output_revs')),
+        'max_hold_s': float(p('max_hold_s')),
         'settle_time_s': float(p('settle_time_s')),
         'transition_rate': float(p('transition_rate')),
         'continuous_torque': float(p('continuous_torque')),
     }
+
+
+def gridpoint_hold_s(settings, velocity, velocity_motor, gear_ratio=None):
+    """Logged hold at one gridpoint: duration_per_point_s, stretched so the
+    output shaft turns at least min_output_revs revolutions, capped at
+    max_hold_s (never below duration_per_point_s).
+
+    `velocity` is the point's velocity command on `velocity_motor` ('input' or
+    'output'). An input-side velocity is reduced to the output through
+    |gear_ratio|; without one the hold is not stretched, since the output speed
+    is unknown. A zero-speed point keeps the plain duration. Shared by
+    GridSearch and the builder preview so the two cannot disagree.
+    """
+    base = float(settings['duration_per_point_s'])
+    revs = float(settings.get('min_output_revs', 0.0) or 0.0)
+    if revs <= 0:
+        return base
+    w_out = abs(float(velocity))
+    if velocity_motor == 'input':
+        if not gear_ratio:
+            return base
+        w_out /= abs(float(gear_ratio))
+    if w_out <= 0:
+        return base
+    need = revs * 2 * math.pi / w_out
+    cap = max(base, float(settings.get('max_hold_s', 600.0)))
+    return min(max(base, need), cap)
+
+
+def gridpoint_velocity_motor(settings):
+    """Which motor ('input'/'output') holds the velocity axis of a grid_search."""
+    for motor in MOTORS:
+        if settings[motor + '_motor']['control_mode'] == 'velocity':
+            return motor
+    return None
 
 
 def gridpoint_preview_rows(segment, limits=None):
@@ -698,11 +739,13 @@ def gridpoint_preview_rows(segment, limits=None):
             t += duration
             emit()
 
+    vel_motor = gridpoint_velocity_motor(settings)
+    gear = limits['input'].get('gear_ratio') if limits else None
     for outer in axes[outer_mode]:
         for inner in axes[inner_mode]:
             goto({outer_mode: float(outer), inner_mode: float(inner)})
             hold(settings['settle_time_s'])
-            hold(settings['duration_per_point_s'])
+            hold(gridpoint_hold_s(settings, state['velocity'], vel_motor, gear))
     goto({'velocity': 0.0, 'torque': 0.0})
     hold(0.1)  # matches GridSearch's trailing hold at zero
 
@@ -1306,6 +1349,30 @@ def _validate_gridpoint(segment, limits=None):
                     issues.append(f'output_motor_torque: {reaction}')
     if settings['duration_per_point_s'] <= 0:
         issues.append('Hold per gridpoint must be > 0')
+    if settings['min_output_revs'] < 0:
+        issues.append('Min output revolutions must be >= 0')
+    if settings['min_output_revs'] > 0:
+        if settings['max_hold_s'] < settings['duration_per_point_s']:
+            issues.append('Longest hold must be >= the hold per gridpoint')
+        vel_motor = gridpoint_velocity_motor(settings)
+        speeds = [abs(v) for v in settings[vel_motor + '_motor']['command_list'] if v]
+        gear = limits['input'].get('gear_ratio') if limits else None
+        if vel_motor == 'input' and not gear:
+            issues.append('Min output revolutions needs the rig gear ratio to convert '
+                          'the input speed; load a rig config')
+        elif speeds:
+            capped = [v for v in speeds
+                      if gridpoint_hold_s(dict(settings, max_hold_s=float('inf')), v,
+                                          vel_motor, gear) > settings['max_hold_s']]
+            if capped:
+                slow = min(capped)
+                need = gridpoint_hold_s(dict(settings, max_hold_s=float('inf')), slow,
+                                        vel_motor, gear)
+                issues.append(f"{len(capped)} speed(s) need more than the longest hold "
+                              f"({settings['max_hold_s']:g} s) to turn "
+                              f"{settings['min_output_revs']:g} output revs (slowest, "
+                              f'{slow:g}, needs {need:.0f} s): raise the longest hold or '
+                              f'lower min output revolutions')
     if settings['settle_time_s'] < 0:
         issues.append('Settle time must be >= 0')
     if not 0 < settings['transition_rate'] <= 1:

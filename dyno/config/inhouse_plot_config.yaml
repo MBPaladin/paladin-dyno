@@ -42,7 +42,7 @@ Output Velocity:
     - dut_velocity_command
     - load_velocity_command
   legends:
-    - DUT Velocity
+    - DUT Velocity (Elmo, input shaft)
     - Load Velocity
     - DUT Velocity Command
     - LOAD Velocity Command
@@ -63,7 +63,7 @@ Output Position:
     - dut_position_command
     - load_position_command
   legends:
-    - DUT Position
+    - DUT Position (Elmo, input shaft)
     - Load Position
     - DUT Position Command
     - LOAD Position Command
@@ -83,12 +83,15 @@ Current Clamp:
   data_keys:
     - dut_current
     - load_current
+    - small_motor_current
   legends:
     - DUT Drive Current
     - Load Drive Current
+    - Small Motor Drive Current
   pens:
     - r
     - g
+    - m
 Temperature:
   title: Temperature
   unit: C

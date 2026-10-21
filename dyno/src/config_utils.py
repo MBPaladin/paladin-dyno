@@ -107,3 +107,59 @@ def augment_log_keys(dyno_params, verbose=False):
                 print(f"\tAuto-logged sensor: {sensor_name} -> {log_path}")
 
     return [entry[0] for entry in log_keys]
+
+
+FEEDFORWARD_MODES = ('off', 'fixed', 'quadrant')
+
+
+def compile_feedforward(dyno_params):
+    """The rig's cross-coupling torque feedforward settings, validated.
+
+    Config is either the legacy scalar `feedforward_ratio: r` (mode fixed) or a
+    `feedforward:` block -- never both, so there is one place to look:
+
+        feedforward:
+          mode: quadrant        # off | fixed | quadrant
+          ratio: 0.8            # fixed mode; also the DUT-side term in any mode
+          forward_ratio: 1.02   # quadrant: DUT drives the load
+          backdrive_ratio: 2.73 # quadrant: the load drives the DUT
+          drag_nm: 1.38         # quadrant: LOAD torque along the motion, any torque
+          v_blend_rad_s: 0.005  # quadrant: tanh width across a speed reversal
+          max_nm: 30            # optional clip on the LOAD feedforward; default
+                                # is LOAD's motor_limits.torque
+
+    Neither key means mode fixed at 0.8, the historical code default. See
+    Controller._load_feedforward for what each term does and how its sign is
+    derived. Pure function of the config, so Master can record the result in
+    resolved_config.json before the controller exists.
+    """
+    spec = dyno_params.get('feedforward')
+    legacy = dyno_params.get('feedforward_ratio')
+    if spec is None:
+        return {'mode': 'fixed', 'ratio': float(0.8 if legacy is None else legacy),
+                'source': 'feedforward_ratio' if legacy is not None else 'code default'}
+    if legacy is not None:
+        raise ValueError('dyno config sets both feedforward: and feedforward_ratio; '
+                         'keep one (feedforward.ratio replaces feedforward_ratio)')
+    if not isinstance(spec, dict):
+        raise ValueError('feedforward: must be a mapping, see config_utils.compile_feedforward')
+    mode = spec.get('mode', 'fixed')
+    if mode not in FEEDFORWARD_MODES:
+        raise ValueError(f'feedforward.mode must be one of {FEEDFORWARD_MODES}, got {mode!r}')
+    out = {'mode': mode, 'ratio': float(spec.get('ratio', 0.8)), 'source': 'feedforward'}
+    if mode == 'quadrant':
+        missing = [k for k in ('forward_ratio', 'backdrive_ratio') if k not in spec]
+        if missing:
+            raise ValueError(f'feedforward.mode quadrant needs {missing}')
+        out.update({'forward_ratio': float(spec['forward_ratio']),
+                    'backdrive_ratio': float(spec['backdrive_ratio']),
+                    'drag_nm': float(spec.get('drag_nm', 0.0)),
+                    'v_blend_rad_s': float(spec.get('v_blend_rad_s', 0.005))})
+        if out['v_blend_rad_s'] <= 0:
+            raise ValueError('feedforward.v_blend_rad_s must be > 0')
+        if out['forward_ratio'] < 0 or out['backdrive_ratio'] < 0 or out['drag_nm'] < 0:
+            raise ValueError('feedforward ratios and drag_nm are magnitudes: give them >= 0; '
+                             'the sign is derived from the drive flags')
+    if spec.get('max_nm') is not None:
+        out['max_nm'] = abs(float(spec['max_nm']))
+    return out

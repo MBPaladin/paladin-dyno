@@ -224,11 +224,10 @@ class AKDBehavior(Behavior):
 
     def __init__(self, layout_entry):
         super().__init__(layout_entry)
-        from dyno.src.devices import akd_pdo_profile, akd_pdo_structs
-        # Resolve the profile the same way devices.AKD does, so a sim run
+        # Resolve the profile the same way the device class does, so a sim run
         # exercises the same wire layout as the rig it is standing in for.
-        self._pdo_profile = akd_pdo_profile(layout_entry.get('params') or {})
-        self._RxPDO, self._TxPDO = akd_pdo_structs(self._pdo_profile)
+        self._pdo_profile, (self._RxPDO, self._TxPDO) = self._resolve_pdo(
+            layout_entry.get('params') or {})
         self.input_size = ctypes.sizeof(self._TxPDO)
         self.output_size = ctypes.sizeof(self._RxPDO)
 
@@ -279,6 +278,12 @@ class AKDBehavior(Behavior):
         # Test-only scheduled fault; see _fault_injection and step().
         self._fault_injection = _fault_injection(layout_entry['name'])
         self._elapsed_s = 0.0
+
+    @staticmethod
+    def _resolve_pdo(params):
+        from dyno.src.devices import akd_pdo_profile, akd_pdo_structs
+        profile = akd_pdo_profile(params)
+        return profile, akd_pdo_structs(profile)
 
     # -- SDO ---------------------------------------------------------------
     def sdo_read(self, index, subindex, size=None, ca=False):
@@ -336,6 +341,58 @@ class AKDBehavior(Behavior):
         x = max(-0.999, min(0.999, tau * self.k_tanh / self.kt))
         return math.atanh(x) / self.k_tanh
 
+    # Op-mode numbers this model treats as velocity / position, for resetting
+    # the loop state on leaving them.
+    VELOCITY_MODES = (3, 9)
+    POSITION_MODES = (7,)
+
+    def _drive_torque(self, rx, omega_m, theta_m, j_motor):
+        """Motor-frame torque this cycle from the received commands."""
+        tau = 0.0
+        if self.op_mode == 4:  # torque (current) mode
+            # getattr throughout: a reduced PDO profile does not map every
+            # command object, and the fake drive has to behave like a real
+            # one that simply never receives it.
+            i_cmd = (getattr(rx, 'current_command', 0) / 1000.0
+                     + getattr(rx, 'torque_ff', 0) * self.i_cont / 1000.0)
+            if self.flip and not self.hw_torque_sign:
+                i_cmd = -i_cmd  # undo the device-side sign flip
+            tau = self._current_to_torque(i_cmd)
+        elif self.op_mode in (3, 9):  # velocity mode: stiff first-order servo
+            v_cmd = getattr(rx, 'velocity_command', 0) / 1000.0 * 2 * math.pi / 60.0
+            # gain limited by explicit-Euler stability at the 1 ms cycle
+            kv = min(self.tau_limit / 0.5, j_motor * 200.0)
+            err = v_cmd - omega_m
+            self._v_integral = max(-self.tau_limit, min(
+                self.tau_limit, self._v_integral + 20.0 * kv * err * CYCLE_S))
+            tau = kv * err + self._v_integral
+            if self.op_mode == 9:
+                # Cyclic synchronous velocity adds the torque offset 0x60B2
+                # as a feedforward; profile velocity (3) ignores it, which
+                # is what the real AKD was measured doing on 2026-10-21.
+                i_ff = getattr(rx, 'torque_ff', 0) * self.i_cont / 1000.0
+                if self.flip and not self.hw_torque_sign:
+                    i_ff = -i_ff  # undo the device-side sign flip
+                tau += self._current_to_torque(i_ff)
+        elif self.op_mode == 7:  # position mode: critically damped PD
+            raw = getattr(rx, 'position_command', 0)
+            if self._pos_cmd_prev_raw is None:
+                # Seed the multi-turn command at the unwrapped value
+                # nearest the current motor position (devices.AKD snaps
+                # its command to actual_position on mode entry).
+                theta_counts = theta_m / (2 * math.pi) * 2**32
+                self._pos_cmd_counts = theta_counts + wrap_i32(
+                    raw - wrap_i32(theta_counts))
+            else:
+                self._pos_cmd_counts += wrap_i32(raw - self._pos_cmd_prev_raw)
+            self._pos_cmd_prev_raw = raw
+            theta_cmd = self._pos_cmd_counts * 2 * math.pi / 2**32
+            wn = 50.0
+            kp = j_motor * wn * wn
+            kd = 2.0 * j_motor * wn
+            tau = kp * (theta_cmd - theta_m) - kd * omega_m
+        return tau
+
     def pre_step(self, output_buf):
         rx = self._RxPDO()
         if output_buf and len(output_buf) == self.output_size:
@@ -356,45 +413,12 @@ class AKDBehavior(Behavior):
         if self.plant is not None and self.state == 'operation_enabled':
             omega_m, theta_m = self._motor_state()
             j_motor = self.plant.J / max(self.gear_ratio ** 2, 1e-9)
-            if self.op_mode == 4:  # torque (current) mode
-                # getattr throughout: a reduced PDO profile does not map every
-                # command object, and the fake drive has to behave like a real
-                # one that simply never receives it.
-                i_cmd = (getattr(rx, 'current_command', 0) / 1000.0
-                         + getattr(rx, 'torque_ff', 0) * self.i_cont / 1000.0)
-                if self.flip and not self.hw_torque_sign:
-                    i_cmd = -i_cmd  # undo the device-side sign flip
-                tau = self._current_to_torque(i_cmd)
-            elif self.op_mode == 3:  # velocity mode: stiff first-order servo
-                v_cmd = getattr(rx, 'velocity_command', 0) / 1000.0 * 2 * math.pi / 60.0
-                # gain limited by explicit-Euler stability at the 1 ms cycle
-                kv = min(self.tau_limit / 0.5, j_motor * 200.0)
-                err = v_cmd - omega_m
-                self._v_integral = max(-self.tau_limit, min(
-                    self.tau_limit, self._v_integral + 20.0 * kv * err * CYCLE_S))
-                tau = kv * err + self._v_integral
-            elif self.op_mode == 7:  # position mode: critically damped PD
-                raw = getattr(rx, 'position_command', 0)
-                if self._pos_cmd_prev_raw is None:
-                    # Seed the multi-turn command at the unwrapped value
-                    # nearest the current motor position (devices.AKD snaps
-                    # its command to actual_position on mode entry).
-                    theta_counts = theta_m / (2 * math.pi) * 2**32
-                    self._pos_cmd_counts = theta_counts + wrap_i32(
-                        raw - wrap_i32(theta_counts))
-                else:
-                    self._pos_cmd_counts += wrap_i32(raw - self._pos_cmd_prev_raw)
-                self._pos_cmd_prev_raw = raw
-                theta_cmd = self._pos_cmd_counts * 2 * math.pi / 2**32
-                wn = 50.0
-                kp = j_motor * wn * wn
-                kd = 2.0 * j_motor * wn
-                tau = kp * (theta_cmd - theta_m) - kd * omega_m
+            tau = self._drive_torque(rx, omega_m, theta_m, j_motor)
             tau = max(-self.tau_limit, min(self.tau_limit, tau))
 
-        if self.op_mode != 3 or self.state != 'operation_enabled':
+        if self.op_mode not in self.VELOCITY_MODES or self.state != 'operation_enabled':
             self._v_integral = 0.0
-        if self.op_mode != 7 or self.state != 'operation_enabled':
+        if self.op_mode not in self.POSITION_MODES or self.state != 'operation_enabled':
             self._pos_cmd_prev_raw = None  # re-seed on next position-mode entry
 
         self.tau_motor = tau
@@ -437,13 +461,105 @@ class AKDBehavior(Behavior):
             current = -current
 
         emit('op_mode', self.op_mode)
+        self._emit_feedback(emit, omega_m, theta_m, current)
+        return bytes(tx)
+
+    def _emit_feedback(self, emit, omega_m, theta_m, current):
+        """Pack position / velocity / current in this drive's wire units."""
         emit('actual_position', wrap_i32(theta_m / (2 * math.pi) * 2**32 + 1000))
         emit('actual_velocity', int(omega_m * 60.0 / (2 * math.pi) * 1000.0
                                     + random.gauss(0, 3)))
         emit('actual_current', int(current * 1000.0 + random.gauss(0, 15)))
         emit('i2t_counter', 0)
-        return bytes(tx)
 
+
+
+class ElmoBehavior(AKDBehavior):
+    """Elmo servo drive (devices.ELMO): the AKD fake's DS402 state machine,
+    plant coupling, sign conventions and fault injection, with the Elmo's own
+    wire format and modes.
+
+    Everything that differs is exactly what devices.ELMO's docstring lists:
+      modes     cyclic synchronous position / velocity / torque, 8 / 9 / 10
+                (against the AKD's 7 / 3 or 9 / 4);
+      torque    0x6071 target_torque and 0x60B2 torque_offset in per-thousand of
+                drive_params.i_rated, not mA; the offset is honoured in all three
+                cyclic modes, as DS402 defines it;
+      position  0x607A / 0x6064 in feedback counts at drive_params.counts_per_rev,
+                absolute in the drive's raw frame (devices.ELMO keeps
+                pos_cmd_offset at 0), against the AKD's 2^32 counts/rev that wrap;
+      velocity  0x60FF / 0x606C in counts/s, against the AKD's mRPM;
+      identity  device name at 0x1008, reported as SIM-<name>, so the
+                absorbers.yaml lookup misses on purpose like the fake AKD's.
+    actual_torque (0x6077) is reported in the same per-thousand-of-i_rated units
+    as the current, which is all devices.ELMO does with it (it logs raw/1000).
+    """
+    VELOCITY_MODES = (9,)
+    POSITION_MODES = (8,)
+    # Raw 0x6064 reading at the sim shaft's zero. Nonzero so a consumer that
+    # treats raw counts as already zeroed shows up in a sim run.
+    RAW_POSITION_OFFSET = 1000
+
+    def __init__(self, layout_entry):
+        super().__init__(layout_entry)
+        dp = self.params.get('drive_params', {}) or {}
+        # Same two values devices.ELMO refuses to run without.
+        self.i_rated = float(dp.get('i_rated', self.i_cont))
+        self.counts_per_rev = float(dp.get('counts_per_rev', 2**20))
+
+    @staticmethod
+    def _resolve_pdo(params):
+        from dyno.src.devices import elmo_pdo_profile, elmo_pdo_structs
+        profile = elmo_pdo_profile(params)
+        return profile, elmo_pdo_structs(profile)
+
+    def sdo_read(self, index, subindex, size=None, ca=False):
+        if index == 0x1008:
+            return (self.drive_name + '\x00').encode()
+        if index == 0x2031 or index == 0x3598:   # AKD-only objects
+            return Behavior.sdo_read(self, index, subindex, size, ca)
+        return super().sdo_read(index, subindex, size, ca)
+
+    def _permille_to_amps(self, value):
+        return value * self.i_rated / 1000.0
+
+    def _counts_to_rad(self, counts):
+        return counts * 2 * math.pi / self.counts_per_rev
+
+    def _drive_torque(self, rx, omega_m, theta_m, j_motor):
+        i_ff = self._permille_to_amps(getattr(rx, 'torque_offset', 0))
+        if self.op_mode == 10:     # cyclic synchronous torque
+            i_cmd = self._permille_to_amps(getattr(rx, 'target_torque', 0)) + i_ff
+            if self.flip and not self.hw_torque_sign:
+                i_cmd = -i_cmd     # undo the device-side sign flip
+            return self._current_to_torque(i_cmd)
+        if self.flip and not self.hw_torque_sign:
+            i_ff = -i_ff
+        if self.op_mode == 9:      # cyclic synchronous velocity: same servo model as the AKD fake
+            v_cmd = self._counts_to_rad(getattr(rx, 'target_velocity', 0))
+            kv = min(self.tau_limit / 0.5, j_motor * 200.0)
+            err = v_cmd - omega_m
+            self._v_integral = max(-self.tau_limit, min(
+                self.tau_limit, self._v_integral + 20.0 * kv * err * CYCLE_S))
+            return kv * err + self._v_integral + self._current_to_torque(i_ff)
+        if self.op_mode == 8:      # cyclic synchronous position: critically damped PD
+            raw = getattr(rx, 'target_position', 0)
+            theta_cmd = self._counts_to_rad(raw - self.RAW_POSITION_OFFSET)
+            wn = 50.0
+            kp = j_motor * wn * wn
+            kd = 2.0 * j_motor * wn
+            return (kp * (theta_cmd - theta_m) - kd * omega_m
+                    + self._current_to_torque(i_ff))
+        return 0.0
+
+    def _emit_feedback(self, emit, omega_m, theta_m, current):
+        counts = theta_m / (2 * math.pi) * self.counts_per_rev + self.RAW_POSITION_OFFSET
+        emit('actual_position', wrap_i32(counts))
+        emit('actual_velocity', int(omega_m / (2 * math.pi) * self.counts_per_rev
+                                    + random.gauss(0, 3)))
+        permille = int(current / self.i_rated * 1000.0 + random.gauss(0, 2))
+        emit('actual_current', max(-32768, min(32767, permille)))
+        emit('actual_torque', max(-32768, min(32767, permille)))
 
 BEHAVIOR_FOR_MODEL = {
     'EK1100': lambda e, noise: CouplerBehavior(e),
@@ -457,6 +573,7 @@ BEHAVIOR_FOR_MODEL = {
     'EL3208': lambda e, noise: RTDBehavior(e),
     'EL5042': lambda e, noise: EnDatEncoderBehavior(e),
     'AKD': lambda e, noise: AKDBehavior(e),
+    'ELMO': lambda e, noise: ElmoBehavior(e),
 }
 
 

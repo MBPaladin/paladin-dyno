@@ -21,6 +21,11 @@ interface: enp86s0
 # desirable, contradicting master.py; master.py was the correct one.
 dc_send_phase_us: 625
 
+# Time process data cycles in SAFE-OP, with SYNC0 running, before OP is
+# requested. Without it an AKD intermittently dropped off the bus at OP and
+# stayed off for the run (see Master.run). Absent means 300.
+safeop_dwell_ms: 300
+
 # Default parent directory offered in the post-experiment "Save to" row. Blank
 # or absent means dyno/logs -- the directory the run already recorded into --
 # so a plain Save is a no-op rename and nothing about today's behaviour changes.

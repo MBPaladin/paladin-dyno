@@ -35,9 +35,10 @@ from dyno.src import test_builder, test_manager
 
 MODES = ('torque', 'velocity', 'position')
 
-# ~33 minutes at 1 kHz. Guards against an accidentally huge loop_count turning a
-# preview into a multi-GB allocation. Expansions that hit this are 'truncated'.
-MAX_CYCLES = 2_000_000
+# ~5.5 hours at 1 kHz (20,000 s). Guards against an accidentally huge loop_count
+# turning a preview into a runaway allocation: a cap-length expansion holds on
+# the order of a few GB while it builds. Expansions that hit this are 'truncated'.
+MAX_CYCLES = 20_000_000
 
 # Must match the constant hold in TestTrace.commands() (the `for i in range(250)`
 # tail). cross_check() catches drift if that changes.

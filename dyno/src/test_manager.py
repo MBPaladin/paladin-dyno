@@ -8,7 +8,8 @@ from deployment import dyno_paths
 # test_builder imports nothing from this package, so this stays acyclic. The
 # shared check lives there because the builder must run without numpy/pandas.
 from dyno.src.test_builder import (design_multisine, reaction_torque_issue,
-                                   throw_rig_from_config, throw_window_reach)
+                                   throw_rig_from_config, throw_window_reach,
+                                   gridpoint_hold_s, gridpoint_velocity_motor)
 
 # PROGRESS CONTRACT. Every behavior class carries two plain ints that the
 # controller reads (on its own thread, inside step()) and republishes for the
@@ -426,6 +427,9 @@ class GridSearch:
         assert self.settings['transition_rate'] > 0, 'Perscribed transition rate of '+str(self.settings['transition_rate'])+' must be greater than 0'
         assert self.settings['transition_rate'] <= 1, 'Perscribed transition rate of '+str(self.settings['transition_rate'])+' must not exceed 1.0'
         assert self.settings['duration_per_point_s'] > 0, 'Perscribed duration of '+str(self.settings['duration_per_point_s'])+' must be greater than 0.0'
+        # Optional, so hand-written and older builder yamls run unchanged.
+        assert float(self.settings.get('min_output_revs', 0.0) or 0.0) >= 0, 'min_output_revs must be >= 0'
+        self._velocity_motor = gridpoint_velocity_motor(self.settings)
 
         # _setpoint_generator, _active_setpoint, _state, etc. will be initialized
         # when .commands() is called.
@@ -523,8 +527,15 @@ class GridSearch:
             # settle at setpoint
             yield from self.hold(self._active_setpoint, self.settings['settle_time_s'])
 
-            # hold at setpoint
-            yield from self.hold(self._active_setpoint, self.settings['duration_per_point_s'], log_flag)
+            # hold at setpoint, stretched at slow speeds to cover min_output_revs
+            # (test_builder.gridpoint_hold_s, which the builder preview also uses)
+            hold_s = gridpoint_hold_s(self.settings, self._active_setpoint['velocity'],
+                                      self._velocity_motor,
+                                      self.limits['input'].get('gear_ratio'))
+            if hold_s > self.settings['duration_per_point_s']:
+                print(f"GridSearch hold {hold_s:.1f} s for "
+                      f"{self.settings['min_output_revs']:g} output revs")
+            yield from self.hold(self._active_setpoint, hold_s, log_flag)
 
             # if setpoint is above cont. torque rating, ramp and hold at 0 torque to cool down
             if abs(self._active_setpoint['torque']) > self.t_limit:
