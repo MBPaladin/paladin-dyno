@@ -143,8 +143,9 @@ def run(d):
     # -- B: motor-order spectra ----------------------------------------------------
     grid = np.arange(0.0, 135.0, 0.01)
     fig, ax = plt.subplots(3, 1, figsize=(14, 11), sharex=True, sharey=True)
-    rows_q = (('backdrive', -15, 'LOAD backdrives DUT, 15 A'), ('zero', 0, 'Zero current'),
-              ('forward', 15, 'DUT drives, 15 A'))
+    im = c.i_max(d)
+    rows_q = (('backdrive', -im, f'LOAD backdrives DUT, {im:g} A'), ('zero', 0, 'Zero current'),
+              ('forward', im, f'DUT drives, {im:g} A'))
     for a, (q, ia, title) in zip(ax, rows_q):
         for v in c.speeds(d):
             specs = []
@@ -227,7 +228,7 @@ def run(d):
     for a in ax[1]:
         a.set_xlabel('DUT current along motion (A)')
         a.set_xticks(c.currents_along(d))
-    handles = [Line2D([], [], color=col, lw=2, label=f'{v:g} rad/s') for v, col in c.SPEED_COLORS.items()]
+    handles = [Line2D([], [], color=col, lw=2, label=f'{v:g} rad/s') for v, col in c.SPEED_COLORS.items() if v in c.speeds(d)]
     handles += [Line2D([], [], color=c.INK_2, marker=c.DIR_MARKER[s], ls=c.DIR_LS[s], label=c.DIR_LABEL[s]) for s in (-1, 1)]
     fig.legend(handles=handles, loc='lower center', ncol=5, bbox_to_anchor=(0.5, 0.0))
     fig.suptitle('Skip ripple orders vs current: which parts scale with load, which do not')
@@ -270,4 +271,5 @@ def run(d):
 
 
 if __name__ == '__main__':
-    run(c.load())
+    c.use_run_from_argv()
+    run(c.cogging_view(c.load()))

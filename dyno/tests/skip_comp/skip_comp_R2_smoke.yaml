@@ -1,0 +1,65 @@
+# R2 smoke test, ~5 min: backdrive 8 Nm at +/-0.1 rad/s, each ripple term
+# alone on base, 30 s (~12 motor revs) each. A term that GROWS its own order
+# in the fold has the wrong sign or phase: stop and check before R3.
+# Hand-written (the builder has no dut_compensation_profiles field), so it
+# opens view-only in the builder. Torque commands are TARGET OUTPUT torque,
+# Nm, because every segment lists dut_compensation_profiles. Forward is
+# torque x speed > 0 (DUT flip_torque_sign True). See dyno/src/dut_compensation.py.
+behaviors:
+- id: PREAMBLE
+  type: preamble
+  settings:
+    mode: hold
+    quiet_s: 10.0
+- id: BD_POS
+  type: grid_search
+  settings:
+    input_motor:
+      control_mode: torque
+      command_list:
+      - -8.0
+    output_motor:
+      control_mode: velocity
+      command_list:
+      - 0.1
+    loop_order:
+    - velocity
+    - torque
+    duration_per_point_s: 30.0
+    min_output_revs: 0.0
+    max_hold_s: 600.0
+    settle_time_s: 3.0
+    transition_rate: 0.25
+    continuous_torque: 20.0
+    dut_compensation_profiles:
+    - C1_base
+    - C3_h1
+    - C4_h6
+    - C6_all
+    profile_settle_s: 1.0
+- id: BD_NEG
+  type: grid_search
+  settings:
+    input_motor:
+      control_mode: torque
+      command_list:
+      - 8.0
+    output_motor:
+      control_mode: velocity
+      command_list:
+      - -0.1
+    loop_order:
+    - velocity
+    - torque
+    duration_per_point_s: 30.0
+    min_output_revs: 0.0
+    max_hold_s: 600.0
+    settle_time_s: 3.0
+    transition_rate: 0.25
+    continuous_torque: 20.0
+    dut_compensation_profiles:
+    - C1_base
+    - C3_h1
+    - C4_h6
+    - C6_all
+    profile_settle_s: 1.0

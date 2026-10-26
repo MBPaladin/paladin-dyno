@@ -65,23 +65,24 @@ def run(d):
                        f'gap between flanks at 0 Nm: {fits[1]["zero_torque_defl_mrad"] - fits[-1]["zero_torque_defl_mrad"]:.1f} mrad\n'
                        f'(torque_test_17 static: 3.66 / 2.94 Nm/mrad, 9.7 mrad)',
            transform=a.transAxes, va='top', fontsize=9, color=c.INK_2)
-    handles = [Line2D([], [], color=col, marker='o', ls='', ms=8, label=f'{v:g} rad/s') for v, col in c.SPEED_COLORS.items()]
+    handles = [Line2D([], [], color=col, marker='o', ls='', ms=8, label=f'{v:g} rad/s') for v, col in c.SPEED_COLORS.items() if v in c.speeds(d)]
     handles += [Line2D([], [], color=c.INK_2, marker=c.DIR_MARKER[s], ls='', ms=8, label=c.DIR_LABEL[s]) for s in (-1, 1)]
     a.legend(handles=handles, loc='lower right')
 
     # Within-dwell clouds for the extreme dwells: the deflection excursion during stick-slip.
     b = ax[1]
     for w in dw:
-        if abs(w['i_along_nom']) != 15 or w['speed_abs'] != 0.05:
+        if abs(w['i_along_nom']) != c.i_max(d) or w['speed_abs'] != 0.05:
             continue
         sl = c.dwell_slice(w)
         col = '#a8302f' if w['quadrant'] == 'backdrive' else '#1c5cab'
         b.plot(d['T_cell'][sl][::20], 1e3 * defl[sl][::20], '.', color=col, ms=1.5, alpha=0.35)
     b.set_xlabel('Cell torque (Nm, every 20th sample)')
     b.set_ylabel('Deflection (mrad at output)')
-    b.set_title('Inside the 15 A dwells at 0.05 rad/s')
-    b.legend(handles=[Line2D([], [], color='#a8302f', marker='o', ls='', label='backdrive 15 A'),
-                      Line2D([], [], color='#1c5cab', marker='o', ls='', label='forward 15 A')], loc='lower right')
+    im = c.i_max(d)
+    b.set_title(f'Inside the {im:g} A dwells at 0.05 rad/s')
+    b.legend(handles=[Line2D([], [], color='#a8302f', marker='o', ls='', label=f'backdrive {im:g} A'),
+                      Line2D([], [], color='#1c5cab', marker='o', ls='', label=f'forward {im:g} A')], loc='lower right')
     fig.suptitle('Skip gear-train windup and backlash measured while moving')
     c.note(fig, 'Deflection zero = mean of the two zero-current dwell groups. Load encoder quantisation is 2 mrad '
                 'per sample, so the clouds are striped; the dwell means are not.', y=0.0)
@@ -143,4 +144,5 @@ def run(d):
 
 
 if __name__ == '__main__':
-    run(c.load())
+    c.use_run_from_argv()
+    run(c.cogging_view(c.load()))

@@ -77,7 +77,9 @@ def run(d):
 
     # -- Stacked shares, one panel per speed, both directions averaged ------------------
     cur = c.currents_along(d)
-    fig, ax = plt.subplots(1, 3, figsize=(16, 5.6), sharey=True)
+    ns = len(c.speeds(d))
+    fig, ax = plt.subplots(1, ns, figsize=(5.3 * ns, 5.6), sharey=True, squeeze=False)
+    ax = ax[0]
     for a, v in zip(ax, c.speeds(d)):
         bottoms = np.zeros(len(cur))
         stds = []
@@ -94,7 +96,7 @@ def run(d):
             sd = np.mean([shares[w['n']][1] for w in ws])
             a.text(j, min(bottoms[j], 112) + 2, f'{sd:.2f}', ha='center', va='bottom', fontsize=8.5, color=c.INK_2)
         a.set_xticks(range(len(cur)))
-        a.set_xticklabels([f'{i:+d}' for i in cur])
+        a.set_xticklabels([f'{i:+g}' for i in cur])
         a.set_xlabel('DUT current along motion (A)')
         a.set_title(f'{v:g} rad/s output')
         a.set_ylim(0, 125)
@@ -122,7 +124,7 @@ def run(d):
                 A, B = ab[k]
                 prof += A * np.cos(k * th) + B * np.sin(k * th)
             a.plot(th * 180 / np.pi, prof, color=c.current_color(ia), lw=1.8 if ia == 0 else 1.4)
-            prof_pp[f'dir{s:+d}_I{ia:+d}'] = so.pkpk(prof)
+            prof_pp[f'dir{s:+d}_I{ia:+g}'] = so.pkpk(prof)
         a.axhline(0, color=c.INK_3, lw=0.8)
         a.set_xlim(0, 360)
         a.set_xticks(range(0, 361, 60))
@@ -132,7 +134,8 @@ def run(d):
     handles = [Line2D([], [], color=c.current_color(i), lw=2, label=c.current_label(i)) for i in cur]
     fig.legend(handles=handles, loc='lower center', ncol=7, bbox_to_anchor=(0.5, 0.0))
     fig.suptitle('Skip torque locked to the output (gearbox) angle, low orders')
-    c.note(fig, 'Joint fit across the three speeds at each current and direction (~3.3 output revs). Orders 25/27 '
+    revs = sum(abs(d['th_o'][w['i1'] - 1] - d['th_o'][w['i0']]) for w in dw) / c.TWO_PI / (2 * len(cur))
+    c.note(fig, f'Joint fit across the {ns} speeds at each current and direction (~{revs:.1f} output revs). Orders 25/27 '
                 '(cycloid sidebands) are fitted too but left out of this plot; see the output-order spectrum.',
            y=-0.02)
     fig.tight_layout(rect=(0, 0.07, 1, 0.94))
@@ -141,19 +144,21 @@ def run(d):
     def mean_share(cond, comp):
         return float(np.mean([shares[w['n']][0][comp] for w in dw if cond(w)]))
     rec = {}
+    im = c.i_max(d)
     for name, cond in (('zero', lambda w: w['i_along_nom'] == 0),
-                       ('forward_15A', lambda w: w['i_along_nom'] == 15),
-                       ('backdrive_15A', lambda w: w['i_along_nom'] == -15),
+                       ('forward_imax', lambda w: w['i_along_nom'] == im),
+                       ('backdrive_imax', lambda w: w['i_along_nom'] == -im),
                        ('forward_all', lambda w: w['quadrant'] == 'forward'),
                        ('backdrive_all', lambda w: w['quadrant'] == 'backdrive')):
         rec[name] = {k: mean_share(cond, k) for k in ('ELEC', 'MECH', 'OUTPUT', 'REST')}
         rec[name]['torque_std_Nm'] = float(np.mean([shares[w['n']][1] for w in dw if cond(w)]))
     rec['output_profile_pkpk_orders_1_4'] = prof_pp
-    rec['sideband_amplitudes'] = {f'dir{s:+d}_I{ia:+d}': {str(k): float(np.hypot(*groups[(s, ia)][0][k])) for k in (25, 27)}
+    rec['sideband_amplitudes'] = {f'dir{s:+d}_I{ia:+g}': {str(k): float(np.hypot(*groups[(s, ia)][0][k])) for k in (25, 27)}
                                   for s in (-1, 1) for ia in cur}
     c.record('decomposition', rec)
     return shares
 
 
 if __name__ == '__main__':
-    run(c.load())
+    c.use_run_from_argv()
+    run(c.cogging_view(c.load()))

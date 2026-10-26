@@ -1,0 +1,72 @@
+# R3b, ~20 min: the session refit (s17_session_refit.py --apply) against the
+# same points as R3. C0_naive is pinned to the same law in both runs, so its
+# change from R3 measures drift between the runs; C1/C2/C6 then show what the
+# refit bought. Same session as R3: no new phase check needed unless the
+# Elmo has been power-cycled.
+# Hand-written (the builder has no dut_compensation_profiles field), so it
+# opens view-only in the builder. Torque commands are TARGET OUTPUT torque,
+# Nm, because every segment lists dut_compensation_profiles. Forward is
+# torque x speed > 0 (DUT flip_torque_sign True). See dyno/src/dut_compensation.py.
+behaviors:
+- id: PREAMBLE
+  type: preamble
+  settings:
+    mode: hold
+    quiet_s: 10.0
+- id: V010
+  type: grid_search
+  settings:
+    input_motor:
+      control_mode: torque
+      command_list:
+      - 4.0
+      - -4.0
+      - 12.0
+      - -12.0
+    output_motor:
+      control_mode: velocity
+      command_list:
+      - 0.1
+      - -0.1
+    loop_order:
+    - velocity
+    - torque
+    duration_per_point_s: 15.0
+    min_output_revs: 0.0
+    max_hold_s: 600.0
+    settle_time_s: 3.0
+    transition_rate: 0.25
+    continuous_torque: 20.0
+    dut_compensation_profiles: &id001
+    - C0_naive
+    - C1_base
+    - C2_speed
+    - C6_all
+    - C1_repeat
+    profile_settle_s: 1.0
+- id: V050
+  type: grid_search
+  settings:
+    input_motor:
+      control_mode: torque
+      command_list:
+      - 4.0
+      - -4.0
+      - 12.0
+      - -12.0
+    output_motor:
+      control_mode: velocity
+      command_list:
+      - 0.5
+      - -0.5
+    loop_order:
+    - velocity
+    - torque
+    duration_per_point_s: 8.0
+    min_output_revs: 0.0
+    max_hold_s: 600.0
+    settle_time_s: 3.0
+    transition_rate: 0.25
+    continuous_torque: 20.0
+    dut_compensation_profiles: *id001
+    profile_settle_s: 1.0

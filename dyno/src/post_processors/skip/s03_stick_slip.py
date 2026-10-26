@@ -112,7 +112,8 @@ def run(d):
 
     # -- Example traces -------------------------------------------------------------
     v_ex = 0.05
-    picks = [('DUT drives, 15 A (forward)', 15), ('Zero current', 0), ('LOAD backdrives DUT, 15 A', -15)]
+    im = c.i_max(d)
+    picks = [(f'DUT drives, {im:g} A (forward)', im), ('Zero current', 0), (f'LOAD backdrives DUT, {im:g} A', -im)]
     fig, ax = plt.subplots(2, 3, figsize=(15, 6.4), sharex=True)
     for j, (title, ia) in enumerate(picks):
         w = next(w for w in dw if w['speed_abs'] == v_ex and w['dir'] < 0 and w['i_along_nom'] == ia)
@@ -141,7 +142,7 @@ def run(d):
     c.save(fig, SUB, 'Skip_stick_slip_examples.png')
 
     # -- Grid maps ------------------------------------------------------------------
-    sp_rows = [-0.1, -0.05, -0.025, 0.025, 0.05, 0.1]
+    sp_rows = sorted({w['speed'] for w in dw})
     cols = c.currents_along(d)
     G = {k: np.full((len(sp_rows), len(cols)), np.nan) for k in ('stuck', 'rate', 'drop', 'std')}
     for w in dw:
@@ -153,8 +154,8 @@ def run(d):
         G['drop'][i, j] = st['drop_median_Nm'] if st['n_slips'] >= 20 else np.nan
         G['std'][i, j] = st['P_std_Nm']
     rl = [f'{v:+g}' for v in sp_rows]
-    cl = [f'{i:+d}' for i in cols]
-    fig, ax = plt.subplots(1, 3, figsize=(16, 4.8))
+    cl = [f'{i:+g}' for i in cols]
+    fig, ax = plt.subplots(1, 3, figsize=(16, 2.6 + 0.37 * len(sp_rows)))
     heat(ax[0], G['stuck'], rl, cl, 'Time stuck (%)', '{:.0f}')
     heat(ax[1], G['rate'], rl, cl, 'Slip bursts per second', '{:.1f}')
     heat(ax[2], G['std'], rl, cl, 'Torque std within dwell (Nm)', '{:.2f}', cmap='Oranges')
@@ -162,15 +163,20 @@ def run(d):
         a.set_xlabel('DUT current along motion (A)  [- = backdrive, + = forward]')
     ax[0].set_ylabel('Output speed command (rad/s)')
     fig.suptitle('Skip stick-slip across the grid')
-    c.note(fig, 'Stick-slip lives almost entirely in the backdrive half (LOAD driving the gearbox against DUT '
-                'current), grows with current and is worst at the slowest speeds. The std includes all '
-                'ripple, not only stick-slip.', y=0.0)
+    c.note(fig, 'Stuck = motor below 0.2 x commanded speed (25 ms window); slip burst = rising through 2 x. '
+                'The std includes all ripple, not only stick-slip.', y=0.0)
     fig.tight_layout(rect=(0, 0.05, 1, 0.94))
     c.save(fig, SUB, 'Skip_stick_slip_map.png')
 
     # -- Stick location vs angle --------------------------------------------------------
     heavy = [w for w in dw if w['i_along_nom'] <= -10]
-    idx = np.concatenate([stats[w['n']]['stick_mid_idx'] for w in heavy])
+    idx = np.concatenate([stats[w['n']]['stick_mid_idx'] for w in heavy]).astype(int)
+    rec = _record(d, dw, stats)
+    if len(idx) < 20:
+        print(f'  only {len(idx)} stuck intervals in heavy backdrive: no stick-location figure')
+        c.record('stick_slip', rec)
+        _per_dwell_csv(dw, stats)
+        return stats
     th_m = d['th_m'][idx]
     th_o = d['th_o'][idx]
     n = len(idx)
@@ -201,13 +207,21 @@ def run(d):
         a.legend(loc='upper right')
     ax[1, 0].set_title('Which motor-side order decides where it sticks')
     ax[1, 1].set_title('Which output-side order decides where it sticks')
-    fig.suptitle(f'Skip stick locations, backdrive dwells at 10-15 A ({n} stuck intervals >= {int(MIN_STICK_S * 1e3)} ms)')
+    fig.suptitle(f'Skip stick locations, backdrive dwells at 10-{c.i_max(d):g} A ({n} stuck intervals >= {int(MIN_STICK_S * 1e3)} ms)')
     c.note(fig, 'Order 21 per motor rev = electrical fundamental; 26 per output rev = once per motor rev; '
                 '25/27 per output rev = cycloid lobe/pin candidates. Bars above the dashed line are '
                 'statistically locked.', y=0.0)
     fig.tight_layout(rect=(0, 0.04, 1, 0.95))
     c.save(fig, SUB, 'Skip_stick_location_vs_angle.png')
 
+    _per_dwell_csv(dw, stats)
+    rec.update({'stick_plv_motor_orders': plv_m, 'stick_plv_output_orders': plv_o,
+                'stick_plv_threshold_1pct': thr, 'n_stick_intervals': n})
+    c.record('stick_slip', rec)
+    return stats
+
+
+def _per_dwell_csv(dw, stats):
     rows = []
     for w in dw:
         st = stats[w['n']]
@@ -219,20 +233,24 @@ def run(d):
                 'slip_bursts_per_s', 'n_slip_bursts', 'median_breakaway_drop_Nm',
                 'median_slip_travel_motor_deg', 'torque_std_Nm'], rows)
 
+
+def _record(d, dw, stats):
+    im = c.i_max(d)
+
     def mean_where(key, cond):
         v = [stats[w['n']][key] for w in dw if cond(w)]
-        return float(np.nanmean(v))
-    c.record('stick_slip', {
-        'stuck_frac_backdrive_15A_by_speed': {f'{v:g}': mean_where('stuck_frac', lambda w, v=v: w['speed_abs'] == v and w['i_along_nom'] == -15) for v in c.speeds(d)},
+        return float(np.nanmean(v)) if v else None
+    return {
+        'i_max_A': im,
+        'stuck_frac_backdrive_imax_by_speed': {f'{v:g}': mean_where('stuck_frac', lambda w, v=v: w['speed_abs'] == v and w['i_along_nom'] == -im) for v in c.speeds(d)},
         'stuck_frac_forward_mean': mean_where('stuck_frac', lambda w: w['quadrant'] == 'forward'),
         'stuck_frac_zero_mean': mean_where('stuck_frac', lambda w: w['quadrant'] == 'zero'),
-        'drop_median_backdrive_15A_Nm': mean_where('drop_median_Nm', lambda w: w['i_along_nom'] == -15),
-        'slip_angle_median_backdrive_15A_motor_deg': 180 / np.pi * mean_where('slip_angle_median_rad', lambda w: w['i_along_nom'] == -15),
-        'stick_plv_motor_orders': plv_m, 'stick_plv_output_orders': plv_o,
-        'stick_plv_threshold_1pct': thr, 'n_stick_intervals': n,
-    })
-    return stats
+        'stuck_frac_backdrive_max': max(stats[w['n']]['stuck_frac'] for w in dw if w['quadrant'] == 'backdrive'),
+        'drop_median_backdrive_imax_Nm': mean_where('drop_median_Nm', lambda w: w['i_along_nom'] == -im),
+        'slip_angle_median_backdrive_imax_motor_deg': 180 / np.pi * (mean_where('slip_angle_median_rad', lambda w: w['i_along_nom'] == -im) or np.nan),
+    }
 
 
 if __name__ == '__main__':
+    c.use_run_from_argv()
     run(c.load())

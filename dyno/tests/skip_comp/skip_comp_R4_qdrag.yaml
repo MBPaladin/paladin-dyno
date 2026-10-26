@@ -1,0 +1,126 @@
+# R4, ~35 min: separate forward/backdrive drag (qdrag) as a component.
+# C2 -> C7 isolates qdrag on base+speed; C6 -> C8 is the same step in the
+# full stack. C0 is the drift anchor against R3/R3b. Fit from R3 + R3b by
+# s17_session_refit.py. One phase-check hold first (constant current).
+# Hand-written (the builder has no dut_compensation_profiles field), so it
+# opens view-only in the builder. Torque commands are TARGET OUTPUT torque,
+# Nm, because every segment lists dut_compensation_profiles. Forward is
+# torque x speed > 0 (DUT flip_torque_sign True). See dyno/src/dut_compensation.py.
+behaviors:
+- id: PREAMBLE
+  type: preamble
+  settings:
+    mode: hold
+    quiet_s: 10.0
+- id: PHASECHK_POS
+  type: grid_search
+  settings:
+    input_motor:
+      control_mode: torque
+      command_list:
+      - -12.0
+    output_motor:
+      control_mode: velocity
+      command_list:
+      - 0.1
+    loop_order:
+    - velocity
+    - torque
+    duration_per_point_s: 40.0
+    min_output_revs: 0.0
+    max_hold_s: 600.0
+    settle_time_s: 3.0
+    transition_rate: 0.25
+    continuous_torque: 20.0
+    dut_compensation_profiles:
+    - C2_speed
+    profile_settle_s: 1.0
+- id: V010
+  type: grid_search
+  settings:
+    input_motor:
+      control_mode: torque
+      command_list:
+      - 4.0
+      - -4.0
+      - 8.0
+      - -8.0
+      - 12.0
+      - -12.0
+    output_motor:
+      control_mode: velocity
+      command_list:
+      - 0.1
+      - -0.1
+    loop_order:
+    - velocity
+    - torque
+    duration_per_point_s: 15.0
+    min_output_revs: 0.0
+    max_hold_s: 600.0
+    settle_time_s: 3.0
+    transition_rate: 0.25
+    continuous_torque: 20.0
+    dut_compensation_profiles: &id001
+    - C0_naive
+    - C2_speed
+    - C7_qdrag
+    - C6_all
+    - C8_all_q
+    profile_settle_s: 1.0
+- id: V050
+  type: grid_search
+  settings:
+    input_motor:
+      control_mode: torque
+      command_list:
+      - 4.0
+      - -4.0
+      - 8.0
+      - -8.0
+      - 12.0
+      - -12.0
+    output_motor:
+      control_mode: velocity
+      command_list:
+      - 0.5
+      - -0.5
+    loop_order:
+    - velocity
+    - torque
+    duration_per_point_s: 8.0
+    min_output_revs: 0.0
+    max_hold_s: 600.0
+    settle_time_s: 3.0
+    transition_rate: 0.25
+    continuous_torque: 20.0
+    dut_compensation_profiles: *id001
+    profile_settle_s: 1.0
+- id: V200
+  type: grid_search
+  settings:
+    input_motor:
+      control_mode: torque
+      command_list:
+      - 4.0
+      - -4.0
+      - 8.0
+      - -8.0
+      - 12.0
+      - -12.0
+    output_motor:
+      control_mode: velocity
+      command_list:
+      - 2.0
+      - -2.0
+    loop_order:
+    - velocity
+    - torque
+    duration_per_point_s: 6.0
+    min_output_revs: 0.0
+    max_hold_s: 600.0
+    settle_time_s: 3.0
+    transition_rate: 0.25
+    continuous_torque: 20.0
+    dut_compensation_profiles: *id001
+    profile_settle_s: 1.0

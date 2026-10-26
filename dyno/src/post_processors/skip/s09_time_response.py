@@ -60,8 +60,14 @@ def run(d):
                       'dP': w['P'] - prev['P']})
 
     kind_col = {'backdrive': '#a8302f', 'crosses 0 A': c.INK_3, 'forward': '#1c5cab'}
-    fig, ax = plt.subplots(1, 3, figsize=(16, 5.2), sharey=True)
-    for a, v in zip(ax, c.speeds(d)):
+    sp = c.speeds(d)
+    nr = 1 if len(sp) <= 3 else 2
+    nc = int(np.ceil(len(sp) / nr))
+    fig, ax = plt.subplots(nr, nc, figsize=(5.3 * nc, 5.2 * nr), sharey=True, squeeze=False)
+    ax = ax.ravel()
+    for a in ax[len(sp):]:
+        a.set_visible(False)
+    for a, v in zip(ax, sp):
         for st in [s for s in steps if s['v'] == v]:
             a.plot(st['t'], st['y'], color=kind_col[st['kind']], lw=1.0, alpha=0.85)
         a.axhline(1, color=c.INK_3, ls=':', lw=0.8)
@@ -84,12 +90,12 @@ def run(d):
     k_int = [abs(s['dP']) / (s['v'] * s['t90']) for s in slow]
     t90_by_speed = {f'{v:g}': float(np.nanmedian([s['t90'] for s in slow if s['v'] == v])) if any(s['v'] == v for s in slow) else None
                     for v in c.speeds(d)}
-    fig.suptitle('Skip torque response to 5 A current steps while sliding')
-    c.note(fig, f'{len(steps) - len(slow)} of {len(steps)} steps reach 90% within {1e3 * SLOW_T90_S:.0f} ms (gear train keeps sliding). '
-                f'The rest ramp for ' + ', '.join(f'{v} rad/s: {t:.1f} s' for v, t in t90_by_speed.items() if t) +
-                f' - ramp time ~ 1/speed, i.e. the gear train sticks and the LOAD velocity loop integrates the new torque '
-                f'from its speed error (implied ~{np.median(k_int):.0f} Nm/rad at the output). Feedforward removes that wait. '
-                'Later wiggles are angle-locked ripple, not relaxation.', y=0.0)
+    fig.suptitle(f'Skip torque response to DUT current steps while sliding ({c.RUN})')
+    msg = f'{len(steps) - len(slow)} of {len(steps)} steps reach 90% within {1e3 * SLOW_T90_S:.0f} ms. '
+    if slow:
+        msg += ('The rest ramp for ' + ', '.join(f'{v} rad/s: {t:.1f} s' for v, t in t90_by_speed.items() if t) +
+                f' (implied LOAD integral stiffness ~{np.median(k_int):.0f} Nm/rad at the output). ')
+    c.note(fig, msg + 'Later wiggles are angle-locked ripple, not relaxation.', y=0.0)
     fig.tight_layout(rect=(0, 0.04, 1, 0.94))
     c.save(fig, SUB, 'Skip_torque_step_response.png')
 
@@ -101,7 +107,7 @@ def run(d):
     fig, ax = plt.subplots(1, 2, figsize=(15, 5.2), sharey=True)
     wander = {}
     for a, q in zip(ax, ('forward', 'backdrive')):
-        for w in [w for w in dw if w['quadrant'] == q and abs(w['i_along_nom']) == 15]:
+        for w in [w for w in dw if w['quadrant'] == q and abs(w['i_along_nom']) == c.i_max(d)]:
             sl = c.dwell_slice(w)
             P = -w['dir'] * d['T_cell'][sl]
             n = int(5 * c.FS_HZ)
@@ -112,15 +118,14 @@ def run(d):
             wander[f'{q}_{w["speed"]:+g}'] = float(np.ptp(m))
         a.axhline(0, color=c.INK_3, lw=0.8)
         a.set_xlabel('Time in dwell (s)')
-        a.set_title(f'{"DUT drives" if q == "forward" else "LOAD backdrives"}, 15 A: 5 s means')
+        a.set_title(f'{"DUT drives" if q == "forward" else "LOAD backdrives"}, {c.i_max(d):g} A: 5 s means')
     ax[0].set_ylabel('Torque along motion minus dwell mean (Nm)')
-    handles = [Line2D([], [], color=col, lw=2, label=f'{v:g} rad/s') for v, col in c.SPEED_COLORS.items()]
+    handles = [Line2D([], [], color=col, lw=2, label=f'{v:g} rad/s') for v, col in c.SPEED_COLORS.items() if v in c.speeds(d)]
     handles += [Line2D([], [], color=c.INK_2, ls=c.DIR_LS[s], lw=1.6, label=c.DIR_LABEL[s]) for s in (-1, 1)]
     ax[0].legend(handles=handles, loc='upper right', ncol=2)
-    fig.suptitle('Skip torque wander within a 2-minute dwell at constant current')
-    c.note(fig, 'A 5 s mean still contains the once-per-motor-rev ripple at 0.025 rad/s (9.7 s per rev); at the faster '
-                'speeds it averages out and what is left is output-angle and slow wander. No dwell shows a monotonic '
-                'drift of more than a few percent.', y=0.0)
+    fig.suptitle('Skip torque wander within a dwell at constant current')
+    c.note(fig, f'A 5 s mean still contains the once-per-motor-rev ripple at the slowest speed '
+                f'({c.TWO_PI / (c.GEAR_RATIO * sp[0]):.1f} s per motor rev); at faster speeds it averages out.', y=0.0)
     fig.tight_layout(rect=(0, 0.04, 1, 0.94))
     c.save(fig, SUB, 'Skip_within_dwell_wander.png')
 
@@ -130,6 +135,8 @@ def run(d):
         'slow_step_t90_by_speed_s': t90_by_speed,
         'slow_step_kinds': {k: sum(1 for s in slow if s['kind'] == k) for k in kind_col},
         'implied_load_integral_stiffness_Nm_per_rad': float(np.median(k_int)) if k_int else None,
+        'n_steps_by_speed': {f'{v:g}': sum(1 for s in steps if s['v'] == v) for v in sp},
+        'median_t90_by_speed_s': {f'{v:g}': float(np.nanmedian([s['t90'] for s in steps if s['v'] == v])) for v in sp},
         't63_by_kind_s': {k: float(np.nanmedian([s['t63'] for s in steps if s['kind'] == k])) for k in kind_col},
         't90_by_kind_s': {k: float(np.nanmedian([s['t90'] for s in steps if s['kind'] == k])) for k in kind_col},
         'wander_5s_means_pkpk_Nm': wander,
@@ -137,4 +144,5 @@ def run(d):
 
 
 if __name__ == '__main__':
+    c.use_run_from_argv()
     run(c.load())

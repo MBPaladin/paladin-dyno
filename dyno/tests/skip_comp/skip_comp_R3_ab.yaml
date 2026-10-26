@@ -1,0 +1,150 @@
+# R3 main A/B, ~50 min: 3 speeds x 2 directions x 6 targets, every profile
+# back to back at each point, C1 repeated last as a drift check.
+# Hand-written (the builder has no dut_compensation_profiles field), so it
+# opens view-only in the builder. Torque commands are TARGET OUTPUT torque,
+# Nm, because every segment lists dut_compensation_profiles. Forward is
+# torque x speed > 0 (DUT flip_torque_sign True). See dyno/src/dut_compensation.py.
+behaviors:
+- id: PREAMBLE
+  type: preamble
+  settings:
+    mode: hold
+    quiet_s: 10.0
+- id: PHASECHK_POS
+  type: grid_search
+  settings:
+    input_motor:
+      control_mode: torque
+      command_list:
+      - -12.0
+    output_motor:
+      control_mode: velocity
+      command_list:
+      - 0.1
+    loop_order:
+    - velocity
+    - torque
+    duration_per_point_s: 40.0
+    min_output_revs: 0.0
+    max_hold_s: 600.0
+    settle_time_s: 3.0
+    transition_rate: 0.25
+    continuous_torque: 20.0
+    dut_compensation_profiles:
+    - C1_base
+    profile_settle_s: 1.0
+- id: PHASECHK_NEG
+  type: grid_search
+  settings:
+    input_motor:
+      control_mode: torque
+      command_list:
+      - 12.0
+    output_motor:
+      control_mode: velocity
+      command_list:
+      - -0.1
+    loop_order:
+    - velocity
+    - torque
+    duration_per_point_s: 40.0
+    min_output_revs: 0.0
+    max_hold_s: 600.0
+    settle_time_s: 3.0
+    transition_rate: 0.25
+    continuous_torque: 20.0
+    dut_compensation_profiles:
+    - C1_base
+    profile_settle_s: 1.0
+- id: V010
+  type: grid_search
+  settings:
+    input_motor:
+      control_mode: torque
+      command_list:
+      - 4.0
+      - -4.0
+      - 8.0
+      - -8.0
+      - 12.0
+      - -12.0
+    output_motor:
+      control_mode: velocity
+      command_list:
+      - 0.1
+      - -0.1
+    loop_order:
+    - velocity
+    - torque
+    duration_per_point_s: 15.0
+    min_output_revs: 0.0
+    max_hold_s: 600.0
+    settle_time_s: 3.0
+    transition_rate: 0.25
+    continuous_torque: 20.0
+    dut_compensation_profiles: &id001
+    - C0_naive
+    - C1_base
+    - C2_speed
+    - C3_h1
+    - C4_h6
+    - C5_hx
+    - C6_all
+    - C1_repeat
+    profile_settle_s: 1.0
+- id: V050
+  type: grid_search
+  settings:
+    input_motor:
+      control_mode: torque
+      command_list:
+      - 4.0
+      - -4.0
+      - 8.0
+      - -8.0
+      - 12.0
+      - -12.0
+    output_motor:
+      control_mode: velocity
+      command_list:
+      - 0.5
+      - -0.5
+    loop_order:
+    - velocity
+    - torque
+    duration_per_point_s: 8.0
+    min_output_revs: 0.0
+    max_hold_s: 600.0
+    settle_time_s: 3.0
+    transition_rate: 0.25
+    continuous_torque: 20.0
+    dut_compensation_profiles: *id001
+    profile_settle_s: 1.0
+- id: V200
+  type: grid_search
+  settings:
+    input_motor:
+      control_mode: torque
+      command_list:
+      - 4.0
+      - -4.0
+      - 8.0
+      - -8.0
+      - 12.0
+      - -12.0
+    output_motor:
+      control_mode: velocity
+      command_list:
+      - 2.0
+      - -2.0
+    loop_order:
+    - velocity
+    - torque
+    duration_per_point_s: 6.0
+    min_output_revs: 0.0
+    max_hold_s: 600.0
+    settle_time_s: 3.0
+    transition_rate: 0.25
+    continuous_torque: 20.0
+    dut_compensation_profiles: *id001
+    profile_settle_s: 1.0

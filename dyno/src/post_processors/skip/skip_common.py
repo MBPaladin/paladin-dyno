@@ -27,14 +27,19 @@ data; the writeup has the numbers):
     histogram and a sign-dependent offset on every reading. `split_correct`
     undoes it; see s08_load_cell.py for the evidence.
 
-Run any script directly, or everything via run_all.py, with the anaconda base
-interpreter:
+  * RUNS. v1 = 2026-10-19 (no working FF, cold); v2 = 2026-10-21 (CSV + FF,
+    VL.KP 4, warm, faster speeds, split corrected at acquisition, DUT
+    flip_torque_sign True). Pass the run name as the script argument.
 
-    "C:/Users/Nathan Justus/anaconda3/python.exe" dyno/src/post_processors/skip/run_all.py
+Run any script directly, or everything via run_all.py:
+
+    .venv/bin/python dyno/src/post_processors/skip/run_all.py v2
+    "C:/Users/Nathan Justus/anaconda3/python.exe" dyno/src/post_processors/skip/run_all.py v2
 """
 
 import json
 import os
+import sys
 import time
 
 import h5py
@@ -47,16 +52,50 @@ import matplotlib.pyplot as plt
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DYNO_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, '..', '..', '..'))
 SKIP_LOGS = os.path.join(DYNO_DIR, 'logs', 'skip')
-COGGING_LOG = os.path.join(SKIP_LOGS, 'cogging', 'cogging_vs_torque_and_speed',
-                           'skip_cogging_vs_torque_long.hdf5')
+# Each cogging run analysed so far. 'results' is where its figures, CSVs and
+# key numbers go; v1 keeps the original top-level layout.
+RUNS = {
+    'v1': {'log': os.path.join(SKIP_LOGS, 'cogging', 'cogging_vs_torque_and_speed',
+                               'skip_cogging_vs_torque_long.hdf5'),
+           'results': os.path.join(SKIP_LOGS, 'results'),
+           'label': '2026-10-19, LOAD FF not reaching the drive, VL.KP 1 / KI 2, cold'},
+    'v2': {'log': os.path.join(SKIP_LOGS, 'cogging', 'cogging_vs_torque_and_speed_02',
+                               'skip_cogging_v2.hdf5'),
+           'results': os.path.join(SKIP_LOGS, 'results', 'cogging_v2'),
+           'label': '2026-10-21, LOAD CSV + FF 0.8, VL.KP 4 / KI 3, after warm-up churn'},
+}
+# v2 again with the angle-domain stages run at every speed, up to 4 rad/s. Above
+# ~0.5 rad/s the high orders sit near the rig/cell lines or past what 1 kHz can
+# resolve, so this is for looking, not for quoting (see COGGING_MAX_SPEED).
+RUNS['v2_all'] = dict(RUNS['v2'], results=os.path.join(SKIP_LOGS, 'results', 'cogging_v2_allspeeds'),
+                      label=RUNS['v2']['label'] + ', angle stages at all speeds', cogging_max_speed=4.0)
+RUN = 'v1'
+COGGING_LOG = RUNS[RUN]['log']
 TORQUE_TEST_LOGS = {
     'torque_test_15': os.path.join(SKIP_LOGS, 'torque_tests', 'torque_test_15',
                                    'skip_torque_holds.hdf5'),
     'torque_test_17': os.path.join(SKIP_LOGS, 'torque_tests', 'torque_test_17',
                                    'skip_torque_holds_samePositionDiffRamps.hdf5'),
 }
-RESULTS_DIR = os.path.join(SKIP_LOGS, 'results')
+RESULTS_DIR = RUNS[RUN]['results']
 KEY_NUMBERS_PATH = os.path.join(RESULTS_DIR, 'skip_key_numbers.json')
+
+
+def use_run(name):
+    """Point loading and every output path at one of RUNS."""
+    global RUN, COGGING_LOG, RESULTS_DIR, KEY_NUMBERS_PATH, COGGING_MAX_SPEED
+    RUN = name
+    COGGING_LOG = RUNS[name]['log']
+    COGGING_MAX_SPEED = RUNS[name].get('cogging_max_speed', _COGGING_MAX_SPEED_DEFAULT)
+    RESULTS_DIR = RUNS[name]['results']
+    KEY_NUMBERS_PATH = os.path.join(RESULTS_DIR, 'skip_key_numbers.json')
+
+
+def use_run_from_argv():
+    """`script.py v2` selects a run; no argument keeps v1."""
+    for a in sys.argv[1:]:
+        if a in RUNS:
+            use_run(a)
 
 # --- Actuator and rig constants -----------------------------------------------
 GEAR_RATIO = 26
@@ -67,13 +106,18 @@ KT_LOAD = 7.79            # Nm/A, LOAD (AKD); torque_test_15 measured 7.75
 CELL_V_PER_NM = 5.0 / 500.0
 
 # --- Analysis tunables ---------------------------------------------------------
-DWELL_MIN_S = 100.0       # command plateaus shorter than this are transitions
+DWELL_MIN_S = 25.0        # command plateaus shorter than this are transitions (v2 has 35 s dwells)
 DWELL_SETTLE_S = 3.0      # trimmed off the front of each dwell (command ramp + catch-up)
 DWELL_TAIL_S = 0.2        # trimmed off the end
 MOTOR_SPEED_WINDOW = 25   # samples; centred position difference for motor speed
 CELL_SPLIT_NM = 0.40      # load cell split at 0 V (s08 measures 0.39-0.42)
 STUCK_FRAC = 0.2          # |motor speed| below this x nominal counts as stuck
 SLIDE_BAND = (0.3, 3.0)   # |motor speed| within this x nominal counts as steady sliding
+# Cogging folds, order fits and order spectra use only speeds up to this. At
+# 1 kHz the 6x electrical order (126 per motor rev) passes the ~283-420 Hz rig
+# and cell lines above 0.5 rad/s and aliases above 1 rad/s; v1 never got here.
+COGGING_MAX_SPEED = 0.25
+_COGGING_MAX_SPEED_DEFAULT = COGGING_MAX_SPEED
 
 TWO_PI = 2.0 * np.pi
 
@@ -81,6 +125,7 @@ _CHANNELS = ('time', 'dut_torque_command', 'load_velocity_command', 'dut_current
              'dut_output_position', 'dut_velocity', 'load_position',
              'load_velocity', 'load_torque', 'load_current', 'input_torque',
              'pt100_rtd_top', 'cycle_time_us')
+_OPTIONAL_CHANNELS = ('load_torque_ff', 'load_torque_raw')
 
 
 # --- Load-cell correction -------------------------------------------------------
@@ -112,6 +157,23 @@ def cell_split_mv(f, name='load_torque'):
     return None
 
 
+def load_flip_torque(f):
+    """LOAD's flip_torque_sign (True on the in-house rig in both runs)."""
+    try:
+        rc = json.loads(f.attrs['resolved_config'])
+        return bool(rc['devices']['LOAD']['params'].get('flip_torque_sign', False))
+    except (KeyError, ValueError):
+        return True
+
+
+def feedforward_ratio(d):
+    """LOAD feedforward ratio this run used. Logs from 2026-10-21 record it;
+    older ones ran the dyno_controller default, 0.8 (which in v1 never reached
+    the drive: AKD profile mode and IL.KBUSFF = 0)."""
+    ff = d.get('ff_config') or {}
+    return float(ff.get('ratio', 0.8))
+
+
 def cell_tare_bias(f):
     try:
         return float(json.loads(f.attrs['tare'])['load_torque']['bias'])
@@ -131,12 +193,23 @@ def speed_from_position(theta, window=MOTOR_SPEED_WINDOW, fs=FS_HZ):
     return w
 
 
-def load(path=COGGING_LOG, verbose=True):
-    """Read the cogging log into a dict of float64 arrays plus derived signals."""
+def load(path=None, verbose=True):
+    """Read the cogging log (default: the selected run's) into a dict of
+    float64 arrays plus derived signals."""
+    path = COGGING_LOG if path is None else path
     with h5py.File(path, 'r') as f:
         d = {k: f[k][:].astype(np.float64) for k in _CHANNELS}
+        for k in _OPTIONAL_CHANNELS:
+            if k in f:
+                d[k] = f[k][:].astype(np.float64)
         d['tare_bias'] = cell_tare_bias(f)
         d['logged_split_mv'] = cell_split_mv(f)
+        d['load_flip_torque'] = load_flip_torque(f)
+        try:
+            d['ff_config'] = json.loads(f.attrs['resolved_config']).get('feedforward')
+        except (KeyError, ValueError):
+            d['ff_config'] = None
+        d['path'] = path
     d['t'] = d['time'] - d['time'][0]
     d['th_m'] = d['dut_output_position']               # motor angle [rad]
     d['th_o'] = d['load_position']                     # output angle [rad]
@@ -145,8 +218,13 @@ def load(path=COGGING_LOG, verbose=True):
     d['cell_raw'] = d['load_torque'] - d['tare_bias']  # untared cell [Nm]
     # Logs from 2026-10-21 on are corrected at acquisition; never correct twice.
     d['cell_corr'] = (d['cell_raw'] if d['logged_split_mv'] else split_correct(d['cell_raw']))
-    d['T_lm'] = KT_LOAD * d['load_current']            # LOAD motor torque [Nm]
+    d['T_lm'] = KT_LOAD * d['load_current']            # LOAD motor torque [Nm], drive frame
+    # The same torque in LOAD's command frame (what a feedforward is sent in):
+    # commands pass through flip_torque_sign, the logged current does not.
+    d['T_lm_cmd'] = -d['T_lm'] if d['load_flip_torque'] else d['T_lm']
+    d['_rs'], d['_fit'] = {}, {}                       # angle-fit caches, shared by cogging_view
     d['dwells'] = find_dwells(d)
+    set_grid_colors(d)
 
     # Mechanical zero of the corrected cell: midpoint of the zero-current
     # dwells in the two directions (the gearbox's no-load drag is taken to be
@@ -164,6 +242,8 @@ def load(path=COGGING_LOG, verbose=True):
         # drives the gearbox (backdrive), negative = LOAD brakes it.
         w['P'] = -w['dir'] * w['T_cell']
         w['T_lm'] = float(np.mean(d['T_lm'][sl]))
+        w['T_lm_cmd'] = float(np.mean(d['T_lm_cmd'][sl]))
+        w['ff'] = float(np.mean(d['load_torque_ff'][sl])) if 'load_torque_ff' in d else 0.0
         w['temp_C'] = float(np.nanmean(d['pt100_rtd_top'][sl]))
     if verbose:
         print(f'loaded {os.path.basename(path)}: {len(d["t"]):,} samples, '
@@ -184,7 +264,8 @@ def find_dwells(d):
     starts, ends = np.r_[0, edges], np.r_[edges, len(t)]
     dwells = []
     for s, e in zip(starts, ends):
-        if t[e - 1] - t[s] < DWELL_MIN_S or abs(vc[s]) < 1e-6:
+        # v2 opens and closes with idle holds (speed command NaN or 0)
+        if t[e - 1] - t[s] < DWELL_MIN_S or not np.isfinite(vc[s]) or abs(vc[s]) < 1e-6:
             continue
         i0 = s + int(DWELL_SETTLE_S * FS_HZ)
         i1 = e - int(DWELL_TAIL_S * FS_HZ)
@@ -192,20 +273,27 @@ def find_dwells(d):
         tcmd = round(float(tc[s]), 3)
         current = float(np.mean(d['dut_current'][i0:i1]))
         direction = int(np.sign(speed))
+        # DUT current along the motion: + = DUT pushes with the motion. The
+        # quadrant comes from the measured current, not the command, because
+        # which sign of tcmd*speed is forward depends on the DUT's
+        # flip_torque_sign (False in v1, True from 2026-10-21).
+        i_along = -direction * current
+        i_nom = abs(tcmd) / KT_CONFIGURED
         if tcmd == 0:
             quadrant = 'zero'
-        elif tcmd * speed < 0:
+        elif i_along > 0:
             quadrant = 'forward'      # DUT torque along the motion: DUT drives LOAD
         else:
             quadrant = 'backdrive'    # DUT torque against the motion: LOAD drives DUT
-        # DUT current along the motion: + = DUT pushes with the motion.
-        i_along = -direction * current
+        i_along_nom = 0.0 if tcmd == 0 else float(np.sign(i_along) * round(2 * i_nom) / 2)
+        if i_along_nom == int(i_along_nom):
+            i_along_nom = int(i_along_nom)
         dwells.append({
             'n': len(dwells), 'i0': int(i0), 'i1': int(i1),
             't0': float(t[i0]), 't1': float(t[i1 - 1]),
             'speed': speed, 'speed_abs': abs(speed), 'dir': direction,
             'tcmd': tcmd, 'current': current, 'i_along': float(i_along),
-            'i_along_nom': int(round(-direction * tcmd / KT_CONFIGURED)),
+            'i_along_nom': i_along_nom,
             'quadrant': quadrant,
             'motor_speed_nom': GEAR_RATIO * abs(speed),
         })
@@ -222,6 +310,20 @@ def speeds(d):
 
 def currents_along(d):
     return sorted({w['i_along_nom'] for w in d['dwells']})
+
+
+def i_max(d):
+    """Largest |current along the motion| in the grid (15 A in v1, 12.5 A in v2)."""
+    return max(abs(i) for i in currents_along(d))
+
+
+def cogging_view(d, vmax=None):
+    """The same data restricted to the quasi-static speeds the angle-domain
+    analyses can resolve. Shares arrays and the angle-fit caches with `d`."""
+    vmax = COGGING_MAX_SPEED if vmax is None else vmax
+    v = dict(d)
+    v['dwells'] = [w for w in d['dwells'] if w['speed_abs'] <= vmax + 1e-9]
+    return v
 
 
 def sliding_mask(d, w):
@@ -315,7 +417,9 @@ GRID = '#e4e3de'
 SURFACE = '#fcfcfb'
 
 # Three speed magnitudes -> the first three categorical slots (validated all-pairs).
+# Grids with more speeds get an ordinal blue ramp instead (set_grid_colors).
 SPEED_COLORS = {0.025: '#2a78d6', 0.05: '#eb6834', 0.1: '#1baf7a'}
+_SPEED_RAMP = ('#86b6ef', '#5598e7', '#2a78d6', '#256abf', '#1c5cab', '#184f95', '#104281', '#0d366b')
 DIR_MARKER = {-1: 'v', 1: '^'}
 DIR_LS = {-1: '--', 1: '-'}
 DIR_LABEL = {-1: 'output turning -', 1: 'output turning +'}
@@ -327,15 +431,37 @@ _CURRENT_COLORS = {-15: '#a8302f', -10: '#e34948', -5: '#f2a19f',
 QUADRANT_FILL = {'forward': '#e8f1fc', 'backdrive': '#fcebea', 'zero': None}
 
 
+_SHADES = {-1: ('#f2a19f', '#e34948', '#a8302f'), 1: ('#86b6ef', '#3987e5', '#1c5cab')}
+
+
+def set_grid_colors(d):
+    """Speed and current colours for whatever grid this log ran. v1's grid keeps
+    its original colours; others get an ordinal ramp for speed and the same
+    diverging shades spread over their current levels."""
+    sp = speeds(d)
+    if not set(sp) <= {0.025, 0.05, 0.1}:
+        SPEED_COLORS.clear()
+        idx = np.round(np.linspace(0, len(_SPEED_RAMP) - 1, len(sp))).astype(int)
+        SPEED_COLORS.update({v: _SPEED_RAMP[k] for v, k in zip(sp, idx)})
+    levels = sorted({abs(i) for i in currents_along(d) if i != 0})
+    if levels and levels != [5, 10, 15]:
+        _CURRENT_COLORS.clear()
+        _CURRENT_COLORS[0] = INK_3
+        idx = np.round(np.linspace(0, 2, len(levels))).astype(int) if len(levels) > 1 else [2]
+        for lv, k in zip(levels, idx):
+            for s in (-1, 1):
+                _CURRENT_COLORS[s * lv] = _SHADES[s][k]
+
+
 def current_color(i_along_nom):
-    return _CURRENT_COLORS.get(int(i_along_nom), INK_3)
+    return _CURRENT_COLORS.get(i_along_nom, INK_3)
 
 
 def current_label(i_along_nom):
-    i = int(i_along_nom)
+    i = i_along_nom
     if i == 0:
         return '0 A'
-    return f'{"backdrive" if i < 0 else "forward"} {abs(i)} A'
+    return f'{"backdrive" if i < 0 else "forward"} {abs(i):g} A'
 
 
 def speed_label(v):

@@ -120,7 +120,74 @@ def split_from_histogram(raw):
     return best[0]
 
 
+def run_corrected(d):
+    """Logs from 2026-10-21 on are split-corrected at acquisition and also
+    carry the uncorrected, untared reading as load_torque_raw. Check that the
+    correction closed the gap and removed the sign-dependent offset, against
+    the same LOAD-current cross-check that found it."""
+    raw = d['load_torque_raw']                     # untared, uncorrected
+    cor = d['cell_raw']                            # untared, corrected at acquisition
+    mv = 1e3 * c.CELL_V_PER_NM                     # mV per Nm at the ELM input
+    g_cfg = d['logged_split_mv'] / mv              # configured split in Nm
+
+    def dwell_fit(sig):
+        L = np.array([np.mean(sig[c.dwell_slice(w)]) for w in d['dwells']])
+        Tl = np.array([w['T_lm'] for w in d['dwells']])
+        sv = np.array([w['dir'] for w in d['dwells']], float)
+        X1 = np.column_stack([np.ones_like(L), L, sv, np.sign(L)])
+        c1, *_ = np.linalg.lstsq(X1, L + Tl, rcond=None)
+        X0 = X1[:, :3]
+        c0, *_ = np.linalg.lstsq(X0, L + Tl, rcond=None)
+        return L, (L + Tl) - X0 @ c0, 2 * c1[3]
+
+    Lr, rr, g_raw = dwell_fit(raw)
+    Lc, rc_, g_cor = dwell_fit(cor)
+    g_hist_raw = split_from_histogram(raw)
+
+    fig, ax = plt.subplots(1, 3, figsize=(17, 5.0))
+    bins = np.arange(-1.0, 1.0001, 0.02)
+    for x, col, lab in ((raw, c.INK_3, 'load_torque_raw (uncorrected)'), (cor, '#1c5cab', 'load_torque (corrected)')):
+        h, e = np.histogram(x, bins=bins)
+        ax[0].step(0.5 * (e[1:] + e[:-1]), h, where='mid', color=col, lw=1.4, label=lab)
+    ax[0].set_yscale('log')
+    ax[0].set_xlabel('Untared reading (Nm); 0 Nm = 0 V at the ELM3004')
+    ax[0].set_ylabel('Samples per 0.02 Nm bin')
+    ax[0].set_title('Histogram around 0 V, whole run')
+    ax[0].legend(loc='lower center')
+    for a, L, r, g, title in ((ax[1], Lr, rr, g_raw, 'Uncorrected'), (ax[2], Lc, rc_, g_cor, 'Corrected at acquisition')):
+        for w, x, y in zip(d['dwells'], L, r):
+            a.plot(x, y, c.DIR_MARKER[w['dir']], color=c.SPEED_COLORS[w['speed_abs']], ms=7, mec='white', mew=0.8)
+        a.axhline(0, color=c.INK_3, lw=0.8)
+        a.axvline(0, color=c.INK_3, lw=0.8)
+        a.set_xlabel('Cell reading, dwell mean (Nm, untared)')
+        a.set_ylabel('Cell + LOAD motor torque, residual without a split term (Nm)')
+        a.set_title(f'{title}: split left = {g:+.2f} Nm, rms {np.sqrt(np.mean(r ** 2)):.3f} Nm')
+    fig.suptitle(f'Skip load cell: the acquisition-side split correction (split_mv = {d["logged_split_mv"]:g} mV '
+                 f'= {g_cfg:.2f} Nm) at work')
+    c.note(fig, 'Middle/right: per dwell, cell + LOAD current x kt fitted as a + b*cell + c*sign(speed); a split in the '
+                'cell shows as a step in the residual where the reading changes sign. Left: the corrected histogram keeps '
+                'a narrow notch at 0 V because the raw gap has sloped shoulders; the mean offset is gone.', y=0.0)
+    fig.tight_layout(rect=(0, 0.05, 1, 0.94))
+    c.save(fig, SUB, 'Skip_load_cell_acquisition_correction.png')
+
+    # depth of what is left of the hole: density in +-1 mV of the configured centre vs its shoulders
+    def hole_depth(x):
+        inside = np.mean(np.abs(x) < 0.1)
+        shoulder = 0.5 * (np.mean((x > 0.2) & (x < 0.4)) + np.mean((x < -0.2) & (x > -0.4)))
+        return float(inside / 0.2 / (shoulder / 0.2))
+    c.record('load_cell', {
+        'split_corrected_at_acquisition_mV': d['logged_split_mv'],
+        'split_from_load_motor_uncorrected_Nm': float(g_raw), 'split_from_load_motor_corrected_Nm': float(g_cor),
+        'split_from_histogram_uncorrected_Nm': float(g_hist_raw),
+        'density_within_0p1Nm_of_0V_over_shoulders': {'uncorrected': hole_depth(raw), 'corrected': hole_depth(cor)},
+        'tare_bias_Nm': d['tare_bias'],
+    })
+
+
 def run(d):
+    if d.get('logged_split_mv') and 'load_torque_raw' in d:
+        c.apply_style()
+        return run_corrected(d)
     c.apply_style()
     logs = {'Skip cogging run': d['cell_raw']}
     for name, p in c.TORQUE_TEST_LOGS.items():
@@ -185,7 +252,7 @@ def run(d):
         a.set_title(f'{title}: rms {np.sqrt(np.mean(r ** 2)):.3f} Nm')
         a.set_xlabel('Raw cell reading, dwell mean (Nm)')
     ax[0].set_ylabel('Cell + LOAD motor torque, fit residual (Nm)')
-    handles = [Line2D([], [], color=col, marker='o', ls='', ms=8, label=f'{v:g} rad/s') for v, col in c.SPEED_COLORS.items()]
+    handles = [Line2D([], [], color=col, marker='o', ls='', ms=8, label=f'{v:g} rad/s') for v, col in c.SPEED_COLORS.items() if v in c.speeds(d)]
     handles += [Line2D([], [], color=c.INK_2, marker=c.DIR_MARKER[s], ls='', ms=8, label=c.DIR_LABEL[s]) for s in (-1, 1)]
     ax[0].legend(handles=handles, loc='lower right')
     fig.suptitle('Skip load cell vs LOAD motor current: every reading carries a sign-dependent offset')
@@ -284,4 +351,5 @@ def run(d):
 
 
 if __name__ == '__main__':
+    c.use_run_from_argv()
     run(c.load())

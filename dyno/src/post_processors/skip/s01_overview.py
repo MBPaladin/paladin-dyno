@@ -41,7 +41,7 @@ def run(d):
     m, lo, hi = _block_stats(d['dut_current'], n)
     ax[1].plot(tb, m, color=c.INK, lw=1.2)
     ax[1].set_ylabel('DUT current (A)')
-    ax[1].set_yticks([-15, -10, -5, 0, 5, 10, 15])
+    ax[1].set_yticks(sorted({abs(w['current']) // 2.5 * 2.5 * s for w in d['dwells'] for s in (-1, 1)}))
 
     m, lo, hi = _block_stats(d['T_cell'], n)
     ax[2].fill_between(tb, lo, hi, color='#b7d3f6', lw=0, label='1 s min..max')
@@ -70,7 +70,10 @@ def run(d):
                           Patch(color=c.QUADRANT_FILL['backdrive'], label='Load backdrives DUT'),
                           Patch(facecolor=c.SURFACE, edgecolor=c.INK_3, label='Zero current')],
                  loc='upper left', ncol=3)
-    fig.suptitle('Skip cogging/backdrive grid: 6 speeds x 7 currents, 120 s per dwell')
+    n_sp, n_i = len(c.speeds(d)) * 2, len(c.currents_along(d))
+    dur = sorted({round((w['t1'] - w['t0']) / 5) * 5 for w in d['dwells']})
+    fig.suptitle(f'Skip cogging/backdrive grid ({c.RUN}): {n_sp} speeds x {n_i} currents, '
+                 f'{dur[0]:g}-{dur[-1] + c.DWELL_SETTLE_S:.0f} s per dwell')
     c.note(fig, 'Motor speed is differentiated from the motor encoder (25 ms window) and divided by '
                 '26 x the commanded output speed: 1 = smooth tracking, 0 = stuck, spikes = slip bursts.',
            y=0.0)
@@ -114,4 +117,5 @@ def run(d):
 
 
 if __name__ == '__main__':
+    c.use_run_from_argv()
     run(c.load())

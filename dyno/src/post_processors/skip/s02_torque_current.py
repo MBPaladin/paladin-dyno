@@ -31,7 +31,6 @@ import matplotlib.pyplot as plt
 import skip_common as c
 
 SUB = '02_torque_vs_current'
-EXISTING_FF_RATIO = 0.8   # dyno_controller default feedforward_ratio
 
 
 def branch_fit(dw):
@@ -75,8 +74,8 @@ def load_torque_test_17_holds():
 
 
 def feedforward_fit(dw):
-    """LOAD motor torque (as logged) = 26*tcmd*r_q + c_v*sign(speed) + c0."""
-    y = np.array([w['T_lm'] for w in dw])
+    """LOAD motor torque (LOAD command frame) = 26*tcmd*r_q + c_v*sign(speed) + c0."""
+    y = np.array([w['T_lm_cmd'] for w in dw])
     g = np.array([c.GEAR_RATIO * w['tcmd'] for w in dw])
     fwd = np.array([w['quadrant'] == 'forward' for w in dw], float)
     bd = np.array([w['quadrant'] == 'backdrive' for w in dw], float)
@@ -93,29 +92,32 @@ def feedforward_fit(dw):
 def run(d):
     c.apply_style()
     dw = d['dwells']
-    fit = branch_fit(dw)
+    # The headline line is the quasi-static one (all of v1; <= 0.25 rad/s in v2);
+    # the per-speed groups below show how it changes with speed.
+    fit = branch_fit([w for w in dw if w['speed_abs'] <= c.COGGING_MAX_SPEED])
     groups = {}
     for v in c.speeds(d):
         for s in (-1, 1):
             groups[(v, s)] = branch_fit([w for w in dw if w['speed_abs'] == v and w['dir'] == s])
-    ff = feedforward_fit(dw)
+    ff = feedforward_fit([w for w in dw if w['speed_abs'] <= c.COGGING_MAX_SPEED])
 
     # -- Figure 1: the kinked curve + standstill band -----------------------------
     fig, ax = plt.subplots(1, 2, figsize=(14, 6.2))
     a = ax[0]
+    im = c.i_max(d) + 1.0
     for w in dw:
         a.plot(w['i_along'], w['P'], c.DIR_MARKER[w['dir']], color=c.SPEED_COLORS[w['speed_abs']],
                ms=8, mec='white', mew=0.8, zorder=3)
-    xb = np.linspace(-16, 0, 20)
-    xf = np.linspace(0, 16, 20)
+    xb = np.linspace(-im, 0, 20)
+    xf = np.linspace(0, im, 20)
     a.plot(xb, fit['backdrive']['c'] - fit['backdrive']['K'] * xb, color=c.INK, lw=1.4, zorder=2)
     a.plot(xf, fit['forward']['c'] - fit['forward']['K'] * xf, color=c.INK, lw=1.4, zorder=2)
-    xx = np.linspace(-16, 16, 2)
+    xx = np.linspace(-im, im, 2)
     a.plot(xx, -c.GEAR_RATIO * fit['kt_symmetric'] * xx, color=c.INK_3, ls='--', lw=1.2, zorder=1)
     a.plot(xx, -c.GEAR_RATIO * c.KT_CONFIGURED * xx, color=c.INK_3, ls=':', lw=1.2, zorder=1)
-    a.text(-15.5, -c.GEAR_RATIO * fit['kt_symmetric'] * -15.5 - 2.6,
+    a.text(-im + 0.5, -c.GEAR_RATIO * fit['kt_symmetric'] * (-im + 0.5) - 2.6,
            f'lossless, kt = {fit["kt_symmetric"]:.3f}', color=c.INK_2, fontsize=8.5)
-    a.text(-15.5, -c.GEAR_RATIO * c.KT_CONFIGURED * -15.5 - 2.6,
+    a.text(-im + 0.5, -c.GEAR_RATIO * c.KT_CONFIGURED * (-im + 0.5) - 2.6,
            f'lossless, kt = {c.KT_CONFIGURED} (configured)', color=c.INK_2, fontsize=8.5)
     a.axhline(0, color=c.INK_3, lw=0.8)
     a.axvline(0, color=c.INK_3, lw=0.8)
@@ -125,23 +127,23 @@ def run(d):
                xytext=(3.0, -13.5), fontsize=9, color=c.INK, arrowprops=dict(arrowstyle='-', color=c.INK_3))
     a.annotate(f'no-load drag {fit["P0"]:.2f} Nm', xy=(0, fit['P0']), xytext=(1.2, 6.5), fontsize=9,
                color=c.INK, arrowprops=dict(arrowstyle='-', color=c.INK_3))
-    a.text(-15.5, -7.0, 'DUT resists the motion\n(LOAD backdrives the gearbox)', fontsize=9, color='#a8302f', va='top')
-    a.text(15.5, 21.5, 'DUT pushes with the motion\n(DUT drives LOAD)', fontsize=9, color='#1c5cab',
+    a.text(-im + 0.5, -7.0, 'DUT resists the motion\n(LOAD backdrives the gearbox)', fontsize=9, color='#a8302f', va='top')
+    a.text(im - 0.5, 21.5, 'DUT pushes with the motion\n(DUT drives LOAD)', fontsize=9, color='#1c5cab',
            va='top', ha='right')
     a.set_xlabel('DUT current along the motion (A)')
     a.set_ylabel('Torque LOAD applies along the motion (Nm, output)')
     a.set_title('Transmitted torque while sliding: one kinked line')
-    a.set_xlim(-16.5, 16.5)
+    a.set_xlim(-im - 0.5, im + 0.5)
     a.set_ylim(-17, 24)
     from matplotlib.lines import Line2D
     handles = [Line2D([], [], color=col, marker='o', ls='', ms=8, label=f'{v:g} rad/s')
-               for v, col in c.SPEED_COLORS.items()]
+               for v, col in c.SPEED_COLORS.items() if v in c.speeds(d)]
     handles += [Line2D([], [], color=c.INK_2, marker=c.DIR_MARKER[s], ls='', ms=8, label=c.DIR_LABEL[s])
                 for s in (-1, 1)]
     a.legend(handles=handles, loc='upper right', bbox_to_anchor=(1.0, 0.86))
 
     b = ax[1]
-    ii = np.linspace(0, 16, 50)
+    ii = np.linspace(0, im, 50)
     lo = np.maximum(fit['forward']['K'] * ii - fit['forward']['c'], 0)
     hi = fit['backdrive']['K'] * ii + fit['backdrive']['c']
     b.fill_between(ii, lo, hi, color='#e8e7e2', lw=0, label='possible output torque at standstill')
@@ -156,12 +158,13 @@ def run(d):
     b.set_xlabel('|DUT current| (A)')
     b.set_ylabel('|Output torque| (Nm)')
     b.set_title('Why static torque-vs-current scatters')
-    b.set_xlim(0, 16)
+    b.set_xlim(0, im)
     b.set_ylim(0, 25)
     b.legend(loc='upper left')
     span12 = (fit['backdrive']['K'] * 12.5 + fit['backdrive']['c'],
               fit['forward']['K'] * 12.5 - fit['forward']['c'])
-    fig.suptitle('Skip output torque vs motor current (all 42 dwells, 0.025-0.1 rad/s)')
+    sp = c.speeds(d)
+    fig.suptitle(f'Skip output torque vs motor current ({c.RUN}: all {len(dw)} dwells, {sp[0]:g}-{sp[-1]:g} rad/s)')
     c.note(fig, 'Left: every dwell mean; torque is the load cell (split-corrected, re-zeroed) signed so that + means '
                 'LOAD pushes along the motion. Right: with no motion, friction can hold the output anywhere '
                 f'between the two sliding lines - at 12.5 A that is {span12[1]:.1f} to {span12[0]:.1f} Nm, '
@@ -171,10 +174,10 @@ def run(d):
 
     # -- Figure 2: per speed-group slopes, efficiency, drag ---------------------------
     fig, ax = plt.subplots(1, 3, figsize=(14, 4.6))
-    xs = []
+    order = sorted(groups, key=lambda vs: vs[1] * vs[0])
+    xpos = {vs: k for k, vs in enumerate(order)}
     for (v, s), g in sorted(groups.items(), key=lambda kv: kv[0][1] * kv[0][0]):
-        x = s * v
-        xs.append(x)
+        x = xpos[(v, s)]
         ax[0].plot(x, g['forward']['K'], 'o', color='#1c5cab', ms=8)
         ax[0].plot(x, g['backdrive']['K'], 's', color='#a8302f', ms=8)
         ax[1].plot(x, g['eta_symmetric'], 'o', color=c.INK, ms=8)
@@ -194,10 +197,11 @@ def run(d):
                  loc='lower right')
     ax[2].set_title('No-load backdrive drag (0 A)')
     ax[2].set_ylabel('Nm at output')
-    ax[2].set_ylim(0, 1.2)
+    ax[2].set_ylim(0, max(1.2, 1.15 * max(g['P0'] for g in groups.values())))
     for a in ax:
         a.set_xlabel('Output speed (rad/s)')
-        a.set_xticks(sorted(xs))
+        a.set_xticks(range(len(order)))
+        a.set_xticklabels([f'{s * v:+g}' for v, s in order])
         a.tick_params(axis='x', labelrotation=45)
     fig.suptitle('Skip gearbox transmission by speed and direction')
     c.note(fig, f'Pooled: forward {fit["forward"]["K"]:.3f}, backdrive {fit["backdrive"]["K"]:.3f} Nm/A; '
@@ -207,32 +211,50 @@ def run(d):
     c.save(fig, SUB, 'Skip_efficiency_and_kt_by_speed.png')
 
     # -- Figure 3: feedforward map ---------------------------------------------------
+    # LOAD torque in its COMMAND frame (the frame a feedforward is sent in):
+    # the logged current is in the drive's frame, commands go through
+    # flip_torque_sign. Quasi-static speeds only; s10 has the speed dependence.
+    qs = [w for w in dw if w['speed_abs'] <= c.COGGING_MAX_SPEED]
     fig, a = plt.subplots(figsize=(9.5, 6.5))
     dir_col = {-1: '#2a78d6', 1: '#eb6834'}
-    for w in dw:
-        a.plot(w['tcmd'], w['T_lm'], c.DIR_MARKER[w['dir']], color=dir_col[w['dir']], ms=8,
+    # With more than three speeds the spread at each command is speed: colour points by speed.
+    by_speed = len({w['speed_abs'] for w in qs}) > 3
+    for w in qs:
+        a.plot(w['tcmd'], w['T_lm_cmd'], c.DIR_MARKER[w['dir']],
+               color=c.SPEED_COLORS[w['speed_abs']] if by_speed else dir_col[w['dir']], ms=8,
                mec='white', mew=0.8, zorder=3)
-    tq = np.linspace(-0.3, 0.3, 61)
+    tmax = max(abs(w['tcmd']) for w in dw)
+    tq = np.linspace(-tmax, tmax, 61)
     for s in (-1, 1):
-        fwd = (tq * s) < 0
+        # which sign of the command is forward in this direction (depends on the DUT's flip)
+        fsign = np.sign(np.mean([np.sign(w['tcmd']) for w in qs if w['dir'] == s and w['quadrant'] == 'forward']))
+        fwd = np.sign(tq) == fsign
         y = c.GEAR_RATIO * tq * np.where(fwd, ff['r_forward'], ff['r_backdrive']) \
             + ff['c_direction_Nm'] * s + ff['c0_Nm']
         y[tq == 0] = np.nan
-        a.plot(tq, y, color=dir_col[s], lw=1.6, label=f'recommended FF, {c.DIR_LABEL[s]}')
-    a.plot(tq, EXISTING_FF_RATIO * c.GEAR_RATIO * tq, color=c.INK_3, ls='--', lw=1.4,
-           label=f'existing FF: {EXISTING_FF_RATIO} x 26 x command')
+        a.plot(tq, y, color=dir_col[s], lw=1.6, label=f'fit to what LOAD needed, {c.DIR_LABEL[s]}')
+    ratio = c.feedforward_ratio(d)
+    a.plot(tq, ratio * c.GEAR_RATIO * tq, color=c.INK_3, ls='--', lw=1.4,
+           label=f'FF {"sent" if c.RUN != "v1" else "configured"}: {ratio:g} x 26 x command')
     a.axhline(0, color=c.INK_3, lw=0.8)
     a.axvline(0, color=c.INK_3, lw=0.8)
-    a.set_xlabel('DUT torque command (Nm, motor side, as logged; kt = 0.02 -> 50 A/Nm)')
-    a.set_ylabel('LOAD motor torque, kt x current (Nm, as logged)')
-    a.set_title('Skip: torque the LOAD actually needed vs what feedforward would supply')
-    a.legend(loc='upper right')
-    a.text(-0.29, -21, f'r_forward = {ff["r_forward"]:.2f}, r_backdrive = {ff["r_backdrive"]:.2f}\n'
+    a.set_xlabel(f'DUT torque command (Nm, motor side, as logged; kt = {c.KT_CONFIGURED} -> {1 / c.KT_CONFIGURED:g} A/Nm)')
+    a.set_ylabel("LOAD motor torque, kt x current (Nm, LOAD's command frame)")
+    a.set_title('Skip: torque the LOAD needed vs what feedforward supplies')
+    if by_speed:
+        from matplotlib.lines import Line2D as _L
+        a.legend(handles=a.get_legend_handles_labels()[0]
+                 + [_L([], [], color=c.SPEED_COLORS[v], marker='o', ls='', label=f'{v:g} rad/s')
+                    for v in sorted({w['speed_abs'] for w in qs})], loc='upper left', fontsize=8)
+    else:
+        a.legend(loc='upper left')
+    a.text(0.98, 0.02, f'r_forward = {ff["r_forward"]:.2f}, r_backdrive = {ff["r_backdrive"]:.2f}\n'
                        f'direction term {ff["c_direction_Nm"]:+.2f} Nm x sign(speed cmd), offset {ff["c0_Nm"]:+.2f} Nm\n'
-                       f'fit residual {ff["rms_resid_Nm"]:.2f} Nm rms over 42 dwells',
-           fontsize=9, color=c.INK_2, va='bottom')
-    c.note(fig, 'Points are dwell means of the LOAD current x 7.79 Nm/A, which is what its velocity loop had to '
-                'find without feedforward. Forward = command and speed of opposite sign in logged frames.', y=0.0)
+                       f'fit residual {ff["rms_resid_Nm"]:.2f} Nm rms over {len(qs)} dwells',
+           transform=a.transAxes, ha='right', fontsize=9, color=c.INK_2, va='bottom')
+    c.note(fig, f'Points are dwell means of the LOAD current x {c.KT_LOAD} Nm/A at <= {c.COGGING_MAX_SPEED:g} rad/s, '
+                'i.e. the feedforward plus whatever the velocity loop added. A perfect feedforward lies on the points.',
+           y=0.0)
     fig.tight_layout(rect=(0, 0.04, 1, 1))
     c.save(fig, SUB, 'Skip_feedforward_map.png')
 
@@ -258,10 +280,11 @@ def run(d):
         'per_group_P0_range': [min(g['P0'] for g in groups.values()), max(g['P0'] for g in groups.values())],
         'standstill_band_at_12p5A_Nm': [float(span12[1]), float(span12[0])],
         'feedforward_fit': ff,
-        'existing_ff_ratio': EXISTING_FF_RATIO,
+        'existing_ff_ratio': c.feedforward_ratio(d),
     })
     return fit, ff
 
 
 if __name__ == '__main__':
+    c.use_run_from_argv()
     run(c.load())

@@ -11,6 +11,7 @@ from operator import attrgetter
 from deployment import dyno_paths
 from dyno.src.test_manager import TestManager
 from dyno.src.config_utils import compile_feedforward
+from dyno.src.dut_compensation import compile_dut_compensation, DutCompensation
 
 SCHED_POLICY = os.SCHED_FIFO
 SCHED_PRIO = 50
@@ -193,6 +194,21 @@ class Controller(Master):
         self._ff_signs = None
         self.load_torque_ff = 0.0
         print(f"Controller: feedforward {self._ff}")
+
+        # Open-loop DUT compensation (dut_compensation.py). It acts only on
+        # commands that carry 'dut_comp_profile' (GridSearch with
+        # dut_compensation_profiles); their input_command is then a target
+        # OUTPUT torque. Built on first use, since the drives do not exist yet.
+        # The dut_comp_* attributes are for log_keys; NaN when inactive.
+        self._comp_cfg = compile_dut_compensation(self.dyno_params)
+        self._comp = None
+        self._comp_was_active = False
+        self._comp_dut_command = 0.0
+        self._comp_warned = False
+        if self._comp_cfg is not None:
+            print(f"Controller: dut_compensation profiles {sorted(self._comp_cfg['profiles'])}, "
+                  f"phase_offset_rad {self._comp_cfg['phase_offset_rad']:.4f}")
+        self._comp_clear_log()
 
         # --- Output position window (limited-travel DUTs) ---
         # Config `position_window:`; absent means the feature is off and every
@@ -1309,6 +1325,89 @@ class Controller(Master):
                   'flip flags before running with feedforward, or use quadrant mode, '
                   'which uses the derived sign.')
         return signs
+
+    def _comp_clear_log(self):
+        self.dut_comp_target = math.nan
+        self.dut_comp_current = math.nan
+        self.dut_comp_ripple = math.nan
+        self.dut_comp_omega = math.nan
+        self.dut_comp_quadrant = math.nan
+        self.dut_comp_profile = math.nan
+
+    def _comp_step(self):
+        """Run the DUT compensation law for this cycle (dut_compensation.py).
+
+        Returns the target output torque when the current command carries
+        'dut_comp_profile' and the DUT is settled in torque mode, and leaves
+        the DUT torque command (Nm at the drive's configured kt) in
+        _comp_dut_command. Otherwise returns None and resets the law's speed
+        estimate, so the next start does not differentiate across the gap.
+        Never raises: a failure sends zero and is reported once.
+        """
+        profile = self.current_cmd.get('dut_comp_profile')
+        dut = self.devices.DUT
+        if (profile is None or self._load_only or dut.mode != 'torque'
+                or dut.switching_modes):
+            if self._comp_was_active and self._comp is not None:
+                self._comp.reset()
+            self._comp_was_active = False
+            self._comp_clear_log()
+            return None
+        try:
+            if self._comp_cfg is None:
+                raise RuntimeError('command asks for dut_compensation but the rig config has none')
+            if self._comp is None:
+                self._comp = DutCompensation(self._comp_cfg, dut.params['gear_ratio'],
+                                             self.process_data_cycle_time_us / 1e6)
+            tau = float(self.current_cmd['input_command'])
+            if not math.isfinite(tau):
+                tau = 0.0
+            current = self._comp.update(tau, float(dut.position), profile)
+            # Amps -> the torque command ELMO.send_command turns back into amps
+            # (its arctanh(command * k_tanh / kt) / k_tanh, inverted).
+            kt = dut.params['motor_params']['kt']
+            k_tanh = dut.params['motor_params'].get('k_tanh', 0.0)
+            self._comp_dut_command = (kt * math.tanh(current * k_tanh) / k_tanh
+                                      if k_tanh else kt * current)
+            last = self._comp.last
+            self.dut_comp_target = tau
+            self.dut_comp_current = current
+            self.dut_comp_ripple = last['ripple_nm']
+            self.dut_comp_omega = last['omega_m']
+            self.dut_comp_quadrant = last['quadrant']
+            self.dut_comp_profile = last['profile']
+            self._comp_was_active = True
+            return tau
+        except Exception as e:
+            if not self._comp_warned:
+                print(f'dut_compensation: {e!r}; sending zero DUT torque')
+                self._comp_warned = True
+            self._comp_dut_command = 0.0
+            self._comp_clear_log()
+            return 0.0
+
+    def _comp_load_feedforward(self, tau, output_command):
+        """LOAD feedforward while the DUT is compensated: the LOAD reacts the
+        target output torque, load_ff_ratio x tau, signed like the fixed mode's
+        ratio x tc x G (tau has tc's sign). The quadrant mode's LOAD-side drag
+        term is added when that mode is configured. 0 when feedforward is off."""
+        ff = self._ff
+        if ff['mode'] == 'off' or self._comp_cfg is None:
+            return 0.0
+        if self._ff_signs is None:
+            self._ff_signs = self._feedforward_signs()
+            print(f"Controller: feedforward signs {self._ff_signs}")
+        s = self._ff_signs
+        out = s['cross'] * self._comp_cfg['load_ff_ratio'] * tau
+        if ff['mode'] == 'quadrant' and self.devices.LOAD.mode == 'velocity':
+            try:
+                v = float(output_command)
+            except (TypeError, ValueError):
+                v = 0.0
+            if math.isfinite(v):
+                out += s['load_push'] * ff['drag_nm'] * math.tanh(v / ff['v_blend_rad_s'])
+        cap = ff.get('max_nm', abs(self.devices.LOAD.torque_limit))
+        return max(-cap, min(cap, out))
 
     def _load_feedforward(self, tc, output_command):
         """LOAD torque feedforward (Nm, LOAD command frame) for DUT torque tc.
@@ -2718,7 +2817,12 @@ class Controller(Master):
                     if not self.devices.DUT.switching_modes:
                         self.devices.DUT.command_operating_mode(self.generated_cmd['input_mode'])
                         self._safe_default_command['input_mode'] = self.current_cmd['input_mode']
-                        self._safe_default_command['input_command'] = self.current_cmd['input_command']
+                        # A compensated command's input_command is an OUTPUT
+                        # torque target (up to ~30 Nm), which as a raw DUT torque
+                        # command would clip to the drive's full limit.
+                        self._safe_default_command['input_command'] = (
+                            0 if self.current_cmd.get('dut_comp_profile') is not None
+                            else self.current_cmd['input_command'])
                         
 
                 if self.generated_cmd['output_mode'] != self.devices.LOAD.mode:
@@ -2792,10 +2896,17 @@ class Controller(Master):
         # cancel, so LOAD is commanded plain and DUT is not written at all --
         # this is the one place that would otherwise actuate a drive the
         # operator was told stays dormant.
+        # None unless this command asks for DUT compensation; then the target
+        # output torque, and _comp_dut_command holds what the DUT is sent.
+        comp_tau = self._comp_step()
+
         load_command = self._load_command_for_mode(self.current_cmd)
         if not self._load_only and self.devices.DUT.mode == 'torque' and not self.devices.LOAD.mode == 'torque':
-            torque_ff = self._load_feedforward(self.current_cmd['input_command'],
-                                               self.current_cmd['output_command'])
+            if comp_tau is not None:
+                torque_ff = self._comp_load_feedforward(comp_tau, self.current_cmd['output_command'])
+            else:
+                torque_ff = self._load_feedforward(self.current_cmd['input_command'],
+                                                   self.current_cmd['output_command'])
             self.load_torque_ff = torque_ff
             self.devices.LOAD.send_command(load_command, torque_ff)
         else:
@@ -2803,7 +2914,8 @@ class Controller(Master):
             self.devices.LOAD.send_command(load_command)
 
         if not self._load_only:
-            dut_command = self._dut_command_for_mode(self.current_cmd)
+            dut_command = (self._comp_dut_command if comp_tau is not None
+                           else self._dut_command_for_mode(self.current_cmd))
             if self.devices.LOAD.mode == 'torque' and not self.devices.DUT.mode == 'torque':
                 torque_ff = ff_ratio*self.current_cmd['output_command'] / self.devices.DUT.params['gear_ratio']
                 self.devices.DUT.send_command(dut_command, torque_ff)

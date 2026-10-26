@@ -22,6 +22,7 @@
 # full 200 Nm. Clearing this flag re-arms that check and caps output torque at
 # DUT.torque x DUT.gear_ratio = 25 Nm until the DUT derate below is raised.
 load_only: false
+align_load_position_to_dut: false
 
 # Cross-coupling torque feedforward onto LOAD (dyno_controller.step), sent as
 # a current offset (AKD 0x60B2). See config_utils.compile_feedforward and
@@ -55,6 +56,96 @@ feedforward:
   drag_nm: 1.38
   v_blend_rad_s: 0.005
   max_nm: 30             # the client's output torque cap; also the cell safety
+
+# Open-loop DUT compensation for Skip (dyno/src/dut_compensation.py): output
+# torque target -> DUT current. Only commands from a grid with
+# dut_compensation_profiles use it; everything else runs as before. Fitted from
+# v2 by dyno/src/post_processors/skip/s15_comp_fit.py. phase_offset_rad maps the
+# live motor angle onto v2's frame and must be re-measured after any Elmo power
+# cycle (skip_phase_cal_R1a + s14_phase_cal.py). Other keys default in
+# dut_compensation.compile_dut_compensation (max_current_a 30, max_output_nm 30,
+# gate_rad_s [0.5, 1.5] motor, t_lead_s 0.0015, load_ff_ratio 1.0).
+# Session refit by dyno/src/post_processors/skip/s17_session_refit.py from
+# logs/skip/feedforward_compensation_tests/04_R3_hourlong_comptest/skip_comp_R3_ab.hdf5.
+# naive_nm_per_a is pinned to the previous block so C0 is the same law.
+# Session refit by dyno/src/post_processors/skip/s17_session_refit.py from
+# logs/skip/feedforward_compensation_tests/04_R3_hourlong_comptest/skip_comp_R3_ab.hdf5, logs/skip/feedforward_compensation_tests/05_R3b_recal/skip_comp_R3b_refit.hdf5.
+# naive_nm_per_a is pinned to the previous block so C0 is the same law.
+dut_compensation:
+  enabled: true
+  phase_offset_rad: 0.1879
+  max_current_a: 30.0
+  naive_nm_per_a: 0.7859
+  ripple_fade_rad_s: [0.25, 1.0]
+  base:
+    K_f: [0.499, 0.5175]
+    K_b: [1.3538, 1.386]
+    drag_nm: [0.2266, 0.336]
+  speed_table:
+    speed_rad_s: [0.1, 0.5, 2.0]
+    K_f:
+    - [0.499, 0.5175]
+    - [0.5309, 0.5553]
+    - [0.632, 0.6653]
+    K_b:
+    - [1.3538, 1.386]
+    - [1.1611, 1.2719]
+    - [0.9504, 1.055]
+    drag_nm:
+    - [0.2266, 0.336]
+    - [0.1585, 0.2445]
+    - [0.7654, 0.9535]
+  quadrant_lines:
+    speed_rad_s: [0.1, 0.5, 2.0]
+    K_f:
+    - [0.4868, 0.5037]
+    - [0.5211, 0.5311]
+    - [0.6053, 0.6446]
+    D_f:
+    - [0.0038, 0.0916]
+    - [-0.018, -0.179]
+    - [0.303, 0.6059]
+    K_b:
+    - [1.3345, 1.3654]
+    - [1.1461, 1.2361]
+    - [0.9127, 1.0268]
+    D_b:
+    - [0.381, 0.4996]
+    - [0.2817, 0.5316]
+    - [1.062, 1.171]
+  harmonics:
+  - group: h1
+    order: 1
+    cells:
+      pos_backdrive: {a0: 0.1331, a1: 0.06555, phase: 1.6337}
+      neg_backdrive: {a0: 0.2259, a1: 0.04456, phase: -1.8587}
+      pos_forward: {a0: 0.0664, a1: 0.04604, phase: 1.0971}
+      neg_forward: {a0: 0.1487, a1: 0.05215, phase: -1.6558}
+  - group: h6
+    order: 6
+    cells:
+      pos_backdrive: {a0: 0.0521, a1: 0.03846, phase: 0.9845}
+      neg_backdrive: {a0: -0.0391, a1: 0.05629, phase: 2.8191}
+      pos_forward: {a0: -0.0124, a1: 0.0116, phase: -0.5123}
+      neg_forward: {a0: -0.0009, a1: 0.0108, phase: -1.9254}
+  - group: hx
+    order: 2
+    cells:
+      pos_backdrive: {a0: 0.0456, a1: 0.0192, phase: 0.7214}
+      neg_backdrive: {a0: 0.0499, a1: 0.02255, phase: -1.6198}
+      pos_forward: {a0: 0.0, a1: 0.01933, phase: 1.3772}
+      neg_forward: {a0: 0.0092, a1: 0.01876, phase: 1.5798}
+  profiles:
+    C0_naive: []
+    C1_base: [base]
+    C2_speed: [base, speed]
+    C3_h1: [base, h1]
+    C4_h6: [base, h6]
+    C5_hx: [base, hx]
+    C6_all: [base, speed, h1, h6, hx]
+    C1_repeat: [base]
+    C7_qdrag: [base, speed, qdrag]
+    C8_all_q: [base, speed, qdrag, h1, h6, hx]
 
 # --- 0. PORTS ---
 # The rig's mechanical ports. `role` is what commands / the UI / analysis
@@ -257,8 +348,8 @@ expected_slave_layout:
         acceleration: 1000 #Rad/s^2
         rotatum: 200 #Nm/s
       drive_params:
-        i_cont: 30.0           
-        i_rated: 30.0          
+        i_cont: 50.0           
+        i_rated: 50.0          
         counts_per_rev: 8192
         position_counter_bits: 32
         pdo_profile: compact
@@ -343,3 +434,14 @@ log_keys:
   # LOAD torque feedforward actually sent, Nm in LOAD's command frame
   # (feedforward: above). 0 whenever the feedforward branch is not active.
   - [load_torque_ff, load_torque_ff]
+  # DUT compensation (dut_compensation: above). NaN when not active.
+  # target = output torque asked for (Nm); current = DUT amps the law sent;
+  # ripple = predicted angle-locked torque it cancelled (Nm); omega = its motor
+  # speed estimate (rad/s); quadrant = +1 forward / -1 backdrive; profile =
+  # index of the profile in sorted(profiles).
+  - [dut_comp_target, dut_comp_target]
+  - [dut_comp_current, dut_comp_current]
+  - [dut_comp_ripple, dut_comp_ripple]
+  - [dut_comp_omega, dut_comp_omega]
+  - [dut_comp_quadrant, dut_comp_quadrant]
+  - [dut_comp_profile, dut_comp_profile]

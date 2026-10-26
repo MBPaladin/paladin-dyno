@@ -49,7 +49,8 @@ def motor_fold(d, w):
 
 
 def grid_figure(d, fold_fn, xlabel, title, fname, ylim, xticks):
-    fig, ax = plt.subplots(2, 3, figsize=(15, 8), sharex=True, sharey=True)
+    ns = len(c.speeds(d))
+    fig, ax = plt.subplots(2, ns, figsize=(5 * ns, 8), sharex=True, sharey=True, squeeze=False)
     for i, s in enumerate((-1, 1)):
         for j, v in enumerate(c.speeds(d)):
             a = ax[i, j]
@@ -90,7 +91,8 @@ def run(d):
                       'Skip load torque folded over one motor revolution (eccentric / input phase)',
                       'Skip_fold_motor_angle.png', (-3.0, 3.0), range(0, 361, 60))
     c.note(fig, 'Raw angle-domain fold with only the slow drift removed. The fine 21-per-rev ripple is electrical; '
-                'the broad shape is the gearbox input phase. Backdrive folds include angle-locked stick-slip.', y=0.0)
+                'the broad shape is the gearbox input phase.' + (' Backdrive folds include angle-locked stick-slip.'
+                                                                 if c.RUN == 'v1' else ''), y=0.0)
     c.save(fig, SUB, 'Skip_fold_motor_angle.png')
 
     # -- Zero current, all six speeds overlaid: is it the same pattern? --------------
@@ -111,7 +113,7 @@ def run(d):
         a.set_xlim(0, 360)
         a.axhline(0, color=c.INK_3, lw=0.8)
         a.set_ylabel('Cell torque ripple (Nm)')
-    handles = [Line2D([], [], color=col, lw=2, label=f'{v:g} rad/s') for v, col in c.SPEED_COLORS.items()]
+    handles = [Line2D([], [], color=col, lw=2, label=f'{v:g} rad/s') for v, col in c.SPEED_COLORS.items() if v in c.speeds(d)]
     handles += [Line2D([], [], color=c.INK_2, ls=c.DIR_LS[s], lw=1.6, label=c.DIR_LABEL[s]) for s in (-1, 1)]
     ax[1].legend(handles=handles, loc='upper right', ncol=2)
     fig.suptitle('Skip zero-current backdrive ripple: same angle-locked pattern at every speed and direction')
@@ -201,27 +203,33 @@ def run(d):
     for a in ax[1]:
         a.set_xlabel('DUT current along motion (A)  [- = backdrive, + = forward]')
         a.set_xticks(c.currents_along(d))
-    handles = [Line2D([], [], color=col, lw=2, label=f'{v:g} rad/s') for v, col in c.SPEED_COLORS.items()]
+    handles = [Line2D([], [], color=col, lw=2, label=f'{v:g} rad/s') for v, col in c.SPEED_COLORS.items() if v in c.speeds(d)]
     handles += [Line2D([], [], color=c.INK_2, marker=c.DIR_MARKER[s], ls=c.DIR_LS[s], label=c.DIR_LABEL[s])
                 for s in (-1, 1)]
     ax[0, 0].legend(handles=handles, loc='upper center', ncol=2)
     fig.suptitle('Skip torque ripple magnitude vs speed and current')
     c.note(fig, 'Pk-pk from the fitted order series (noise-free); rms of what the angle fits leave behind. '
-                'Ripple grows with transmitted load and is largest in backdrive; speed matters little at 0.025-0.1 rad/s.',
+                f'Output speeds {c.speeds(d)[0]:g} to {c.speeds(d)[-1]:g} rad/s.',
            y=0.0)
     fig.tight_layout(rect=(0, 0.03, 1, 0.95))
     c.save(fig, SUB, 'Skip_ripple_vs_speed_and_current.png')
 
     def mean_of(key, cond):
         return float(np.mean([r[key] for r in R if cond(r)]))
+    im = c.i_max(d)
+    keys = ('total_pp', 'elec_pp', 'mech_pp', 'resid_rms')
     c.record('ripple', {
-        'zero_current': {k: mean_of(k, lambda r: r['I'] == 0) for k in ('total_pp', 'elec_pp', 'mech_pp', 'resid_rms')},
-        'forward_15A': {k: mean_of(k, lambda r: r['I'] == 15) for k in ('total_pp', 'elec_pp', 'mech_pp', 'resid_rms')},
-        'backdrive_15A': {k: mean_of(k, lambda r: r['I'] == -15) for k in ('total_pp', 'elec_pp', 'mech_pp', 'resid_rms')},
+        'i_max_A': im,
+        'zero_current': {k: mean_of(k, lambda r: r['I'] == 0) for k in keys},
+        'forward_imax': {k: mean_of(k, lambda r: r['I'] == im) for k in keys},
+        'backdrive_imax': {k: mean_of(k, lambda r: r['I'] == -im) for k in keys},
+        'forward_10A': {k: mean_of(k, lambda r: r['I'] == 10) for k in keys},
+        'backdrive_10A': {k: mean_of(k, lambda r: r['I'] == -10) for k in keys},
         'zero_current_conservative_vs_dissipative_pkpk': split_pp,
     })
     return R
 
 
 if __name__ == '__main__':
-    run(c.load())
+    c.use_run_from_argv()
+    run(c.cogging_view(c.load()))

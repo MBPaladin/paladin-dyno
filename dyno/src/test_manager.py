@@ -10,6 +10,7 @@ from deployment import dyno_paths
 from dyno.src.test_builder import (design_multisine, reaction_torque_issue,
                                    throw_rig_from_config, throw_window_reach,
                                    gridpoint_hold_s, gridpoint_velocity_motor)
+from dyno.src.dut_compensation import compile_dut_compensation
 
 # PROGRESS CONTRACT. Every behavior class carries two plain ints that the
 # controller reads (on its own thread, inside step()) and republishes for the
@@ -407,11 +408,37 @@ class GridSearch:
         elif self.output_mode == 'torque':
             self.t_limit = 110
 
+        # Open-loop DUT compensation (dyno/src/dut_compensation.py). With a list
+        # of profiles the INPUT torque commands are target OUTPUT torque (Nm),
+        # turned into DUT current by Controller._comp_step, and every gridpoint
+        # is held once per profile, back to back, so the profiles meet the same
+        # operating point in the same thermal state. Each hold gets its own log
+        # flag, <id>-RUN<r>-SETPOINT<n>-<profile>.
+        self.comp_profiles = [str(p) for p in (self.settings.get('dut_compensation_profiles') or [])]
+        self.profile_settle_s = float(self.settings.get('profile_settle_s', 1.0))
+        self._profile = None
+        if self.comp_profiles:
+            assert self.input_mode == 'torque', \
+                'dut_compensation_profiles needs the input motor in torque mode'
+            with open(f"{dyno_paths.dyno_config_directory}/{mode}_dyno_config.yaml") as f:
+                comp = compile_dut_compensation(yaml.safe_load(f))
+            assert comp is not None, ('dut_compensation_profiles given, but the rig config '
+                                      'has no enabled dut_compensation block')
+            unknown = [p for p in self.comp_profiles if p not in comp['profiles']]
+            assert not unknown, (f'unknown dut_compensation profiles {unknown}; '
+                                 f'the rig config has {sorted(comp["profiles"])}')
+            assert self.profile_settle_s >= 0, 'profile_settle_s must be >= 0'
+            self.repeats *= len(self.comp_profiles)
+
         for motor in ['input', 'output']:
             motor_key = f'{motor}_motor'
             peak = max(abs(np.array(self.settings[motor_key]['command_list'])))
             if self.settings[motor_key]['control_mode'] == 'torque':
-                assert peak <= self.limits[motor]['torque'], 'Max commanded '+motor_key+' torque of '+str(peak)+' exceeds its limit of '+str(self.limits[motor]['torque'])
+                if motor == 'input' and self.comp_profiles:
+                    # Output-torque targets: the law clips its current itself.
+                    assert peak <= comp['max_output_nm'], 'Max target output torque '+str(peak)+' exceeds dut_compensation.max_output_nm '+str(comp['max_output_nm'])
+                else:
+                    assert peak <= self.limits[motor]['torque'], 'Max commanded '+motor_key+' torque of '+str(peak)+' exceeds its limit of '+str(self.limits[motor]['torque'])
                 if motor == 'output':
                     reaction = reaction_torque_issue(peak, self.limits)
                     assert reaction is None, 'Commanded output_motor torque '+str(reaction)
@@ -488,6 +515,16 @@ class GridSearch:
 
 
     def commands(self):
+        # Every command carries the profile active when it is pulled (None when
+        # this grid runs without compensation), so ramps between points use the
+        # law too and the controller never sees an output-torque target alone.
+        self._profile = self.comp_profiles[0] if self.comp_profiles else None
+        for cmd in self._commands():
+            if self._profile is not None:
+                cmd['dut_comp_profile'] = self._profile
+            yield cmd
+
+    def _commands(self):
         # --- Initialize state for this specific run of the generator ---
         self._state = {'velocity': 0.0, 'torque': 0.0}
         self._point_ct = 0
@@ -535,7 +572,16 @@ class GridSearch:
             if hold_s > self.settings['duration_per_point_s']:
                 print(f"GridSearch hold {hold_s:.1f} s for "
                       f"{self.settings['min_output_revs']:g} output revs")
-            yield from self.hold(self._active_setpoint, hold_s, log_flag)
+            if self.comp_profiles:
+                for p in self.comp_profiles:
+                    self._profile = p
+                    print(f"GridSearch profile {p}")
+                    yield from self.hold(self._active_setpoint, self.profile_settle_s)
+                    self.repeat = (self._point_ct - 1) * len(self.comp_profiles) + \
+                        self.comp_profiles.index(p) + 1
+                    yield from self.hold(self._active_setpoint, hold_s, f'{log_flag}-{p}')
+            else:
+                yield from self.hold(self._active_setpoint, hold_s, log_flag)
 
             # if setpoint is above cont. torque rating, ramp and hold at 0 torque to cool down
             if abs(self._active_setpoint['torque']) > self.t_limit:
